@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { RotateCw } from 'lucide-svelte'
 	import { Button, Drawer, Skeleton } from './common'
 	import DrawerContent from './common/drawer/DrawerContent.svelte'
 	import NoItemFound from './home/NoItemFound.svelte'
@@ -26,14 +27,19 @@
 
 	export function openDrawer() {
 		loading = true
-		loadItems().then((v) => {
-			items = v
-			loading = false
-		})
+		loadItems()
+			.then((v) => {
+				items = v
+			})
+			.finally(() => {
+				loading = false
+			})
 		drawer.openDrawer?.()
 	}
 
 	let drawer: Drawer
+
+	let refreshing = false
 </script>
 
 <SearchItems
@@ -50,35 +56,60 @@
 />
 
 <Drawer bind:this={drawer} size="600px">
-	<DrawerContent {tooltip} {documentationLink} overflow_y={false} title="Search {itemName}s" on:close={drawer.closeDrawer}>
+	<DrawerContent
+		{tooltip}
+		{documentationLink}
+		overflow_y={false}
+		title="Search {itemName}s"
+		on:close={drawer.closeDrawer}
+	>
 		<div class="w-full h-full flex flex-col">
-			<div class="w-12/12 pb-4">
+			<div class="flex flex-row gap-2 pb-4">
+				<!-- svelte-ignore a11y-autofocus -->
 				<input
 					type="text"
 					placeholder="Search {itemName}s"
 					bind:value={filter}
 					class="search-item"
+					autofocus
+				/>
+				<Button
+					color="light"
+					variant="border"
+					on:click={() => {
+						refreshing = true
+						loadItems()
+							.then((v) => {
+								items = v
+							})
+							.finally(() => {
+								loading = false
+								refreshing = false
+							})
+					}}
+					iconOnly
+					startIcon={{ icon: RotateCw, classes: loading || refreshing ? 'animate-spin' : '' }}
 				/>
 			</div>
 			{#if loading}
-				{#each new Array(6) as _}
-					<Skeleton layout={[[2], 0.7]} />
+				{#each new Array(3) as _}
+					<Skeleton layout={[[5], 0.2]} />
 				{/each}
 			{:else if !items?.length}
-				<div class="text-center text-sm text-gray-600 mt-2">
+				<div class="text-center text-sm text-tertiary mt-2">
 					{@html noItemMessage}
 				</div>
 			{:else if filteredItems?.length}
-				<div class="border rounded-md divide-y divide-gray-200 w-full overflow-auto pb-12 grow">
+				<div class="border rounded-md divide-y w-full overflow-auto pb-12 grow">
 					{#each filteredItems as obj}
 						<div
-							class="hover:bg-gray-50 w-full flex items-center p-4 gap-4 first-of-type:!border-t-0 
+							class="hover:bg-surface-hover w-full flex items-center p-4 gap-4 first-of-type:!border-t-0
 						first-of-type:rounded-t-md last-of-type:rounded-b-md"
 						>
 							<div class="inline-flex items-center grow">
 								<button
 									class="py-2 px-1 gap-1 flex grow border-gray-300 border-opacity-0
-									 text-black"
+									 text-primary"
 									on:click={() => {
 										if (closeOnClick) {
 											drawer.closeDrawer()
@@ -87,12 +118,12 @@
 									}}
 								>
 									{#if `app` in obj}
-										<div class="mr-2 text-sm text-left center-center  w-30">
+										<div class="mr-2 text-sm text-left center-center w-30">
 											<IconedResourceType after={true} silent={false} name={obj['app']} />
 										</div>
 									{/if}
 									{#if `resource_type` in obj}
-										<div class="mr-2  text-left w-30  center-center  text-sm">
+										<div class="mr-2 text-left w-30 center-center text-sm">
 											<IconedResourceType after={true} name={obj['resource_type']} />
 										</div>
 									{/if}

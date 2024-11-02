@@ -6,25 +6,27 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-use crate::{
-    db::{UserDB, DB},
-    users::{get_groups_for_user, Authed},
-};
+use crate::db::ApiAuthed;
+use crate::{db::DB, utils::require_super_admin};
+
 use axum::{
     extract::{Extension, Path, Query},
     routing::{delete, get, post},
     Json, Router,
 };
-use windmill_audit::{audit_log, ActionKind};
-use windmill_common::users::username_to_permissioned_as;
+use windmill_audit::audit_ee::audit_log;
+use windmill_audit::ActionKind;
+use windmill_common::worker::CLOUD_HOSTED;
 use windmill_common::{
+    auth::get_groups_for_user,
     error::{Error, JsonResult, Result},
     utils::{not_found_if_none, paginate, Pagination},
 };
+use windmill_common::{db::UserDB, users::username_to_permissioned_as};
 
 use serde::{Deserialize, Serialize};
 use sqlx::{query_scalar, FromRow, Postgres, Transaction};
-use windmill_queue::CLOUD_HOSTED;
+use windmill_git_sync::handle_deployment_metadata;
 
 pub fn workspaced_service() -> Router {
     Router::new()
@@ -37,6 +39,19 @@ pub fn workspaced_service() -> Router {
         .route("/adduser/:name", post(add_user))
         .route("/removeuser/:name", post(remove_user))
         .route("/is_owner", get(is_owner))
+}
+
+pub fn global_service() -> Router {
+    Router::new()
+        .route("/list", get(list_igroups))
+        .route("/get/:name", get(get_igroup))
+        .route("/create", post(create_igroup))
+        .route("/update/:name", post(update_igroup))
+        .route("/delete/:name", delete(delete_igroup))
+        .route("/adduser/:name", post(add_user_igroup))
+        .route("/removeuser/:name", post(remove_user_igroup))
+        .route("/export", get(export_igroups))
+        .route("/overwrite", post(overwrite_igroups))
 }
 
 #[derive(FromRow, Serialize, Deserialize)]
@@ -72,6 +87,11 @@ pub struct Username {
     pub username: String,
 }
 
+#[derive(Deserialize)]
+pub struct Email {
+    pub email: String,
+}
+
 async fn list_groups(
     Extension(db): Extension<DB>,
     Path(w_id): Path<String>,
@@ -97,20 +117,23 @@ struct QueryListGroup {
     pub only_member_of: Option<bool>,
 }
 async fn list_group_names(
-    Authed { username, .. }: Authed,
+    ApiAuthed { username, email, .. }: ApiAuthed,
     Extension(db): Extension<DB>,
     Query(QueryListGroup { only_member_of }): Query<QueryListGroup>,
     Path(w_id): Path<String>,
 ) -> JsonResult<Vec<String>> {
     let rows = if !only_member_of.unwrap_or(false) {
         sqlx::query_scalar!(
-            "SELECT name FROM group_ WHERE workspace_id = $1 ORDER BY name desc",
+            "SELECT name FROM group_ WHERE workspace_id = $1 UNION SELECT name FROM instance_group ORDER BY name desc",
             w_id
         )
         .fetch_all(&db)
         .await?
+        .into_iter()
+        .filter_map(|x| x)
+        .collect()
     } else {
-        get_groups_for_user(&w_id, &username, &db).await?
+        get_groups_for_user(&w_id, &username, &email, &db).await?
     };
 
     Ok(Json(rows))
@@ -126,7 +149,7 @@ async fn check_name_conflict<'c>(
         name,
         w_id
     )
-    .fetch_one(tx)
+    .fetch_one(&mut **tx)
     .await?
     .unwrap_or(false);
     if exists {
@@ -139,7 +162,7 @@ async fn check_name_conflict<'c>(
 }
 
 pub async fn is_owner(
-    Authed { username, is_admin, groups, .. }: Authed,
+    ApiAuthed { username, is_admin, groups, .. }: ApiAuthed,
     Extension(db): Extension<DB>,
     Path((w_id, name)): Path<(String, String)>,
 ) -> JsonResult<bool> {
@@ -183,9 +206,24 @@ pub async fn require_is_owner(
     }
 }
 
+async fn _check_nb_of_groups(db: &DB) -> Result<()> {
+    let nb_groups = sqlx::query_scalar!("SELECT COUNT(*) FROM group_ WHERE name != 'all' AND name != 'error_handler' AND name != 'slack'",)
+        .fetch_one(db)
+        .await?;
+    if nb_groups.unwrap_or(0) >= 3 {
+        return Err(Error::BadRequest(
+            "You have reached the maximum number of groups (3 outside of native groups 'all', 'slack' and 'error_handler') without an enterprise license"
+                .to_string(),
+        ));
+    }
+    return Ok(());
+}
+
 async fn create_group(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(_db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path(w_id): Path<String>,
     Json(ng): Json<NewGroup>,
 ) -> Result<String> {
@@ -193,30 +231,31 @@ async fn create_group(
 
     check_name_conflict(&mut tx, &w_id, &ng.name).await?;
 
-    sqlx::query_as!(
-        Group,
+    #[cfg(not(feature = "enterprise"))]
+    _check_nb_of_groups(&_db).await?;
+
+    sqlx::query!(
         "INSERT INTO group_ (workspace_id, name, summary, extra_perms) VALUES ($1, $2, $3, $4)",
         w_id,
         ng.name,
         ng.summary,
         serde_json::json!({username_to_permissioned_as(&authed.username): true})
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
-    sqlx::query_as!(
-        Group,
+    sqlx::query!(
         "INSERT INTO usr_to_group (workspace_id, usr, group_) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         &w_id,
         &authed.username,
         ng.name,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "group.create",
         ActionKind::Create,
         &w_id,
@@ -226,7 +265,122 @@ async fn create_group(
     .await?;
 
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &_db,
+        &w_id,
+        windmill_git_sync::DeployedObject::Group { name: ng.name.clone() },
+        Some(format!("Created group '{}'", &ng.name)),
+        rsmq,
+        true,
+    )
+    .await?;
+
     Ok(format!("Created group {}", ng.name))
+}
+
+async fn create_igroup(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Json(ng): Json<NewGroup>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+
+    sqlx::query!(
+        "INSERT INTO instance_group (name, summary) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        ng.name,
+        ng.summary,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroup.create",
+        ActionKind::Create,
+        "global",
+        Some(&ng.name.to_string()),
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(format!("Created group {}", ng.name))
+}
+
+#[derive(Deserialize)]
+struct IGroupUpdate {
+    new_summary: String,
+}
+
+async fn update_igroup(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Path(name): Path<String>,
+    Json(igroup_update): Json<IGroupUpdate>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx: Transaction<'_, Postgres> = db.begin().await?;
+
+    let exists_opt = sqlx::query("SELECT 1 FROM instance_group WHERE name = $1")
+        .bind(name.clone())
+        .fetch_optional(&mut *tx)
+        .await?;
+    not_found_if_none(exists_opt, "instance_group", name.clone())?;
+
+    sqlx::query("UPDATE instance_group SET summary = $1 WHERE name = $2")
+        .bind(igroup_update.new_summary)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroup.updated",
+        ActionKind::Delete,
+        "global",
+        Some(&name.to_string()),
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(format!("Deleted group {}", name))
+}
+
+async fn delete_igroup(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Path(name): Path<String>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx: Transaction<'_, Postgres> = db.begin().await?;
+    sqlx::query!("DELETE FROM instance_group WHERE name = $1", name)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query!("DELETE FROM email_to_igroup WHERE igroup = $1", name)
+        .execute(&mut *tx)
+        .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroup.delete",
+        ActionKind::Delete,
+        "global",
+        Some(&name.to_string()),
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(format!("Deleted group {}", name))
 }
 
 pub async fn get_group_opt<'c>(
@@ -240,13 +394,13 @@ pub async fn get_group_opt<'c>(
         name,
         w_id
     )
-    .fetch_optional(db)
+    .fetch_optional(&mut **db)
     .await?;
     Ok(group_opt)
 }
 
 async fn get_group(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, name)): Path<(String, String)>,
 ) -> JsonResult<GroupInfo> {
@@ -266,12 +420,12 @@ async fn get_group(
 
     let members = sqlx::query_scalar!(
         "SELECT  usr.username  
-            FROM usr_to_group LEFT JOIN usr ON usr_to_group.usr = usr.username 
+            FROM usr_to_group LEFT JOIN usr ON usr_to_group.usr = usr.username AND usr_to_group.workspace_id = $2
             WHERE group_ = $1 AND usr.workspace_id = $2 AND usr_to_group.workspace_id = $2",
         name,
         w_id
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -285,16 +439,18 @@ async fn get_group(
 }
 
 async fn delete_group(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, name)): Path<(String, String)>,
 ) -> Result<String> {
     let mut tx = user_db.begin(&authed).await?;
 
     if name == "all" {
         return Err(Error::BadRequest(
-            "The group 'all' is a special group that contains all users and cannot be deleted".to_string(),
+            "The group 'all' is a special group that contains all users and cannot be deleted"
+                .to_string(),
         ));
     }
 
@@ -308,18 +464,18 @@ async fn delete_group(
         name,
         w_id
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
     sqlx::query!(
         "DELETE FROM group_ WHERE name = $1 AND workspace_id = $2",
         name,
         w_id
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "group.delete",
         ActionKind::Delete,
         &w_id,
@@ -328,13 +484,27 @@ async fn delete_group(
     )
     .await?;
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        windmill_git_sync::DeployedObject::Group { name: name.clone() },
+        Some(format!("Deleted group '{}'", &name)),
+        rsmq,
+        true,
+    )
+    .await?;
+
     Ok(format!("delete group at name {}", name))
 }
 
 async fn update_group(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, name)): Path<(String, String)>,
     Json(eg): Json<EditGroup>,
 ) -> Result<String> {
@@ -344,19 +514,18 @@ async fn update_group(
     }
     not_found_if_none(get_group_opt(&mut tx, &w_id, &name).await?, "Group", &name)?;
 
-    sqlx::query_as!(
-        Group,
+    sqlx::query!(
         "UPDATE group_ SET summary = $1 WHERE name = $2 AND workspace_id = $3",
         eg.summary,
         &name,
         &w_id
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "group.edit",
         ActionKind::Update,
         &w_id,
@@ -365,13 +534,27 @@ async fn update_group(
     )
     .await?;
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        windmill_git_sync::DeployedObject::Group { name: name.clone() },
+        Some(format!("Updated group '{}'", &name)),
+        rsmq,
+        true,
+    )
+    .await?;
+
     Ok(format!("Edited group {}", name))
 }
 
 async fn add_user(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, name)): Path<(String, String)>,
     Json(Username { username: user_username }): Json<Username>,
 ) -> Result<String> {
@@ -382,19 +565,18 @@ async fn add_user(
 
     not_found_if_none(get_group_opt(&mut tx, &w_id, &name).await?, "Group", &name)?;
 
-    sqlx::query_as!(
-        Group,
+    sqlx::query!(
         "INSERT INTO usr_to_group (workspace_id, usr, group_) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         &w_id,
         user_username,
         name,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "group.adduser",
         ActionKind::Update,
         &w_id,
@@ -403,13 +585,134 @@ async fn add_user(
     )
     .await?;
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        windmill_git_sync::DeployedObject::Group { name: name.clone() },
+        Some(format!("Added user to group '{}'", &name)),
+        rsmq,
+        true,
+    )
+    .await?;
+
     Ok(format!("Added {} to group {}", user_username, name))
 }
 
+async fn add_user_igroup(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Path(name): Path<String>,
+    Json(Email { email }): Json<Email>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+
+    let mut tx: Transaction<'_, Postgres> = db.begin().await?;
+
+    let group_opt = sqlx::query_scalar!("SELECT name FROM instance_group WHERE name = $1", name)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    not_found_if_none(group_opt, "IGroup", &name)?;
+
+    sqlx::query!(
+        "INSERT INTO email_to_igroup (email, igroup) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        email,
+        name,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroup.adduser",
+        ActionKind::Update,
+        "global",
+        Some(&name.to_string()),
+        Some([("email", email.as_str())].into()),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(format!("Added {} to igroup {}", email, name))
+}
+
+#[derive(Serialize)]
+struct IGroup {
+    name: String,
+    summary: Option<String>,
+    emails: Option<Vec<String>>,
+}
+async fn list_igroups(Extension(db): Extension<DB>) -> JsonResult<Vec<IGroup>> {
+    let mut tx: Transaction<'_, Postgres> = db.begin().await?;
+
+    let groups = sqlx::query_as!(
+        IGroup,
+        "SELECT name, summary, array_remove(array_agg(email_to_igroup.email), null) as emails FROM email_to_igroup RIGHT JOIN instance_group ON instance_group.name = email_to_igroup.igroup GROUP BY name"
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    return Ok(Json(groups));
+}
+
+async fn get_igroup(Path(name): Path<String>, Extension(db): Extension<DB>) -> JsonResult<IGroup> {
+    let group = sqlx::query_as!(
+        IGroup,
+        "SELECT name, summary, array_remove(array_agg(email_to_igroup.email), null) as emails FROM email_to_igroup RIGHT JOIN instance_group ON instance_group.name = email_to_igroup.igroup WHERE name = $1 GROUP BY name",
+        name
+    )
+    .fetch_optional(&db)
+    .await?;
+    let group = not_found_if_none(group, "IGroup", &name)?;
+    return Ok(Json(group));
+}
+
+async fn remove_user_igroup(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Path(name): Path<String>,
+    Json(Email { email }): Json<Email>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+
+    let group_opt = sqlx::query_scalar!("SELECT name FROM instance_group WHERE name = $1", name,)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    not_found_if_none(group_opt, "IGroup", &name)?;
+
+    sqlx::query!(
+        "DELETE FROM email_to_igroup WHERE email = $1 AND igroup = $2",
+        email,
+        name,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroup.removeuser",
+        ActionKind::Update,
+        "global",
+        Some(&name.to_string()),
+        Some([("email", email.as_str())].into()),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(format!("Added {} to igroup {}", email, name))
+}
+
 async fn remove_user(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, name)): Path<(String, String)>,
     Json(Username { username: user_username }): Json<Username>,
 ) -> Result<String> {
@@ -422,19 +725,18 @@ async fn remove_user(
     if &name == "all" {
         return Err(Error::BadRequest(format!("Cannot delete users from all")));
     }
-    sqlx::query_as!(
-        Group,
+    sqlx::query!(
         "DELETE FROM usr_to_group WHERE usr = $1 AND group_ = $2 AND workspace_id = $3",
         user_username,
         name,
         &w_id,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "group.removeuser",
         ActionKind::Update,
         &w_id,
@@ -444,5 +746,133 @@ async fn remove_user(
     .await?;
 
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        windmill_git_sync::DeployedObject::Group { name: name.clone() },
+        Some(format!("Removed user from group '{}'", &name)),
+        rsmq,
+        true,
+    )
+    .await?;
+
     Ok(format!("Removed {} to group {}", user_username, name))
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Serialize, Deserialize)]
+struct ExportedIGroup {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scim_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emails: Option<Vec<String>>,
+}
+
+#[cfg(feature = "enterprise")]
+async fn export_igroups(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+) -> JsonResult<Vec<ExportedIGroup>> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+    let igroups = sqlx::query_as!(
+        ExportedIGroup,
+        "SELECT name, summary, array_remove(array_agg(email_to_igroup.email), null) as emails, id, scim_display_name, external_id FROM email_to_igroup RIGHT JOIN instance_group ON instance_group.name = email_to_igroup.igroup GROUP BY name",
+    ).fetch_all(&mut *tx).await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroups.export",
+        ActionKind::Execute,
+        "global",
+        None,
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(igroups))
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn export_igroups() -> JsonResult<String> {
+    Err(Error::BadRequest(
+        "This feature is only available in the enterprise version".to_string(),
+    ))
+}
+
+#[cfg(feature = "enterprise")]
+async fn overwrite_igroups(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Json(igroups): Json<Vec<ExportedIGroup>>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+
+    sqlx::query!("DELETE FROM email_to_igroup")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query!("DELETE FROM instance_group")
+        .execute(&mut *tx)
+        .await?;
+
+    for igroup in igroups.iter() {
+        sqlx::query!(
+            "INSERT INTO instance_group (name, summary, id, scim_display_name, external_id) VALUES ($1, $2, $3, $4, $5)",
+            igroup.name,
+            igroup.summary,
+            igroup.id,
+            igroup.scim_display_name,
+            igroup.external_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(emails) = &igroup.emails {
+            for email in emails.iter() {
+                sqlx::query!(
+                    "INSERT INTO email_to_igroup (email, igroup) VALUES ($1, $2)",
+                    email,
+                    igroup.name,
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+    }
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "igroups.import",
+        ActionKind::Create,
+        "global",
+        None,
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok("Imported igroups".to_string())
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn overwrite_igroups() -> JsonResult<String> {
+    Err(Error::BadRequest(
+        "This feature is only available in the enterprise version".to_string(),
+    ))
 }

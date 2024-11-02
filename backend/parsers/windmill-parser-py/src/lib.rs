@@ -9,28 +9,28 @@
 use std::collections::HashMap;
 
 use itertools::Itertools;
-use lazy_static::lazy_static;
-use phf::phf_map;
-use regex::Regex;
 
 use serde_json::json;
-use windmill_common::error;
 use windmill_parser::{json_to_typ, Arg, MainArgSignature, Typ};
 
-use rustpython_parser::ast::{Constant, ExprKind, Located, StmtKind};
-use rustpython_parser::parser::parse_program;
+use rustpython_parser::{
+    ast::{
+        Constant, Expr, ExprConstant, ExprDict, ExprList, ExprName, Stmt, StmtFunctionDef, Suite,
+    },
+    Parse,
+};
 
-const DEF_MAIN: &str = "def main(";
 const FUNCTION_CALL: &str = "<function call>";
 
-fn filter_non_main(code: &str) -> String {
+fn filter_non_main(code: &str, main_name: &str) -> String {
+    let def_main = format!("def {}(", main_name);
     let mut filtered_code = String::new();
     let mut code_iter = code.split("\n");
     let mut remaining: String = String::new();
     while let Some(line) = code_iter.next() {
-        if line.starts_with(DEF_MAIN) {
-            filtered_code += DEF_MAIN;
-            remaining += line.strip_prefix(DEF_MAIN).unwrap();
+        if line.starts_with(&def_main) {
+            filtered_code += &def_main;
+            remaining += line.strip_prefix(&def_main).unwrap();
             remaining += &code_iter.join("\n");
             break;
         }
@@ -57,56 +57,57 @@ fn filter_non_main(code: &str) -> String {
     return filtered_code;
 }
 
-pub fn parse_python_signature(code: &str) -> error::Result<MainArgSignature> {
-    let filtered_code = filter_non_main(code);
+pub fn parse_python_signature(
+    code: &str,
+    override_main: Option<String>,
+) -> anyhow::Result<MainArgSignature> {
+    let main_name = override_main.unwrap_or("main".to_string());
+
+    let has_preprocessor = !filter_non_main(code, "preprocessor").is_empty();
+
+    let filtered_code = filter_non_main(code, &main_name);
     if filtered_code.is_empty() {
-        return Err(error::Error::BadRequest(
-            "No main function found".to_string(),
-        ));
+        return Ok(MainArgSignature {
+            star_args: false,
+            star_kwargs: false,
+            args: vec![],
+            no_main_func: Some(true),
+            has_preprocessor: Some(has_preprocessor),
+        });
     }
-    let ast = parse_program(&filtered_code, "main.py").map_err(|e| {
-        error::Error::ExecutionErr(format!("Error parsing code: {}", e.to_string()))
-    })?;
+    let ast = Suite::parse(&filtered_code, "main.py")
+        .map_err(|e| anyhow::anyhow!("Error parsing code: {}", e.to_string()))?;
+
     let param = ast.into_iter().find_map(|x| match x {
-        Located { node: StmtKind::FunctionDef { name, args, .. }, .. } if &name == "main" => {
-            Some(*args)
-        }
+        Stmt::FunctionDef(StmtFunctionDef { name, args, .. }) if &name == &main_name => Some(*args),
         _ => None,
     });
     if let Some(params) = param {
         //println!("{:?}", params);
-        let def_arg_start = params.args.len() - params.defaults.len();
+        let def_arg_start = params.args.len() - params.defaults().count();
         Ok(MainArgSignature {
             star_args: params.vararg.is_some(),
             star_kwargs: params.kwarg.is_some(),
             args: params
                 .args
-                .into_iter()
+                .iter()
                 .enumerate()
                 .map(|(i, x)| {
-                    let x = x.node;
                     let default = if i >= def_arg_start {
-                        to_value(&params.defaults[i - def_arg_start].node)
+                        params
+                            .defaults()
+                            .nth(i - def_arg_start)
+                            .map(to_value)
+                            .flatten()
                     } else {
                         None
                     };
 
-                    let mut typ = x.annotation.map_or(Typ::Unknown, |e| match *e {
-                        Located { node: ExprKind::Name { id, .. }, .. } => match id.as_ref() {
-                            "str" => Typ::Str(None),
-                            "float" => Typ::Float,
-                            "int" => Typ::Int,
-                            "bool" => Typ::Bool,
-                            "dict" => Typ::Object(vec![]),
-                            "list" => Typ::List(Box::new(Typ::Str(None))),
-                            "bytes" => Typ::Bytes,
-                            "datetime" => Typ::Datetime,
-                            "datetime.datetime" => Typ::Datetime,
-                            "Sql" | "sql" => Typ::Sql,
-                            _ => Typ::Resource(id),
-                        },
-                        _ => Typ::Unknown,
-                    });
+                    let mut typ = x
+                        .as_arg()
+                        .annotation
+                        .as_ref()
+                        .map_or(Typ::Unknown, |e| parse_expr(e));
 
                     if typ == Typ::Unknown
                         && default.is_some()
@@ -115,44 +116,122 @@ pub fn parse_python_signature(code: &str) -> error::Result<MainArgSignature> {
                         typ = json_to_typ(default.as_ref().unwrap());
                     }
 
-                    Arg { otyp: None, name: x.arg, typ, has_default: default.is_some(), default }
+                    Arg {
+                        otyp: None,
+                        name: x.as_arg().arg.to_string(),
+                        typ,
+                        has_default: default.is_some(),
+                        default,
+                        oidx: None,
+                    }
                 })
                 .collect(),
+            no_main_func: Some(false),
+            has_preprocessor: Some(has_preprocessor),
         })
     } else {
-        Err(error::Error::ExecutionErr(
-            "main function was not findable".to_string(),
-        ))
+        Ok(MainArgSignature {
+            star_args: false,
+            star_kwargs: false,
+            args: vec![],
+            no_main_func: Some(true),
+            has_preprocessor: Some(has_preprocessor),
+        })
     }
 }
 
-fn to_value(et: &ExprKind) -> Option<serde_json::Value> {
+fn parse_expr(e: &Box<Expr>) -> Typ {
+    match e.as_ref() {
+        Expr::Name(ExprName { id, .. }) => parse_typ(id.as_ref()),
+        Expr::Attribute(x) => {
+            if x.value
+                .as_name_expr()
+                .is_some_and(|x| x.id.as_str() == "wmill")
+            {
+                parse_typ(x.attr.as_str())
+            } else {
+                Typ::Unknown
+            }
+        }
+        Expr::Subscript(x) => match x.value.as_ref() {
+            Expr::Name(ExprName { id, .. }) => match id.as_str() {
+                "Literal" => {
+                    let values = match x.slice.as_ref() {
+                        Expr::Tuple(elts) => {
+                            let v: Vec<String> = elts
+                                .elts
+                                .iter()
+                                .map(|x| match x {
+                                    Expr::Constant(c) => c.value.as_str().map(|x| x.to_string()),
+                                    _ => None,
+                                })
+                                .filter_map(|x| x)
+                                .collect();
+                            if v.is_empty() {
+                                None
+                            } else {
+                                Some(v)
+                            }
+                        }
+                        _ => None,
+                    };
+                    Typ::Str(values)
+                }
+                "List" => Typ::List(Box::new(parse_expr(&x.slice))),
+                _ => Typ::Unknown,
+            },
+            _ => Typ::Unknown,
+        },
+        _ => Typ::Unknown,
+    }
+}
+
+fn parse_typ(id: &str) -> Typ {
+    match id {
+        "str" => Typ::Str(None),
+        "float" => Typ::Float,
+        "int" => Typ::Int,
+        "bool" => Typ::Bool,
+        "dict" => Typ::Object(vec![]),
+        "list" => Typ::List(Box::new(Typ::Str(None))),
+        "bytes" => Typ::Bytes,
+        "datetime" => Typ::Datetime,
+        "datetime.datetime" => Typ::Datetime,
+        "Sql" | "sql" => Typ::Sql,
+        x @ _ if x.starts_with("DynSelect_") => {
+            Typ::DynSelect(x.strip_prefix("DynSelect_").unwrap().to_string())
+        }
+        _ => Typ::Resource(id.to_string()),
+    }
+}
+
+fn to_value<R>(et: &Expr<R>) -> Option<serde_json::Value> {
     match et {
-        ExprKind::Constant { value, .. } => Some(constant_to_value(value)),
-        ExprKind::Dict { keys, values } => {
+        Expr::Constant(ExprConstant { value, .. }) => Some(constant_to_value(value)),
+        Expr::Dict(ExprDict { keys, values, .. }) => {
             let v = keys
                 .into_iter()
                 .zip(values)
                 .map(|(k, v)| {
-                    let key = to_value(&k.node)
+                    let key = k
+                        .as_ref()
+                        .map(to_value)
+                        .flatten()
                         .and_then(|x| match x {
                             serde_json::Value::String(s) => Some(s),
                             _ => None,
                         })
                         .unwrap_or_else(|| "no_key".to_string());
-                    (key, to_value(&v.node))
+                    (key, to_value(&v))
                 })
                 .collect::<HashMap<String, _>>();
             Some(json!(v))
         }
-        ExprKind::List { elts, .. } => {
-            let v = elts
-                .into_iter()
-                .map(|x| to_value(&x.node))
-                .collect::<Vec<_>>();
+        Expr::List(ExprList { elts, .. }) => {
+            let v = elts.into_iter().map(|x| to_value(&x)).collect::<Vec<_>>();
             Some(json!(v))
         }
-        ExprKind::Call { .. } => Some(json!(FUNCTION_CALL)),
+        Expr::Call { .. } => Some(json!(FUNCTION_CALL)),
         _ => None,
     }
 }
@@ -168,89 +247,6 @@ fn constant_to_value(c: &Constant) -> serde_json::Value {
         Constant::Float(f) => json!(f),
         Constant::Complex { real, imag } => json!([real, imag]),
         Constant::Ellipsis => json!("..."),
-    }
-}
-
-static PYTHON_IMPORTS_REPLACEMENT: phf::Map<&'static str, &'static str> = phf_map! {
-    "psycopg2" => "psycopg2-binary",
-    "psycopg" => "psycopg[binary, pool]",
-    "yaml" => "pyyaml",
-    "git" => "GitPython",
-    "u" => "requests",
-    "f" => "requests",
-    "." => "requests",
-    "shopify" => "ShopifyAPI",
-    "seleniumwire" => "selenium-wire",
-    "openbb-terminal" => "openbb[all]",
-    "riskfolio" => "riskfolio-lib",
-    "smb" => "pysmb",
-};
-
-fn replace_import(x: String) -> String {
-    PYTHON_IMPORTS_REPLACEMENT
-        .get(&x)
-        .map(|x| x.to_owned())
-        .unwrap_or(&x)
-        .to_string()
-}
-
-lazy_static! {
-    static ref RE: Regex = Regex::new(r"^\#\s?(\S+)$").unwrap();
-}
-
-pub fn parse_python_imports(code: &str) -> error::Result<Vec<String>> {
-    let find_requirements = code
-        .lines()
-        .find_position(|x| x.starts_with("#requirements:") || x.starts_with("# requirements:"));
-    if let Some((pos, _)) = find_requirements {
-        let lines = code
-            .lines()
-            .skip(pos + 1)
-            .map_while(|x| {
-                RE.captures(x)
-                    .map(|x| x.get(1).unwrap().as_str().to_string())
-            })
-            .collect();
-        Ok(lines)
-    } else {
-        let code = code.split(DEF_MAIN).next().unwrap_or("");
-        let ast = parse_program(code, "main.py").map_err(|e| {
-            error::Error::ExecutionErr(format!("Error parsing code: {}", e.to_string()))
-        })?;
-        let mut imports: Vec<String> = ast
-            .into_iter()
-            .filter_map(|x| match x {
-                Located { node, .. } => match node {
-                    StmtKind::Import { names } => Some(
-                        names
-                            .into_iter()
-                            .map(|x| {
-                                let name = x.node.name;
-                                if name.starts_with('.') {
-                                    ".".to_string()
-                                } else {
-                                    name.split('.').next().unwrap_or("").to_string()
-                                }
-                            })
-                            .map(replace_import)
-                            .collect::<Vec<String>>(),
-                    ),
-                    StmtKind::ImportFrom { level: Some(i), .. } if i > 0 => {
-                        Some(vec!["requests".to_string()])
-                    }
-                    StmtKind::ImportFrom { level: _, module: Some(mod_), names: _ } => {
-                        let imprt = mod_.split('.').next().unwrap_or("").replace("_", "-");
-                        Some(vec![replace_import(imprt)])
-                    }
-                    _ => None,
-                },
-            })
-            .flatten()
-            .filter(|x| !STDIMPORTS.contains(&x.as_str()))
-            .unique()
-            .collect();
-        imports.sort();
-        Ok(imports)
     }
 }
 
@@ -276,7 +272,7 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
 ";
         //println!("{}", serde_json::to_string()?);
         assert_eq!(
-            parse_python_signature(code)?,
+            parse_python_signature(code, None)?,
             MainArgSignature {
                 star_args: false,
                 star_kwargs: false,
@@ -286,51 +282,60 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         name: "test1".to_string(),
                         typ: Typ::Str(None),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "name".to_string(),
                         typ: Typ::Unknown,
                         default: Some(json!("<function call>")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "byte".to_string(),
                         typ: Typ::Bytes,
                         default: Some(json!("<function call>")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "f".to_string(),
                         typ: Typ::Str(None),
                         default: Some(json!("wewe")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "g".to_string(),
                         typ: Typ::Int,
                         default: Some(json!(21)),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "h".to_string(),
                         typ: Typ::List(Box::new(Typ::Int)),
                         default: Some(json!([1, 2])),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "i".to_string(),
                         typ: Typ::Bool,
                         default: Some(json!(true)),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
-                ]
+                ],
+                no_main_func: Some(false),
+                has_preprocessor: Some(false)
             }
         );
 
@@ -356,7 +361,7 @@ def main(test1: str,
 ";
         //println!("{}", serde_json::to_string()?);
         assert_eq!(
-            parse_python_signature(code)?,
+            parse_python_signature(code, None)?,
             MainArgSignature {
                 star_args: false,
                 star_kwargs: false,
@@ -366,30 +371,36 @@ def main(test1: str,
                         name: "test1".to_string(),
                         typ: Typ::Str(None),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "name".to_string(),
                         typ: Typ::Unknown,
                         default: Some(json!("<function call>")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "byte".to_string(),
                         typ: Typ::Bytes,
                         default: Some(json!("<function call>")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "resource".to_string(),
                         typ: Typ::Resource("postgresql".to_string()),
                         default: Some(json!("$res:g/all/resource")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     }
-                ]
+                ],
+                no_main_func: Some(false),
+                has_preprocessor: Some(false)
             }
         );
 
@@ -403,13 +414,14 @@ def main(test1: str,
 import os
 
 def main(test1: str,
+    s3o: wmill.S3Object,
     name = \"test\",
     byte: bytes = bytes(1)): return
 
 ";
         //println!("{}", serde_json::to_string()?);
         assert_eq!(
-            parse_python_signature(code)?,
+            parse_python_signature(code, None)?,
             MainArgSignature {
                 star_args: false,
                 star_kwargs: false,
@@ -419,23 +431,36 @@ def main(test1: str,
                         name: "test1".to_string(),
                         typ: Typ::Str(None),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
+                    },
+                    Arg {
+                        otyp: None,
+                        name: "s3o".to_string(),
+                        typ: Typ::Resource("S3Object".to_string()),
+                        default: None,
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "name".to_string(),
                         typ: Typ::Str(None),
                         default: Some(json!("test")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     },
                     Arg {
                         otyp: None,
                         name: "byte".to_string(),
                         typ: Typ::Bytes,
                         default: Some(json!("<function call>")),
-                        has_default: true
+                        has_default: true,
+                        oidx: None
                     }
-                ]
+                ],
+                no_main_func: Some(false),
+                has_preprocessor: Some(false)
             }
         );
 
@@ -443,352 +468,129 @@ def main(test1: str,
     }
 
     #[test]
-    fn test_parse_python_imports() -> anyhow::Result<()> {
-        //let code = "print(2 + 3, fd=sys.stderr)";
-        let code = "
+    fn test_parse_python_sig_4() -> anyhow::Result<()> {
+        let code = r#"
 
 import os
-import wmill
-from zanzibar.estonie import talin
-import matplotlib.pyplot as plt
-from . import tests
 
-def main():
-    pass
+def main(test1: Literal["foo", "bar"], test2: List[Literal["foo", "bar"]]): return
 
-";
-        let r = parse_python_imports(code)?;
-        // println!("{}", serde_json::to_string(&r)?);
-        assert_eq!(r, vec!["matplotlib", "requests", "wmill", "zanzibar"]);
+"#;
+        //println!("{}", serde_json::to_string()?);
+        assert_eq!(
+            parse_python_signature(code, None)?,
+            MainArgSignature {
+                star_args: false,
+                star_kwargs: false,
+                args: vec![
+                    Arg {
+                        otyp: None,
+                        name: "test1".to_string(),
+                        typ: Typ::Str(Some(vec!["foo".to_string(), "bar".to_string()])),
+                        default: None,
+                        has_default: false,
+                        oidx: None
+                    },
+                    Arg {
+                        otyp: None,
+                        name: "test2".to_string(),
+                        typ: Typ::List(Box::new(Typ::Str(Some(vec![
+                            "foo".to_string(),
+                            "bar".to_string()
+                        ])))),
+                        default: None,
+                        has_default: false,
+                        oidx: None
+                    }
+                ],
+                no_main_func: Some(false),
+                has_preprocessor: Some(false)
+            }
+        );
+
         Ok(())
     }
 
     #[test]
-    fn test_parse_python_imports2() -> anyhow::Result<()> {
-        //let code = "print(2 + 3, fd=sys.stderr)";
-        let code = "
-#requirements:
-#burkina=0.4
-#nigeria
-#
-#congo
+    fn test_parse_python_sig_5() -> anyhow::Result<()> {
+        let code = r#"
 
 import os
-import wmill
-from zanzibar.estonie import talin
 
-def main():
-    pass
+def main(test1: DynSelect_foo): return
 
-";
-        let r = parse_python_imports(code)?;
-        println!("{}", serde_json::to_string(&r)?);
-        assert_eq!(r, vec!["burkina=0.4", "nigeria"]);
+"#;
+        //println!("{}", serde_json::to_string()?);
+        assert_eq!(
+            parse_python_signature(code, None)?,
+            MainArgSignature {
+                star_args: false,
+                star_kwargs: false,
+                args: vec![Arg {
+                    otyp: None,
+                    name: "test1".to_string(),
+                    typ: Typ::DynSelect("foo".to_string()),
+                    default: None,
+                    has_default: false,
+                    oidx: None
+                }],
+                no_main_func: Some(false),
+                has_preprocessor: Some(false)
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_python_sig_6() -> anyhow::Result<()> {
+        let code = r#"
+
+import os
+
+def hello(): return
+
+"#;
+        //println!("{}", serde_json::to_string()?);
+        assert_eq!(
+            parse_python_signature(code, None)?,
+            MainArgSignature {
+                star_args: false,
+                star_kwargs: false,
+                args: vec![],
+                no_main_func: Some(true),
+                has_preprocessor: Some(false)
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_python_sig_7() -> anyhow::Result<()> {
+        let code = r#"
+
+import os
+
+def preprocessor(): return
+
+def main(): return
+
+
+
+"#;
+        //println!("{}", serde_json::to_string()?);
+        assert_eq!(
+            parse_python_signature(code, None)?,
+            MainArgSignature {
+                star_args: false,
+                star_kwargs: false,
+                args: vec![],
+                no_main_func: Some(false),
+                has_preprocessor: Some(true)
+            }
+        );
 
         Ok(())
     }
 }
-
-const STDIMPORTS: [&str; 301] = [
-    "__future__",
-    "_abc",
-    "_aix_support",
-    "_ast",
-    "_asyncio",
-    "_bisect",
-    "_blake2",
-    "_bootsubprocess",
-    "_bz2",
-    "_codecs",
-    "_codecs_cn",
-    "_codecs_hk",
-    "_codecs_iso2022",
-    "_codecs_jp",
-    "_codecs_kr",
-    "_codecs_tw",
-    "_collections",
-    "_collections_abc",
-    "_compat_pickle",
-    "_compression",
-    "_contextvars",
-    "_crypt",
-    "_csv",
-    "_ctypes",
-    "_curses",
-    "_curses_panel",
-    "_datetime",
-    "_dbm",
-    "_decimal",
-    "_elementtree",
-    "_frozen_importlib",
-    "_frozen_importlib_external",
-    "_functools",
-    "_gdbm",
-    "_hashlib",
-    "_heapq",
-    "_imp",
-    "_io",
-    "_json",
-    "_locale",
-    "_lsprof",
-    "_lzma",
-    "_markupbase",
-    "_md5",
-    "_msi",
-    "_multibytecodec",
-    "_multiprocessing",
-    "_opcode",
-    "_operator",
-    "_osx_support",
-    "_overlapped",
-    "_pickle",
-    "_posixshmem",
-    "_posixsubprocess",
-    "_py_abc",
-    "_pydecimal",
-    "_pyio",
-    "_queue",
-    "_random",
-    "_sha1",
-    "_sha256",
-    "_sha3",
-    "_sha512",
-    "_signal",
-    "_sitebuiltins",
-    "_socket",
-    "_sqlite3",
-    "_sre",
-    "_ssl",
-    "_stat",
-    "_statistics",
-    "_string",
-    "_strptime",
-    "_struct",
-    "_symtable",
-    "_thread",
-    "_threading_local",
-    "_tkinter",
-    "_tracemalloc",
-    "_uuid",
-    "_warnings",
-    "_weakref",
-    "_weakrefset",
-    "_winapi",
-    "_zoneinfo",
-    "abc",
-    "aifc",
-    "antigravity",
-    "argparse",
-    "array",
-    "ast",
-    "asynchat",
-    "asyncio",
-    "asyncore",
-    "atexit",
-    "audioop",
-    "base64",
-    "bdb",
-    "binascii",
-    "binhex",
-    "bisect",
-    "builtins",
-    "bz2",
-    "cProfile",
-    "calendar",
-    "cgi",
-    "cgitb",
-    "chunk",
-    "cmath",
-    "cmd",
-    "code",
-    "codecs",
-    "codeop",
-    "collections",
-    "colorsys",
-    "compileall",
-    "concurrent",
-    "configparser",
-    "contextlib",
-    "contextvars",
-    "copy",
-    "copyreg",
-    "crypt",
-    "csv",
-    "ctypes",
-    "curses",
-    "dataclasses",
-    "datetime",
-    "dbm",
-    "decimal",
-    "difflib",
-    "dis",
-    "distutils",
-    "doctest",
-    "email",
-    "encodings",
-    "ensurepip",
-    "enum",
-    "errno",
-    "faulthandler",
-    "fcntl",
-    "filecmp",
-    "fileinput",
-    "fnmatch",
-    "fractions",
-    "ftplib",
-    "functools",
-    "gc",
-    "genericpath",
-    "getopt",
-    "getpass",
-    "gettext",
-    "glob",
-    "graphlib",
-    "grp",
-    "gzip",
-    "hashlib",
-    "heapq",
-    "hmac",
-    "html",
-    "http",
-    "idlelib",
-    "imaplib",
-    "imghdr",
-    "imp",
-    "importlib",
-    "inspect",
-    "io",
-    "ipaddress",
-    "itertools",
-    "json",
-    "keyword",
-    "lib2to3",
-    "linecache",
-    "locale",
-    "logging",
-    "lzma",
-    "mailbox",
-    "mailcap",
-    "marshal",
-    "math",
-    "mimetypes",
-    "mmap",
-    "modulefinder",
-    "msilib",
-    "msvcrt",
-    "multiprocessing",
-    "netrc",
-    "nis",
-    "nntplib",
-    "nt",
-    "ntpath",
-    "nturl2path",
-    "numbers",
-    "opcode",
-    "operator",
-    "optparse",
-    "os",
-    "ossaudiodev",
-    "pathlib",
-    "pdb",
-    "pickle",
-    "pickletools",
-    "pipes",
-    "pkgutil",
-    "platform",
-    "plistlib",
-    "poplib",
-    "posix",
-    "posixpath",
-    "pprint",
-    "profile",
-    "pstats",
-    "pty",
-    "pwd",
-    "py_compile",
-    "pyclbr",
-    "pydoc",
-    "pydoc_data",
-    "pyexpat",
-    "queue",
-    "quopri",
-    "random",
-    "re",
-    "readline",
-    "reprlib",
-    "resource",
-    "rlcompleter",
-    "runpy",
-    "sched",
-    "secrets",
-    "select",
-    "selectors",
-    "shelve",
-    "shlex",
-    "shutil",
-    "signal",
-    "site",
-    "smtpd",
-    "smtplib",
-    "sndhdr",
-    "socket",
-    "socketserver",
-    "spwd",
-    "sqlite3",
-    "sre_compile",
-    "sre_constants",
-    "sre_parse",
-    "ssl",
-    "stat",
-    "statistics",
-    "string",
-    "stringprep",
-    "struct",
-    "subprocess",
-    "sunau",
-    "symtable",
-    "sys",
-    "sysconfig",
-    "syslog",
-    "tabnanny",
-    "tarfile",
-    "telnetlib",
-    "tempfile",
-    "termios",
-    "textwrap",
-    "this",
-    "threading",
-    "time",
-    "timeit",
-    "tkinter",
-    "token",
-    "tokenize",
-    "trace",
-    "traceback",
-    "tracemalloc",
-    "tty",
-    "turtle",
-    "turtledemo",
-    "types",
-    "typing",
-    "unicodedata",
-    "unittest",
-    "urllib",
-    "uu",
-    "uuid",
-    "venv",
-    "warnings",
-    "wave",
-    "weakref",
-    "webbrowser",
-    "winreg",
-    "winsound",
-    "wsgiref",
-    "xdrlib",
-    "xml",
-    "xmlrpc",
-    "zipapp",
-    "zipfile",
-    "zipimport",
-    "",
-];

@@ -1,39 +1,48 @@
 <script lang="ts">
-	import { JobService, Preview, ResourceService } from '$lib/gen'
+	import { OauthService, type ResourceType } from '$lib/gen'
 	import { workspaceStore } from '$lib/stores'
+	import { base } from '$lib/base'
 	import { emptySchema, emptyString } from '$lib/utils'
-	import { Loader2 } from 'lucide-svelte'
-	import Button from './common/button/Button.svelte'
 	import SchemaForm from './SchemaForm.svelte'
 	import SimpleEditor from './SimpleEditor.svelte'
 	import Toggle from './Toggle.svelte'
-	import { sendUserToast } from '$lib/toast'
+	import TestConnection from './TestConnection.svelte'
+	import SupabaseIcon from './icons/SupabaseIcon.svelte'
+	import Popup from './common/popup/Popup.svelte'
+	import Button from './common/button/Button.svelte'
 
-	export let resource_type: string
+	export let resourceType: string
+	export let resourceTypeInfo: ResourceType | undefined
 	export let args: Record<string, any> | any = {}
-	export let password: string
+	export let linkedSecret: string | undefined = undefined
 	export let isValid = true
+	export let linkedSecretCandidates: string[] | undefined = undefined
 
 	let schema = emptySchema()
 	let notFound = false
 
+	let supabaseWizard = false
+
+	async function isSupabaseAvailable() {
+		supabaseWizard =
+			((await OauthService.listOauthConnects()) ?? {})['supabase_wizard'] != undefined
+	}
 	async function loadSchema() {
+		if (!resourceTypeInfo) return
 		rawCode = '{}'
 		viewJsonSchema = false
 		try {
-			const rt = await ResourceService.getResourceType({
-				workspace: $workspaceStore!,
-				path: resource_type
-			})
-			schema = rt.schema
+			schema = resourceTypeInfo.schema as any
+
+			schema.order = schema.order ?? Object.keys(schema.properties).sort()
+
 			notFound = false
 		} catch (e) {
 			notFound = true
 		}
 	}
-	$: {
-		$workspaceStore && loadSchema()
-	}
+	$: $workspaceStore && loadSchema()
+
 	$: notFound && rawCode && parseJson()
 
 	function parseJson() {
@@ -52,67 +61,131 @@
 
 	$: rawCode && parseJson()
 
+	$: textFileContent && parseTextFileContent()
+
 	function switchTab(asJson: boolean) {
 		viewJsonSchema = asJson
 		if (asJson) {
 			rawCode = JSON.stringify(args, null, 2)
 		} else {
 			parseJson()
+			if (resourceTypeInfo?.format_extension) {
+				textFileContent = args.content
+			}
 		}
 	}
 
-	let loading = false
-	async function testConnection() {
-		loading = true
-		const job = await JobService.runScriptPreview({
-			workspace: $workspaceStore!,
-			requestBody: {
-				language: 'deno' as Preview.language,
-				content: `
-import { Client } from 'https://deno.land/x/postgres/mod.ts'
-export async function main(args: any) {
-	const client = new Client("postgres://" + args.user + ":" + args.password + "@" + args.host + ":" + args.port + "/" + args.dbname + "?sslmode=" + args.sslmode)
-	await client.connect()
-	return 'Connection successful'
-}
-				`,
-				args: {
-					args
-				}
-			}
-		})
-		await new Promise((r) => setTimeout(r, 3000))
-		loading = false
-		const testResult = await JobService.getCompletedJob({
-			workspace: $workspaceStore!,
-			id: job
-		})
-		if (testResult) {
-			sendUserToast(
-				testResult.success ? testResult.result : testResult.result?.['error']?.['message'],
-				!testResult.success
+	$: resourceType == 'postgresql' && isSupabaseAvailable()
+
+	let connectionString = ''
+	let validConnectionString = true
+	function parseConnectionString(close: (_: any) => void) {
+		// parse postgres connection string
+		const regex =
+			/postgres:\/\/(?<user>[^:@]+)(?::(?<password>[^@]+))?@(?<host>[^:\/?]+)(?::(?<port>\d+))?\/(?<dbname>[^\?]+)?(?:\?.*sslmode=(?<sslmode>[^&]+))?/
+		const match = connectionString.match(regex)
+		if (match) {
+			validConnectionString = true
+			const { user, password, host, port, dbname, sslmode } = match.groups!
+			rawCode = JSON.stringify(
+				{
+					...args,
+					user,
+					password: password || args?.password,
+					host,
+					port: (port ? Number(port) : undefined) || args?.port,
+					dbname: dbname || args?.dbname,
+					sslmode: sslmode || args?.sslmode
+				},
+				null,
+				2
 			)
+			rawCodeEditor?.setCode(rawCode)
+			close(null)
+		} else {
+			validConnectionString = false
+		}
+	}
+
+	let rawCodeEditor: SimpleEditor | undefined = undefined
+	let textFileContent: string
+
+	function parseTextFileContent() {
+		args = {
+			content: textFileContent
 		}
 	}
 </script>
 
 {#if !notFound}
-	<div class="w-full flex gap-4 flex-row-reverse">
+	<div class="w-full flex gap-4 flex-row-reverse items-center">
 		<Toggle
 			on:change={(e) => switchTab(e.detail)}
 			options={{
 				right: 'As JSON'
 			}}
 		/>
-		{#if resource_type == 'postgresql'}
-			<Button size="sm" on:click={testConnection}
-				>{#if loading}<Loader2 class="animate-spin mr-2" />{/if} Test connection</Button
+		<TestConnection {resourceType} {args} />
+		{#if resourceType == 'postgresql'}
+			<Popup
+				let:close
+				floatingConfig={{
+					placement: 'bottom'
+				}}
 			>
+				<svelte:fragment slot="button">
+					<Button
+						spacingSize="sm"
+						size="xs"
+						btnClasses="h-8"
+						color="light"
+						variant="border"
+						nonCaptureEvent
+					>
+						From connection string
+					</Button>
+				</svelte:fragment>
+				<div class="block text-primary">
+					<div class="w-[550px] flex flex-col items-start gap-1">
+						<div class="flex flex-row gap-1 w-full">
+							<input
+								type="text"
+								bind:value={connectionString}
+								placeholder="postgres://user:password@host:5432/dbname?sslmode=disable"
+							/>
+							<Button
+								size="xs"
+								color="blue"
+								buttonType="button"
+								on:click={() => {
+									parseConnectionString(close)
+								}}
+								disabled={connectionString.length <= 0}
+							>
+								Apply
+							</Button>
+						</div>
+						{#if !validConnectionString}
+							<p class="text-red-500 text-xs">Could not parse connection string</p>
+						{/if}
+					</div>
+				</div>
+			</Popup>
+		{/if}
+		{#if resourceType == 'postgresql' && supabaseWizard}
+			<a
+				target="_blank"
+				href="{base}/api/oauth/connect/supabase_wizard"
+				class="border rounded-lg flex flex-row gap-2 items-center text-xs px-3 py-1.5 h-8 bg-[#F1F3F5] hover:bg-[#E6E8EB] dark:bg-[#1C1C1C] dark:hover:bg-black"
+			>
+				<SupabaseIcon height="16px" width="16px" />
+				<div class="text-[#11181C] dark:text-[#EDEDED] font-semibold">Connect Supabase</div>
+			</a>
 		{/if}
 	</div>
 {:else}
-	<p class="italic text-gray-500 text-xs mb-4"
-		>No corresponding resource type found in your workspace for {resource_type}. Define the value in
+	<p class="italic text-tertiary text-xs mb-4"
+		>No corresponding resource type found in your workspace for {resourceType}. Define the value in
 		JSON directly</p
 	>
 {/if}
@@ -120,7 +193,37 @@ export async function main(args: any) {
 	{#if !emptyString(error)}<span class="text-red-400 text-xs mb-1 flex flex-row-reverse"
 			>{error}</span
 		>{:else}<div class="py-2" />{/if}
-	<SimpleEditor autoHeight lang="json" bind:code={rawCode} fixedOverflowWidgets={false} />
+	<div class="h-full w-full border p-1 rounded">
+		<SimpleEditor
+			bind:this={rawCodeEditor}
+			autoHeight
+			lang="json"
+			bind:code={rawCode}
+			fixedOverflowWidgets={false}
+		/>
+	</div>
+{:else if resourceTypeInfo?.format_extension}
+	<h5 class="mt-4 inline-flex items-center gap-4">
+		File content ({resourceTypeInfo.format_extension})
+	</h5>
+	<div class="py-2" />
+	<div class="h-full w-full border p-1 rounded">
+		<SimpleEditor
+			bind:this={rawCodeEditor}
+			autoHeight
+			lang={resourceTypeInfo.format_extension}
+			bind:code={textFileContent}
+			fixedOverflowWidgets={false}
+		/>
+	</div>
 {:else}
-	<SchemaForm noDelete {password} isValid {schema} bind:args />
+	<SchemaForm
+		onlyMaskPassword
+		noDelete
+		{linkedSecretCandidates}
+		bind:linkedSecret
+		isValid
+		{schema}
+		bind:args
+	/>
 {/if}

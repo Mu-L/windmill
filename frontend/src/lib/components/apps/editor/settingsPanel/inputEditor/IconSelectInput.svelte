@@ -1,121 +1,111 @@
 <script lang="ts">
-	import type { StaticInput } from '../../../inputType'
 	import { Loader2 } from 'lucide-svelte'
 	import { ClearableInput, Popup } from '../../../../common'
-	import { fade } from 'svelte/transition'
+	import { AllIcons } from './icons'
+	import type { ComputeConfig } from 'svelte-floating-ui'
 
-	export let componentInput: StaticInput<string>
+	export let value: string | undefined = ''
 
-	let anchor: HTMLElement
 	let loading = false
-	let items: { label: string; icon: any }[]
-	let filteredItems: { label: string; icon: any }[]
+	let items: string[]
+	let filteredItems: string[]
 	let search = ''
-	let openPopup: () => void
 
 	$: if (search) {
 		filteredItems = items.filter((item) => {
-			return item.label.toLowerCase().includes(search.toLowerCase())
+			return item.toLowerCase().includes(search.toLowerCase())
 		})
 	} else {
 		filteredItems = items
 	}
 
 	async function getData() {
-		if (items) {
-			return openPopup()
-		}
 		loading = true
-		const data = await import('lucide-svelte/dist/svelte/icons')
-
-		filteredItems = items = Object.entries(data)
-			.filter(([key]) => !(key.endsWith('Icon') || key.startsWith('Lucide')))
-			.map(([key, icon]) => ({ label: key, icon }))
+		// @ts-ignore
+		items = AllIcons
 
 		loading = false
-		openPopup()
 	}
 
 	function select(label: string) {
-		componentInput.value = label
+		value = label
 
 		const elem = document.activeElement as HTMLElement
 		if (elem.blur) {
 			elem.blur()
 		}
 	}
+
+	export let floatingConfig: ComputeConfig = {
+		strategy: 'absolute',
+		placement: 'bottom-end'
+	}
+	export let shouldUsePortal: boolean = true
 </script>
 
-<div bind:this={anchor} class="relative">
-	<ClearableInput
-		readonly
-		value={componentInput.value}
-		on:change={({ detail }) => (componentInput.value = detail)}
-		on:focus={getData}
-		class="!pr-6"
-	/>
-	{#if loading}
-		<div class="center-center absolute right-2 top-1/2 transform -translate-y-1/2 p-0.5">
-			<Loader2 class="animate-spin" size={16} />
+<Popup let:close {floatingConfig} {shouldUsePortal}>
+	<svelte:fragment slot="button">
+		<div class="relative">
+			<ClearableInput
+				readonly
+				{value}
+				on:change={({ detail }) => (value = detail)}
+				on:focus={getData}
+				class="!pr-6"
+			/>
+			{#if loading}
+				<div class="center-center absolute right-2 top-1/2 transform -translate-y-1/2 p-0.5">
+					<Loader2 class="animate-spin" size={16} />
+				</div>
+			{/if}
 		</div>
-	{/if}
-</div>
-{#if anchor}
-	<Popup
-		ref={anchor}
-		closeOn={[]}
-		options={{
-			placement: 'bottom-start',
-			strategy: 'fixed',
-			modifiers: [{ name: 'offset', options: { offset: [0, 6] } }]
-		}}
-		bind:open={openPopup}
-		let:close
-		transition={fade}
-		wrapperClasses=" z-[1002]"
-	>
-		{#if !loading}
-			<div class="w-72 shadow-[0_10px_40px_-5px_rgba(0,0,0,0.25)] bg-white rounded-md p-2">
-				{#if filteredItems}
-					<input
-						on:keydown={(event) => {
-							if (!['ArrowDown', 'ArrowUp'].includes(event.key)) {
-								event.stopPropagation()
-							}
-						}}
-						bind:value={search}
-						type="text"
-						placeholder="Search"
-						class="col-span-4 mb-2"
-					/>
-					<div class="grid gap-1 grid-cols-4 max-h-[300px] overflow-auto">
-						{#each filteredItems as { label, icon }}
-							<button
-								type="button"
-								title={label}
-								on:click={() => {
-									select(label)
-									close()
-								}}
-								class="w-full center-center flex-col font-normal p-1
-									hover:bg-gray-100 focus:bg-gray-100 rounded duration-200
-									{label === componentInput.value ? 'text-blue-600 bg-blue-50 pointer-events-none' : ''}"
-							>
-								<svelte:component this={icon} size={22} />
-								<span class="inline-block w-full text-[10px] ellipsize pt-0.5">
-									{label}
-								</span>
-							</button>
-						{:else}
-							<div class="col-span-4 text-center text-gray-700 text-sm p-2">
-								No icons match your search
-							</div>
-						{/each}
-					</div>
-				{:else}
-					<div class="text-center text-sm text-gray-600 p-2"> Couldn't load options </div>
-				{/if}
+	</svelte:fragment>
+	{#if !loading}
+		{#if filteredItems}
+			<div class="w-72">
+				<input
+					on:keydown={(event) => {
+						if (!['ArrowDown', 'ArrowUp'].includes(event.key)) {
+							event.stopPropagation()
+						}
+					}}
+					bind:value={search}
+					type="text"
+					placeholder="Search"
+					class="col-span-4 mb-2"
+				/>
+				<div class="grid gap-1 grid-cols-4 max-h-[300px] overflow-auto">
+					{#each filteredItems as label}
+						<button
+							type="button"
+							title={label}
+							on:click={() => {
+								select(label)
+								close(null)
+							}}
+							class="w-full center-center flex-col font-normal p-1
+									hover:bg-gray-100 focus:bg-gray-100 rounded duration-200 dark:hover:bg-frost-900 dark:focus:bg-frost-900
+									{label === value ? 'text-blue-600 bg-blue-50 pointer-events-none' : ''}"
+						>
+							<!-- svelte-ignore a11y-missing-attribute -->
+							<img
+								class="dark:invert"
+								loading="lazy"
+								src="https://cdn.jsdelivr.net/npm/lucide-static@0.367.0/icons/{label}.svg"
+							/>
+							<span class="inline-block w-full text-[10px] ellipsize pt-0.5">
+								{label}
+							</span>
+						</button>
+					{:else}
+						<div class="col-span-4 text-center text-secondary text-sm p-2">
+							No icons match your search
+						</div>
+					{/each}
+				</div>
 			</div>
+		{:else}
+			<div class="text-center text-sm text-secondary p-2"> Couldn't load options </div>
 		{/if}
-	</Popup>
-{/if}
+	{/if}
+</Popup>

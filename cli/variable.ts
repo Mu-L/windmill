@@ -6,21 +6,16 @@ import {
   parseFromFile,
   removeType,
 } from "./types.ts";
-import {
-  colors,
-  Command,
-  Confirm,
-  ListableVariable,
-  log,
-  Table,
-  VariableService,
-} from "./deps.ts";
+import { colors, Command, Confirm, log, SEP, Table } from "./deps.ts";
+
+import * as wmill from "./gen/services.gen.ts";
+import { ListableVariable } from "./gen/types.gen.ts";
 
 async function list(opts: GlobalOptions) {
   const workspace = await resolveWorkspace(opts);
   await requireLogin(opts);
 
-  const variables = await VariableService.listVariable({
+  const variables = await wmill.listVariable({
     workspace: workspace.workspaceId,
   });
 
@@ -52,23 +47,21 @@ export async function pushVariable(
   remotePath: string,
   variable: VariableFile | ListableVariable | undefined,
   localVariable: VariableFile,
-  plainSecrets: boolean,
-  raw: boolean
+  plainSecrets: boolean
 ): Promise<void> {
   remotePath = removeType(remotePath, "variable");
   log.debug(`Processing local variable ${remotePath}`);
 
-  if (raw) {
-    try {
-      variable = await VariableService.getVariable({
-        workspace: workspace,
-        path: remotePath,
-        decryptSecret: plainSecrets,
-      });
-      log.debug(`Variable ${remotePath} exists on remote`);
-    } catch {
-      log.debug(`Variable ${remotePath} does not exist on remote`);
-    }
+  try {
+    variable = await wmill.getVariable({
+      workspace: workspace,
+      path: remotePath.replaceAll(SEP, "/"),
+      decryptSecret: plainSecrets,
+      includeEncrypted: true,
+    });
+    log.debug(`Variable ${remotePath} exists on remote`);
+  } catch {
+    log.debug(`Variable ${remotePath} does not exist on remote`);
   }
 
   if (variable) {
@@ -76,11 +69,12 @@ export async function pushVariable(
       log.debug(`Variable ${remotePath} is up-to-date`);
       return;
     }
+
     log.debug(`Variable ${remotePath} is not up-to-date, updating`);
 
-    await VariableService.updateVariable({
+    await wmill.updateVariable({
       workspace,
-      path: remotePath,
+      path: remotePath.replaceAll(SEP, "/"),
       alreadyEncrypted: !plainSecrets,
       requestBody: {
         ...localVariable,
@@ -90,11 +84,11 @@ export async function pushVariable(
     });
   } else {
     log.info(colors.yellow.bold(`Creating new variable ${remotePath}...`));
-    await VariableService.createVariable({
+    await wmill.createVariable({
       workspace,
       alreadyEncrypted: !plainSecrets,
       requestBody: {
-        path: remotePath,
+        path: remotePath.replaceAll(SEP, "/"),
         ...localVariable,
       },
     });
@@ -125,14 +119,13 @@ async function push(
     remotePath,
     undefined,
     parseFromFile(filePath),
-    opts.plainSecrets,
-    true
+    opts.plainSecrets ?? false
   );
   log.info(colors.bold.underline.green(`Variable ${remotePath} pushed`));
 }
 
 async function add(
-  opts: GlobalOptions & { public?: boolean },
+  opts: GlobalOptions & { public?: boolean; plainSecrets?: boolean },
   value: string,
   remotePath: string
 ) {
@@ -144,7 +137,7 @@ async function add(
   }
 
   if (
-    await VariableService.existsVariable({
+    await wmill.existsVariable({
       workspace: workspace.workspaceId,
       path: remotePath,
     })
@@ -171,8 +164,7 @@ async function add(
       is_secret: !opts.public,
       description: "",
     },
-    true,
-    true
+    opts.plainSecrets ?? false
   );
   log.info(colors.bold.underline.green(`Variable ${remotePath} pushed`));
 }

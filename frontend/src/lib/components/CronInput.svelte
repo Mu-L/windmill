@@ -1,13 +1,18 @@
 <script lang="ts">
 	import { ScheduleService } from '$lib/gen'
-	import { emptyString, formatCron } from '$lib/utils'
+	import { emptyString, formatCron, sendUserToast } from '$lib/utils'
 	import Badge from './Badge.svelte'
-
 	// @ts-ignore
 	import Multiselect from 'svelte-multiselect'
-	import TimezonePicker from 'svelte-timezone-picker'
-	import CollapseLink from './CollapseLink.svelte'
 	import { Button } from './common'
+	import Select from '../components/apps/svelte-select/lib/index'
+	import timezones from './timezones'
+	import { SELECT_INPUT_DEFAULT_STYLE } from '$lib/defaults'
+	import { onMount } from 'svelte'
+	import CronBuilder from './CronBuilder.svelte'
+	import Label from './Label.svelte'
+	import CronGen from './copilot/CronGen.svelte'
+	import DarkModeObserver from './DarkModeObserver.svelte'
 
 	export let schedule: string
 	// export let offset: number = -60 * Math.floor(new Date().getTimezoneOffset() / 60)
@@ -64,6 +69,7 @@
 			if (err.status == 400 && err.body.includes('cron')) {
 				validCRON = false
 			} else {
+				sendUserToast(err.body, true)
 				validCRON = false
 			}
 		}
@@ -106,80 +112,141 @@
 		// If using the basic editor, set the cron string based on the selected options
 		if (executeEvery === 'second') {
 			if (seconds > 0) {
-				nschedule = `*/${seconds} * * * *`
+				nschedule = `*/${seconds} * * * * *`
 			} else {
-				nschedule = `* * * * *`
+				nschedule = `* * * * * *`
 			}
 		} else if (executeEvery === 'minute') {
 			if (minutes > 0) {
-				nschedule = `0 */${minutes} * * *`
+				nschedule = `0 */${minutes} * * * *`
 			} else {
-				nschedule = `* * * * *`
+				nschedule = `* * * * * *`
 			}
 		} else if (executeEvery === 'hour') {
 			if (hours > 0) {
-				nschedule = `0 0 */${hours} * *`
+				nschedule = `0 0 */${hours} * * *`
 			} else {
-				nschedule = `* * * * *`
+				nschedule = `* * * * * *`
 			}
 		} else if (executeEvery === 'day-month') {
-			nschedule = `0 ${s_AtUTCMinutes} ${s_AtUTCHours} ${s_daysOfMonth} *`
+			nschedule = `0 ${s_AtUTCMinutes} ${s_AtUTCHours} ${s_daysOfMonth} * *`
 		} else if (executeEvery === 'month') {
-			nschedule = `0 ${s_AtUTCMinutes} ${s_AtUTCHours} ${s_daysOfMonth} ${s_months}`
+			nschedule = `0 ${s_AtUTCMinutes} ${s_AtUTCHours} ${s_daysOfMonth} ${s_months} *`
 		} else if (executeEvery === 'day-week') {
 			nschedule = `0 ${s_AtUTCMinutes} ${s_AtUTCHours} * * ${s_daysOfWeek}`
 		}
 	}
 
-	$: dateFormatter = new Intl.DateTimeFormat('en-GB', {
-		weekday: 'short',
-		day: '2-digit',
-		month: 'short',
-		year: 'numeric',
-		hour: 'numeric',
-		minute: 'numeric',
-		second: 'numeric',
-		timeZone: timezone,
-		timeZoneName: 'short'
-	}).format
+	$: dateFormatter = formatDate(timezone)
+
+	function formatDate(timezone) {
+		try {
+			return new Intl.DateTimeFormat('en-GB', {
+				weekday: 'short',
+				day: '2-digit',
+				month: 'short',
+				year: 'numeric',
+				hour: 'numeric',
+				minute: 'numeric',
+				second: 'numeric',
+				timeZone: timezone,
+				timeZoneName: 'short'
+			}).format
+		} catch (ee) {
+			sendUserToast(
+				`Invalid timezone: ${timezone}. Update your browser's timezone preference`,
+				true
+			)
+			return new Intl.DateTimeFormat('en-GB', {
+				weekday: 'short',
+				day: '2-digit',
+				month: 'short',
+				year: 'numeric',
+				hour: 'numeric',
+				minute: 'numeric',
+				second: 'numeric',
+				timeZone: 'Europe/Paris',
+				timeZoneName: 'short'
+			}).format
+		}
+	}
+	let darkMode: boolean = false
+
+	function onThemeChange() {
+		if (document.documentElement.classList.contains('dark')) {
+			darkMode = true
+		} else {
+			darkMode = false
+		}
+	}
+
+	onMount(() => {
+		onThemeChange()
+	})
+
+	const items = Object.keys(timezones)
+		.map((key) => {
+			return Object.keys(timezones[key])
+				.map((subKey) => {
+					return {
+						value: subKey,
+						label: subKey,
+						group: timezones[key][subKey][1]
+					}
+				})
+				.flat()
+		})
+		.flat()
 </script>
 
-<div class="w-full flex space-x-16">
-	<div class="w-full flex flex-col space-y-2">
-		<div class="w-full flex flex-col gap-1">
-			<small class="font-bold">Cron</small>
+<DarkModeObserver on:change={onThemeChange} />
+
+<div class="w-full flex space-x-8">
+	<div class="w-full flex flex-col gap-4">
+		<Label label="Cron" class="font-semibold" primary={true}>
+			<svelte:fragment slot="error">
+				{#if !validCRON}
+					<div class="text-red-600 text-xs"> Invalid cron syntax </div>
+				{/if}
+			</svelte:fragment>
 			<input
 				class="inline-block"
 				type="text"
 				id="cron-schedule"
 				name="cron-schedule"
-				placeholder="*/30 * * * *"
+				placeholder="0 0 */1 * * *"
 				bind:value={schedule}
 				{disabled}
 			/>
-			{#if !validCRON}
-				<small class="text-red-600"> Invalid cron syntax </small>
-			{/if}
-		</div>
-
-		<div class="w-full flex flex-col gap-1">
-			<small class="font-bold">Timezone</small>
-
+		</Label>
+		<Label label="Timezone" class="font-semibold" primary>
 			{#if disabled}
 				<div>
-					<Badge>{timezone}</Badge>
+					<Badge><span class="text-primary dark:text-primary-inverse">{timezone}</span></Badge>
 				</div>
 			{:else}
-				<TimezonePicker {timezone} on:update={(e) => (timezone = e.detail.timezone)} />
+				<Select
+					inputStyles={SELECT_INPUT_DEFAULT_STYLE.inputStyles}
+					containerStyles={'border-color: lightgray;' +
+						(darkMode
+							? SELECT_INPUT_DEFAULT_STYLE.containerStylesDark
+							: SELECT_INPUT_DEFAULT_STYLE.containerStyles)}
+					{items}
+					groupBy={(item) => item.group}
+					on:change={(w) => {
+						timezone = w.detail.label
+					}}
+					value={timezone}
+				/>
 			{/if}
-		</div>
+		</Label>
 
 		{#if !disabled}
-			<div class="w-full">
-				<CollapseLink text="Use simplified builder">
-					<div class="w-full flex flex-col gap-4 mt-4">
+			<div class="flex flex-row gap-2">
+				<CronBuilder let:close>
+					<div class="w-full flex flex-col">
 						<div class="w-full flex flex-col gap-1">
-							<small class="font-bold">Execute schedule every</small>
+							<div class="text-secondary text-sm leading-none">Execute schedule every</div>
 
 							<div class="w-full flex gap-4">
 								<div class="w-full flex flex-col gap-1">
@@ -231,6 +298,7 @@
 										options={monthsOfYearOptions}
 										selectedOptionsDraggable={false}
 										placeholder="Every month"
+										ulOptionsClass={'!bg-surface-secondary'}
 									/>
 								</div>
 							{/if}
@@ -243,6 +311,7 @@
 										options={daysOfWeekOptions}
 										selectedOptionsDraggable={false}
 										placeholder="Every day"
+										ulOptionsClass={'!bg-surface-secondary'}
 									/>
 								</div>
 							{/if}
@@ -260,6 +329,7 @@
 												options={daysOfMonthOptions}
 												selectedOptionsDraggable={false}
 												placeholder="Every day"
+												ulOptionsClass={'!bg-surface-secondary'}
 											/>
 										</div>
 
@@ -280,7 +350,7 @@
 
 							{#if executeEvery == 'day-month' || executeEvery == 'month' || executeEvery == 'day-week'}
 								<div class="w-full flex flex-col gap-1">
-									<small class="font-bold">At UTC Time</small>
+									<small class="font-bold">At Time</small>
 									<input
 										{disabled}
 										type="time"
@@ -293,34 +363,38 @@
 						</div>
 
 						<div class="w-full flex flex-col gap-1">
-							<small class="font-bold">Preview New Cron</small>
+							<div class="text-secondary text-sm leading-none">Preview New Cron</div>
 
-							<div class="flex p-2 px-4 rounded-md bg-gray-100">
+							<div class="flex p-2 px-4 rounded-md bg-surface-secondary">
 								<span>{nschedule}</span>
 							</div>
 						</div>
 					</div>
 
 					<div class="mt-4">
-						<Button color="dark" size="xs" on:click={() => (schedule = nschedule)}
-							>Set Cron Schedule</Button
+						<Button
+							color="dark"
+							size="xs"
+							on:click={() => {
+								schedule = nschedule
+								close(null)
+							}}
 						>
+							Set Cron Schedule
+						</Button>
 					</div>
-				</CollapseLink>
+				</CronBuilder>
+				<CronGen bind:schedule />
 			</div>
 		{/if}
 	</div>
 
 	<div class="w-full flex flex-col space-y-2">
-		<h3>Execution summary</h3>
-		<hr />
+		<div class="text-sm font-semibold leading-none">Estimated upcoming events ({timezone})</div>
 		<div class="flex flex-col space-y-2">
-			<small>Estimated upcoming events ({timezone})</small>
-			<div class="flex flex-col rounded-md p-4 border text-gray-600">
+			<div class="flex flex-col rounded-md p-4 border text-tertiary bg-surface-secondary gap-0.5">
 				{#each preview as date}
-					<div class="flex items-center space-x-2 text-sm">
-						<span>{dateFormatter(new Date(date))}</span>
-					</div>
+					<span class="text-sm">{dateFormatter(new Date(date))}</span>
 				{/each}
 			</div>
 		</div>

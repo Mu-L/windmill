@@ -1,61 +1,129 @@
 <script lang="ts">
 	import { getContext } from 'svelte'
-	import type { AppInput } from '../../inputType'
+	import type { AppInput, InputConnection } from '../../inputType'
 	import type { AppViewerContext } from '../../types'
-	import { CurlyBraces, FunctionSquare, Pen, Plug2 } from 'lucide-svelte'
+	import { Code, CurlyBraces, FunctionSquare, Pen, Plug, Plug2 } from 'lucide-svelte'
 
 	import ToggleButtonGroup from '$lib/components/common/toggleButton-v2/ToggleButtonGroup.svelte'
 	import ToggleButton from '$lib/components/common/toggleButton-v2/ToggleButton.svelte'
+	import { Button } from '$lib/components/common'
+	import type EvalV2InputEditor from './inputEditor/EvalV2InputEditor.svelte'
 
 	export let componentInput: AppInput
 	export let disableStatic: boolean = false
+	export let evalV2editor: EvalV2InputEditor | undefined
 
-	const { onchange } = getContext<AppViewerContext>('AppViewerContext')
+	const { onchange, connectingInput, app } = getContext<AppViewerContext>('AppViewerContext')
 
 	$: if (componentInput.fieldType == 'template' && componentInput.type == 'static') {
 		//@ts-ignore
-		componentInput.type = 'template'
+		componentInput.type = 'templatev2'
 		componentInput['eval'] = componentInput.value
+		componentInput['connections'] = [{ componentId: 'ctx', id: 'email' }]
+	}
+
+	function applyConnection(connection: InputConnection) {
+		console.log(connection)
+		const expr = `${connection.componentId}.${connection.path}`
+		//@ts-ignore
+		componentInput = {
+			...componentInput,
+			type: 'evalv2',
+			expr: expr,
+			connections: [
+				{
+					componentId: connection.componentId,
+					id: connection?.path?.split('.')?.[0]?.split('[')?.[0]
+				}
+			]
+		}
+		evalV2editor?.setCode(expr)
+		$app = $app
 	}
 
 	let clientWidth: number
+	const iconOnlyThreshold = 300
 </script>
 
 {#if componentInput.fieldType !== 'any'}
 	<div class="w-full">
-		<div class="mx-auto" bind:clientWidth>
+		<div class="mx-auto flex gap-2" bind:clientWidth>
 			<ToggleButtonGroup
 				on:selected={() => {
 					onchange?.()
 				}}
+				noWFull
 				bind:selected={componentInput.type}
 			>
 				{#if componentInput.fieldType === 'template'}
-					<ToggleButton
-						tooltip={`Templated string (use \$\{<output>.x\} )`}
-						value="template"
-						disabled={disableStatic}
-						icon={CurlyBraces}
-						label="Template"
-					/>
-				{:else}
+					{#if componentInput.type == 'template'}
+						<ToggleButton
+							tooltip={`Templated string (use \$\{<output>.x\} )`}
+							value="template"
+							disabled={disableStatic}
+							icon={CurlyBraces}
+							label="Template"
+						/>
+					{:else}
+						<ToggleButton
+							tooltip={`Templated string (use \$\{<output>.x\} )`}
+							value="templatev2"
+							disabled={disableStatic}
+							icon={CurlyBraces}
+							label="Template"
+						/>
+					{/if}
+				{:else if componentInput.noStatic !== true}
 					<ToggleButton
 						label="Static"
 						value="static"
 						disabled={disableStatic}
-						iconOnly={clientWidth < 250}
+						iconOnly={clientWidth < iconOnlyThreshold}
 						icon={Pen}
 					/>
 				{/if}
+				{#if componentInput.type == 'connected'}
+					<ToggleButton
+						value="connected"
+						icon={Plug2}
+						iconOnly={clientWidth < iconOnlyThreshold}
+						label="Connect"
+					/>
+				{/if}
+				<ToggleButton
+					value="evalv2"
+					icon={FunctionSquare}
+					iconOnly={clientWidth < iconOnlyThreshold}
+					label="Eval"
+				/>
 
-				<ToggleButton value="connected" icon={Plug2} iconOnly={clientWidth < 250} label="Connect" />
 				<ToggleButton
 					value="runnable"
-					icon={FunctionSquare}
-					iconOnly={clientWidth < 250}
+					icon={Code}
+					iconOnly={clientWidth < iconOnlyThreshold}
 					label="Compute"
+					id="data-source-compute"
 				/>
 			</ToggleButtonGroup>
+			<div class="flex">
+				<Button
+					size="xs"
+					variant="border"
+					color="light"
+					title="Connect"
+					id={`plug`}
+					on:click={() => {
+						$connectingInput = {
+							opened: true,
+							input: undefined,
+							hoveredComponent: undefined,
+							onConnect: applyConnection
+						}
+					}}
+				>
+					<Plug size={12} />
+				</Button>
+			</div>
 		</div>
 	</div>
 {/if}

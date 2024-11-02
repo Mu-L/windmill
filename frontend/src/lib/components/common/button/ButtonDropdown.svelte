@@ -3,9 +3,11 @@
 	import { ChevronDown } from 'lucide-svelte'
 	import { twMerge } from 'tailwind-merge'
 	import { createPopperActions, type PopperOptions } from 'svelte-popperjs'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
 
 	export let hasPadding: boolean = true
+	export let target: string | undefined = 'body'
+	export let disabled: boolean = false
 
 	const [popperRef, popperContent] = createPopperActions({ placement: 'auto' })
 
@@ -28,14 +30,19 @@
 	<span use:popperRef>
 		<MenuButton
 			class={twMerge('h-full w-full flex flex-row gap-2 items-center', hasPadding ? 'px-2' : '')}
+			{disabled}
 		>
-			<slot name="label" />
-			<ChevronDown class="w-5 h-5" />
+			{#if $$slots.buttonReplacement}
+				<slot name="buttonReplacement" />
+			{:else}
+				<slot name="label" />
+				<ChevronDown class="w-5 h-5" />
+			{/if}
 		</MenuButton>
 	</span>
 
-	<Portal>
-		<div use:popperContent={popperOptions} class="z-[2000]">
+	<Portal name="button-dropdown" {target}>
+		<div use:popperContent={popperOptions} class="z-[6000]">
 			<Transition
 				show={open}
 				enter="transition ease-out duration-[25ms]"
@@ -46,7 +53,7 @@
 				leaveTo="transform opacity-0 scale-95"
 			>
 				<MenuItems
-					class="absolute border right-0 z-50 w-56 origin-top-right top-1 rounded-md bg-white shadow-md focus:outline-none"
+					class="absolute border right-0 z-50 w-56 origin-top-right top-1 rounded-md bg-surface shadow-md focus:outline-none"
 				>
 					<div class="my-1">
 						<slot name="items" />

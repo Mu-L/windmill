@@ -1,20 +1,18 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { page } from '$app/stores'
-	import { SettingsService, UserService, WorkspaceService } from '$lib/gen'
+	import { UserService, WorkspaceService } from '$lib/gen'
 	import { logoutWithRedirect } from '$lib/logout'
-	import {
-		enterpriseLicense,
-		superadmin,
-		userStore,
-		usersWorkspaceStore,
-		workspaceStore
-	} from '$lib/stores'
+	import { userStore, usersWorkspaceStore, workspaceStore } from '$lib/stores'
 	import { getUserExt } from '$lib/user'
 	import { sendUserToast } from '$lib/toast'
-	import { onMount } from 'svelte'
-	import github from 'svelte-highlight/styles/github'
+	import { onDestroy, onMount } from 'svelte'
+
 	import { refreshSuperadmin } from '$lib/refreshUser'
+	// import EditorTheme from '$lib/components/EditorTheme.svelte'
+	import { computeDrift } from '$lib/forLater'
+	import { setLicense } from '$lib/enterpriseUtils'
+	import { deepEqual } from 'fast-equals'
 
 	const monacoEditorUnhandledErrors = [
 		'Model not found',
@@ -22,20 +20,15 @@
 		'Connection got disposed.',
 		'Stopping the server timed out',
 		'Canceled',
+		'Starting server failed',
 		'Missing service editorService',
 		'Unexpected usage',
-		'NetworkError when attempting to fetch resource.'
+		'NetworkError when attempting to fetch resource.',
+		"Client got disposed and can't be restarted."
 	]
 
 	async function setUserWorkspaceStore() {
 		$usersWorkspaceStore = await WorkspaceService.listUserWorkspaces()
-	}
-
-	async function setLicense() {
-		const license = await SettingsService.getLicenseId()
-		if (license) {
-			$enterpriseLicense = license
-		}
 	}
 
 	async function loadUser() {
@@ -45,10 +38,6 @@
 			if ($workspaceStore) {
 				if ($userStore) {
 					console.log(`Welcome back ${$userStore.username} to ${$workspaceStore}`)
-				} else if ($superadmin) {
-					console.log(
-						`You are a superadmin, you can go wherever you please, even at ${$workspaceStore}`
-					)
 				} else {
 					$userStore = await getUserExt($workspaceStore)
 					if (!$userStore) {
@@ -56,7 +45,10 @@
 					}
 				}
 			} else {
-				if (!$page.url.pathname.startsWith('/user/')) {
+				if (
+					!$page.url.pathname.startsWith('/user/') ||
+					$page.url.pathname.startsWith('/user/cli')
+				) {
 					goto(
 						`/user/workspaces?rd=${encodeURIComponent(
 							$page.url.href.replace($page.url.origin, '')
@@ -75,6 +67,7 @@
 		}
 	}
 
+	let interval: NodeJS.Timeout | undefined = undefined
 	onMount(() => {
 		window.onunhandledrejection = (event: PromiseRejectionEvent) => {
 			event.preventDefault()
@@ -90,7 +83,10 @@
 				// Unhandled errors from Monaco Editor don't logout the user
 				if (
 					monacoEditorUnhandledErrors.includes(message) ||
-					message.startsWith('Failed to fetch dynamically imported')
+					message.startsWith('Failed to fetch dynamically imported') ||
+					message.startsWith('Unable to figure out browser width and height') ||
+					message.startsWith('Unable to read file') ||
+					message.startsWith('Could not find source file')
 				) {
 					console.warn(message)
 					return
@@ -123,16 +119,59 @@
 				console.error('Caught unhandled promise rejection without message', event.reason, event)
 			}
 		}
+		setLicense()
+		computeDrift()
+
 		if ($page.url.pathname != '/user/login') {
 			setUserWorkspaceStore()
 			loadUser()
-			setLicense()
+			UserService.refreshUserToken()
 		}
-	})
-</script>
 
-<svelte:head>
-	{@html github}
-</svelte:head>
+		let i = 0
+		interval = setInterval(async () => {
+			if ($page.url.pathname != '/user/login') {
+				i += 1
+
+				// every 1 hour
+				if (i % 12 == 0) {
+					await UserService.refreshUserToken()
+				}
+
+				try {
+					const workspace = $workspaceStore
+					const user = $userStore
+
+					if (workspace && user) {
+						const newUser = await getUserExt(workspace)
+						if (!deepEqual(newUser, $userStore)) {
+							userStore.set(newUser)
+							console.info('refreshed user')
+						} else {
+							console.debug('user is the same')
+						}
+					}
+				} catch (e) {
+					console.error('Could not refresh user', e)
+				}
+			}
+			// every 5 minues
+		}, 300000)
+	})
+
+	onDestroy(() => {
+		interval && clearInterval(interval)
+	})
+
+	const darkMode =
+		window.localStorage.getItem('dark-mode') ??
+		(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+
+	if (darkMode === 'dark') {
+		document.documentElement.classList.add('dark')
+	} else {
+		document.documentElement.classList.remove('dark')
+	}
+</script>
 
 <slot />

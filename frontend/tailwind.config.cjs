@@ -1,24 +1,86 @@
 const plugin = require('tailwindcss/plugin')
 
+const lightTheme = {
+	surface: '#ffffff',
+	surfaceSecondary: '#f3f4f6',
+	surfaceHover: '#e5e7eb',
+	surfaceDisabled: '#f9fafb',
+	surfaceSelected: '#d1d5db',
+
+	textPrimary: '#2d3748',
+	textSecondary: '#4a5568',
+	textTertiary: '#505c70',
+	textDisabled: '#a0aec0',
+
+	border: '#dddddd',
+	borderHover: '#cccccc'
+}
+
+const lightThemeRgb = makeRgb(lightTheme)
+
+const darkTheme = {
+	surface: '#2e3440',
+	surfaceSecondary: '#3b4252',
+	surfaceHover: '#454F64',
+	surfaceDisabled: '#212732',
+	surfaceSelected: '#434c5e',
+
+	textPrimary: '#EEEEEE',
+	textSecondary: '#C2C9D1',
+	textTertiary: '#A8AEB7',
+	textDisabled: '#989DA5',
+
+	border: '#3e4c60',
+	borderHover: '#3e4c60'
+}
+
+const darkThemeRgb = makeRgb(darkTheme)
+
+function makeRgb(theme) {
+	return Object.fromEntries(
+		Object.entries(theme).map(([key, value]) => {
+			if (typeof value === 'string' && value.startsWith('#')) {
+				return [key, hexToRgb(value)]
+			}
+
+			return [key, value]
+		})
+	)
+}
+
+function hexToRgb(hex) {
+	// Remove '#' symbol from the beginning of the hex value
+	hex = hex.replace('#', '')
+
+	// Convert the hex value to decimal
+	const r = parseInt(hex.substring(0, 2), 16)
+	const g = parseInt(hex.substring(2, 4), 16)
+	const b = parseInt(hex.substring(4, 6), 16)
+
+	// Return the RGB string format
+	return `${r} ${g} ${b}`
+}
+
 /** @type {import('tailwindcss').Config} */
 const config = {
-	content: ['./src/**/*.{html,js,svelte,ts}'],
+	//to generatd tailwind full, only include ./src/lib/components/apps/editor/componentsPanel/tailwindUtils.ts and run:
+	//npx tailwindcss -i src/lib/assets/app.css -o static/tailwind_full.css
+	//then copy content in that file
+	content: [
+		'./src/**/*.{html,js,svelte,ts}',
+		'!./src/lib/components/apps/utils.ts',
+		'!./src/lib/components/apps/editor/componentsPanel/tailwindUtils.ts'
+	],
 	safelist: [
 		'hljs',
 		'splitpanes__pane',
 		'splitpanes__splitter',
-		...(process.env.NODE_ENV === 'production'
-			? [
-					{ pattern: /^m(\w?)-.*$/ },
-					{ pattern: /^p(\w?)-.*$/ },
-					{ pattern: /^rounded-.*$/ },
-					{ pattern: /^shadow-.*$/, variants: ['hover'] },
-					{ pattern: /^text-[^/]*$/, variants: ['hover', 'active', 'focus'] },
-					{ pattern: /^bg-[^/]*$/, variants: ['hover', 'active', 'focus'] },
-					{ pattern: /^border-[^/]*$/, variants: ['hover', 'active', 'focus'] },
-					{ pattern: /^ring-[^/]*$/, variants: ['hover', 'active', 'focus'] }
-			  ]
-			: [])
+		'wm-tab',
+		'autocomplete-list',
+		'autocomplete-list-item',
+		'autocomplete-list-item-create',
+		'selected',
+		'wm-tab-selected'
 	],
 	theme: {
 		colors: {
@@ -302,16 +364,61 @@ const config = {
 				900: '#312e81'
 			},
 			frost: {
-				100: '#dfe6ee',
-				200: '#bfcdde',
-				300: '#9eb3cd',
-				400: '#7e9abd',
+				50: '#f5f7fa',
+				100: '#eaeef4',
+				200: '#cfd9e8',
+				300: '#a6bad3',
+				400: '#7594bb',
 				500: '#5e81ac',
-				600: '#4b678a',
-				700: '#384d67',
-				800: '#263445',
-				900: '#131a22'
-			}
+				600: '#415f88',
+				700: '#364d6e',
+				800: '#2f425d',
+				900: '#2b394f',
+				950: '#1d2534'
+			},
+			marine: {
+				50: '#E9E9F4',
+				100: '#859AC7',
+				200: '#586F9E',
+				300: '#4A5F8A',
+				400: '#394A6D',
+				500: '#323F5B'
+			},
+			nord: {
+				0: '#2E3440',
+				100: '#3B4252',
+				200: '#434C5E',
+				300: '#4C566A',
+				400: '#D8DEE9',
+				500: '#E5E9F0',
+				600: '#ECEFF4',
+				700: '#8FBCBB',
+				800: '#88C0D0',
+				900: '#81A1C1',
+				950: '#5E81AC'
+			},
+
+			surface: 'rgb(var(--color-surface) / <alpha-value>)',
+			'surface-secondary': 'rgb(var(--color-surface-secondary) / <alpha-value>)',
+			'surface-hover': 'rgb(var(--color-surface-hover) / <alpha-value>)',
+			'surface-disabled': 'rgb(var(--color-surface-disabled) / <alpha-value>)',
+			'surface-selected': 'rgb(var(--color-surface-selected) / <alpha-value>)',
+
+			primary: 'rgb(var(--color-text-primary) / <alpha-value>)',
+			secondary: 'rgb(var(--color-text-secondary) / <alpha-value>)',
+			tertiary: 'rgb(var(--color-text-tertiary) / <alpha-value>)',
+			disabled: 'rgb(var(--color-text-disabled) / <alpha-value>)',
+
+			'surface-inverse': 'rgb(var(--color-surface-inverse) / <alpha-value>)',
+			'surface-secondary-inverse': 'rgb(var(--color-surface-secondary-inverse) / <alpha-value>)',
+			'surface-hover-inverse': 'rgb(var(--color-surface-hover-inverse) / <alpha-value>)',
+			'surface-disabled-inverse': 'rgb(var(--color-surface-disabled-inverse) / <alpha-value>)',
+			'surface-selected-inverse': 'rgb(var(--color-surface-selected-inverse) / <alpha-value>)',
+
+			'primary-inverse': 'rgb(var(--color-text-primary-inverse) / <alpha-value>)',
+			'secondary-inverse': 'rgb(var(--color-text-secondary-inverse) / <alpha-value>)',
+			'tertiary-inverse': 'rgb(var(--color-text-tertiary-inverse) / <alpha-value>)',
+			'disabled-inverse': 'rgb(var(--color-text-disabled-inverse) / <alpha-value>)'
 		},
 		fontFamily: {
 			// add double quotes if there is space in font name
@@ -328,6 +435,12 @@ const config = {
 			]
 		},
 		extend: {
+			border: {
+				color: 'red'
+			},
+			borderRadius: {
+				component: '0.250rem'
+			},
 			maxHeight: {
 				'1/2': '50vh',
 				'2/3': '66vh',
@@ -377,16 +490,85 @@ const config = {
 					fontFamily: theme('fontFamily.main'),
 					fontSize: theme('fontSize.base'),
 					fontWeight: theme('fontWeight.normal'),
-					color: theme('colors.gray.900'),
+
+					backgroundColor: 'rgb(var(--color-surface))',
+					color: lightTheme.textPrimary,
+					'--color-surface': lightThemeRgb.surface,
+					'--color-surface-secondary': lightThemeRgb.surfaceSecondary,
+					'--color-surface-hover': lightThemeRgb.surfaceHover,
+					'--color-surface-disabled': lightThemeRgb.surfaceDisabled,
+					'--color-surface-selected': lightThemeRgb.surfaceSelected,
+
+					'--color-text-primary': lightThemeRgb.textPrimary,
+					'--color-text-secondary': lightThemeRgb.textSecondary,
+					'--color-text-tertiary': lightThemeRgb.textTertiary,
+					'--color-text-disabled': lightThemeRgb.textDisabled,
+
+					'--color-surface-inverse': darkThemeRgb.surface,
+					'--color-surface-secondary-inverse': darkThemeRgb.surfaceSecondary,
+					'--color-surface-hover-inverse': darkThemeRgb.surfaceHover,
+					'--color-surface-disabled-inverse': darkThemeRgb.surfaceDisabled,
+					'--color-surface-selected-inverse': darkThemeRgb.surfaceSelected,
+
+					'--color-text-primary-inverse': darkThemeRgb.textPrimary,
+					'--color-text-secondary-inverse': darkThemeRgb.textSecondary,
+					'--color-text-tertiary-inverse': darkThemeRgb.textTertiary,
+					'--color-text-disabled-inverse': darkThemeRgb.textDisabled,
+
+					'--color-border': lightThemeRgb.border,
+					'--color-border-hover': lightThemeRgb.borderHover,
+
+					'--vscode-editorSuggestWidget-background': '#f3f3f3',
+					'--vscode-editorHoverWidget-foreground': '#616161',
+					'--vscode-editorHoverWidget-border': '#c8c8c8',
+					'--vscode-editorHoverWidget-statusBarBackground': '#e7e7e7',
+					'--vscode-editorSuggestWidget-foreground': '#eeffff',
+					'--vscode-editorSuggestWidget-highlightForeground': '#80cbc4',
+					'--vscode-editorSuggestWidget-selectedBackground': 'rgba(0, 0, 0, 0.31)',
+
 					[`@media (min-width: ${theme('screens.qhd')})`]: {
 						fontSize: theme('fontSize.lg')
+					},
+
+					'&.dark': {
+						backgroundColor: darkTheme.surface,
+						color: darkTheme.textPrimary,
+
+						'--color-surface': darkThemeRgb.surface,
+						'--color-surface-secondary': darkThemeRgb.surfaceSecondary,
+						'--color-surface-hover': darkThemeRgb.surfaceHover,
+						'--color-surface-disabled': darkThemeRgb.surfaceDisabled,
+						'--color-surface-selected': darkThemeRgb.surfaceSelected,
+
+						'--color-text-primary': darkThemeRgb.textPrimary,
+						'--color-text-secondary': darkThemeRgb.textSecondary,
+						'--color-text-tertiary': darkThemeRgb.textTertiary,
+						'--color-text-disabled': darkThemeRgb.textDisabled,
+
+						'--color-surface-inverse': lightThemeRgb.surface,
+						'--color-surface-secondary-inverse': lightThemeRgb.surfaceSecondary,
+						'--color-surface-hover-inverse': lightThemeRgb.surfaceHover,
+						'--color-surface-disabled-inverse': lightThemeRgb.surfaceDisabled,
+						'--color-surface-selected-inverse': lightThemeRgb.surfaceSelected,
+
+						'--color-text-primary-inverse': lightThemeRgb.textPrimary,
+						'--color-text-secondary-inverse': lightThemeRgb.textSecondary,
+						'--color-text-tertiary-inverse': lightThemeRgb.textTertiary,
+						'--color-text-disabled-inverse': lightThemeRgb.textDisabled,
+
+						'--color-border': darkThemeRgb.border,
+						'--color-border-hover': darkThemeRgb.borderHover,
+
+						'--vscode-editorSuggestWidget-background': '#252526',
+						'--vscode-editorHoverWidget-foreground': '#cccccc',
+						'--vscode-editorHoverWidget-border': '#454545',
+						'--vscode-editorHoverWidget-statusBarBackground': '#2c2c2d'
 					}
 				},
 				h1: {
 					fontSize: '24px',
 					fontWeight: theme('fontWeight.extrabold'),
 					lineHeight: '1.05',
-					color: theme('colors.gray.800'),
 					[`@media (min-width: ${theme('screens.lg')})`]: {
 						fontSize: '26px'
 					},
@@ -401,7 +583,6 @@ const config = {
 					fontSize: '20px',
 					fontWeight: theme('fontWeight.extrabold'),
 					lineHeight: '1.1',
-					color: theme('colors.gray.700'),
 					[`@media (min-width: ${theme('screens.fhd')})`]: {
 						fontSize: '22px'
 					},
@@ -417,7 +598,6 @@ const config = {
 					fontSize: '18px',
 					fontWeight: theme('fontWeight.bold'),
 					lineHeight: '1.2',
-					color: theme('colors.gray.600'),
 					[`@media (min-width: ${theme('screens.fhd')})`]: {
 						fontSize: '20px'
 					},
@@ -429,7 +609,6 @@ const config = {
 					fontSize: '18px',
 					fontWeight: theme('fontWeight.semibold'),
 					lineHeight: '1.3',
-					color: theme('colors.gray.600'),
 					[`@media (min-width: ${theme('screens.qhd')})`]: {
 						fontSize: '20px'
 					}
@@ -438,7 +617,6 @@ const config = {
 					fontSize: '16px',
 					fontWeight: theme('fontWeight.semibold'),
 					lineHeight: '1.5',
-					color: theme('colors.gray.600'),
 					[`@media (min-width: ${theme('screens.qhd')})`]: {
 						fontSize: '18px'
 					}
@@ -447,7 +625,6 @@ const config = {
 					fontSize: '16px',
 					fontWeight: theme('fontWeight.medium'),
 					lineHeight: '1.5',
-					color: theme('colors.gray.600'),
 					[`@media (min-width: ${theme('screens.qhd')})`]: {
 						fontSize: '18px'
 					}
@@ -458,16 +635,26 @@ const config = {
 				a: {
 					color: theme('colors.blue.500')
 				},
+				'.dark input::placeholder': {
+					color: theme('colors.gray.400')
+				},
+				"[type='checkbox']:checked": {
+					backgroundImage: `url("data:image/svg+xml,%3csvg viewBox='0 0 16 16' fill='black' xmlns='http://www.w3.org/2000/svg'%3e%3cpath d='M12.207 4.793a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0l-2-2a1 1 0 011.414-1.414L6.5 9.086l4.293-4.293a1 1 0 011.414 0z'/%3e%3c/svg%3e")`
+				},
+				".dark [type='checkbox']:checked": {
+					backgroundImage: `url("data:image/svg+xml,%3csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3e%3cpath d='M12.207 4.793a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0l-2-2a1 1 0 011.414-1.414L6.5 9.086l4.293-4.293a1 1 0 011.414 0z'/%3e%3c/svg%3e")`
+				},
 				'input:not(.windmillapp),input[type="text"]:not(.windmillapp),input[type="email"]:not(.windmillapp),input[type="url"]:not(.windmillapp),input[type="password"]:not(.windmillapp),input[type="number"]:not(.windmillapp),input[type="date"]:not(.windmillapp),input[type="datetime-local"]:not(.windmillapp),input[type="month"]:not(.windmillapp),input[type="search"]:not(.windmillapp),input[type="tel"]:not(.windmillapp),input[type="time"]:not(.windmillapp),input[type="week"]:not(.windmillapp),textarea:not(.windmillapp):not(.monaco-mouse-cursor-text),select:not(.windmillapp)':
 					{
 						display: 'block',
 						fontSize: theme('fontSize.sm'),
+						boxShadow: theme('boxShadow.sm'),
 						width: '100%',
 						padding: `${theme('spacing.1')} ${theme('spacing.2')}`,
 						border: `1px solid ${theme('colors.gray.300')}`,
 						borderRadius: theme('borderRadius.md'),
 						'&:focus': {
-							'--tw-ring-color': theme('colors.indigo.100'),
+							'--tw-ring-color': theme('colors.frost.100'),
 							'--tw-ring-offset-shadow':
 								'var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color)',
 							'--tw-ring-shadow':
@@ -476,18 +663,31 @@ const config = {
 								'var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow, 0 0 #0000)'
 						},
 						'&:disabled,[disabled]': {
-							backgroundColor: theme('colors.gray.100') + ' !important'
+							backgroundColor: theme('colors.gray.100') + ' !important',
+							'.dark &': {
+								backgroundColor: theme('colors.gray.700') + ' !important'
+							}
 						}
 					},
+				'.dark input:not(.windmillapp),.dark input[type="text"]:not(.windmillapp),.dark input[type="email"]:not(.windmillapp),.dark input[type="url"]:not(.windmillapp),.dark input[type="password"]:not(.windmillapp),.dark input[type="number"]:not(.windmillapp),.dark input[type="date"]:not(.windmillapp),.dark input[type="datetime-local"]:not(.windmillapp),.dark input[type="month"]:not(.windmillapp),.dark input[type="search"]:not(.windmillapp),.dark input[type="tel"]:not(.windmillapp),.dark input[type="time"]:not(.windmillapp),.dark input[type="week"]:not(.windmillapp),.dark textarea:not(.windmillapp):not(.monaco-mouse-cursor-text),.dark select:not(.windmillapp)':
+					{
+						backgroundColor: theme('colors.gray.700'),
+						color: theme('colors.gray.200'),
+						borderColor: theme('colors.gray.600'),
+						'&:focus': {
+							'--tw-ring-color': theme('colors.frost.700')
+						}
+					},
+
 				'button:disabled,button[disabled=true],a:disabled,a[disabled=true]': {
 					pointerEvents: 'none',
 					cursor: 'default',
-					filter: 'grayscale(1)'
+					opacity: '0.90'
 				},
 				'pre code.hljs': {
 					padding: '0px !important',
 					fontFamily: theme('fontFamily.mono'),
-					fontSize: theme('fontSize.sm') + ' !important',
+					fontSize: theme('fontSize.xs') + ' !important',
 					lineHeight: theme('lineHeight.4') + ' !important'
 				},
 				'.h1-textarea': {
@@ -529,6 +729,12 @@ const config = {
 					[`@media (min-width: ${theme('screens.qhd')})`]: {
 						fontSize: '20px !important'
 					}
+				},
+				input: {
+					backgroundColor: 'rgb(var(--color-surface-secondary) / 30%) !important'
+				},
+				textarea: {
+					backgroundColor: 'rgb(var(--color-surface-secondary) / 30%) !important'
 				}
 			})
 			addComponents({
@@ -544,6 +750,9 @@ const config = {
 						color: theme('colors.gray.900'),
 						textTransform: 'capitalize'
 					},
+					'.dark & th': {
+						color: theme('colors.gray.200')
+					},
 					'& td': {
 						paddingLeft: theme('spacing.1'),
 						paddingRight: theme('spacing.1'),
@@ -552,11 +761,20 @@ const config = {
 						fontSize: theme('fontSize.sm'),
 						color: theme('colors.gray.700')
 					},
+					'.dark & td ': {
+						color: theme('colors.gray.200')
+					},
 					'& tbody > :not([hidden]) ~ :not([hidden])': {
 						borderTop: `1px solid ${theme('colors.gray.200')}`
 					},
+					'.dark & tbody > :not([hidden]) ~ :not([hidden])': {
+						borderTop: `1px solid ${theme('colors.gray.700')}`
+					},
 					'& tbody > tr:hover': {
 						backgroundColor: theme('colors.gray.50')
+					},
+					'.dark & tbody > tr:hover': {
+						backgroundColor: theme('colors.gray.800')
 					}
 				},
 				'.commit-hash': {
@@ -587,25 +805,35 @@ const config = {
 					)})`
 				},
 				'.splitpanes__pane': {
-					backgroundColor: theme('colors.white') + ' !important',
+					backgroundColor: lightTheme.surface + ' !important',
+					overflow: 'auto !important'
+				},
+				'.dark .splitpanes__pane': {
+					backgroundColor: darkTheme.surface + ' !important',
 					overflow: 'auto !important'
 				},
 				'.splitpanes__splitter': {
-					backgroundColor: theme('colors.gray.300') + ' !important',
+					backgroundColor: lightTheme.border + ' !important',
 					margin: '0 !important',
 					border: 'none !important',
 					'&::after': {
-						backgroundColor: '#3f83f850 !important',
+						backgroundColor: lightTheme.border + ' !important',
 						margin: '0 !important',
 						transform: 'none !important',
-						zIndex: '1001 !important',
 						transition: 'opacity 200ms !important',
 						opacity: '0',
 						'--splitter-hover-size': '5px',
 						'--splitter-hover-adjustment': '-2px'
 					},
 					'&:hover::after': {
-						opacity: '1'
+						opacity: '1',
+						zIndex: '1001 !important'
+					}
+				},
+				'.dark .splitpanes__splitter': {
+					backgroundColor: darkTheme.border + ' !important',
+					'&::after': {
+						backgroundColor: darkTheme.border + ' !important'
 					}
 				},
 				'.splitpanes--vertical>.splitpanes__splitter': {
@@ -635,16 +863,40 @@ const config = {
 						left: '0 !important',
 						width: '100% !important'
 					}
+				},
+				// Windmill Tab classes
+
+				'.wm-tab-active': {
+					borderColor: darkTheme.border,
+					color: lightTheme.textPrimary
+				},
+
+				'.dark .wm-tab-active': {
+					borderColor: lightTheme.border,
+					color: darkTheme.textPrimary
 				}
 			})
+
 			addUtilities({
 				'.separator': {
-					backgroundColor: '#ddd !important'
+					backgroundColor: `${lightTheme.border} !important`
+				},
+				'.dark .separator': {
+					backgroundColor: `${darkTheme.border} !important`
 				},
 				'.center-center': {
 					display: 'flex',
 					justifyContent: 'center',
 					alignItems: 'center'
+				},
+				'.inner-border': {
+					boxShadow: `inset 0 0 0 1px ${lightTheme.border}`
+				},
+				'.dark .inner-border': {
+					boxShadow: `inset 0 0 0 1px ${darkTheme.border}`
+				},
+				'.z5000': {
+					zIndex: '5000 !important'
 				},
 				'.ellipsize': {
 					overflow: 'hidden',

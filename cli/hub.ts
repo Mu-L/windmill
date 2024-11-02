@@ -1,10 +1,13 @@
 // deno-lint-ignore-file no-explicit-any
-import { Command, ResourceService, log } from "./deps.ts";
+import { Command, log } from "./deps.ts";
+import * as wmill from "./gen/services.gen.ts";
+
 import { requireLogin, resolveWorkspace } from "./context.ts";
 import { pushResourceType } from "./resource-type.ts";
 import { GlobalOptions } from "./types.ts";
+import { deepEqual } from "./utils.ts";
 
-async function pull(opts: GlobalOptions) {
+export async function pull(opts: GlobalOptions) {
   const workspace = await resolveWorkspace(opts);
 
   if (workspace.workspaceId !== "admins") {
@@ -15,6 +18,25 @@ async function pull(opts: GlobalOptions) {
   }
 
   const userInfo = await requireLogin(opts);
+
+  const uid = (await wmill.getGlobal({
+    key: "uid",
+  })) as string;
+
+  const hubBaseUrl =
+    (await wmill.getGlobal({
+      key: "hubBaseUrl",
+    })) ?? "https://hub.windmill.dev";
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "X-email": userInfo.email,
+  };
+
+  if (uid) {
+    headers["X-uid"] = uid;
+  }
+
   const list: {
     id: number;
     name: string;
@@ -25,23 +47,17 @@ async function pull(opts: GlobalOptions) {
     created_by: string;
     created_at: Date;
     comments: never[];
-  }[] = await fetch("https://hub.windmill.dev/resource_types/list", {
-    headers: {
-      Accept: "application/json",
-      "X-email": userInfo.email,
-    },
+  }[] = await fetch(hubBaseUrl + "/resource_types/list", {
+    headers,
   })
-    .then((r) => r.json())
+    .then((r) => r.json() as Promise<{ id: number; name: string }[]>)
     .then((list: { id: number; name: string }[]) =>
       list.map((x) =>
-        fetch(
-          "https://hub.windmill.dev/resource_types/" + x.id + "/" + x.name,
-          {
-            headers: {
-              Accept: "application/json",
-            },
-          }
-        )
+        fetch(hubBaseUrl + "/resource_types/" + x.id + "/" + x.name, {
+          headers: {
+            Accept: "application/json",
+          },
+        })
       )
     )
     .then((x) => Promise.all(x))
@@ -54,34 +70,42 @@ async function pull(opts: GlobalOptions) {
       )
     )
     .then((x) => Promise.all(x))
-    .then((x) => x.filter((x) => x).map((x) => x.resource_type));
+    .then((x) =>
+      (x as { resource_type: any }[])
+        .filter((x) => x)
+        .map((x) => x.resource_type)
+    );
 
-  const resourceTypes = await ResourceService.listResourceType({
+  const resourceTypes = await wmill.listResourceType({
     workspace: workspace.workspaceId,
   });
 
   for (const x of list) {
-    if (
-      resourceTypes.find(
-        (y) => y.name === x.name && typeof y.schema !== "string"
-      )
-    ) {
-      log.info("skipping " + x.name);
-      continue;
-    }
-    log.info("syncing " + x.name);
     try {
       x.schema = JSON.parse(x.schema);
     } catch (e) {
       log.info("failed to parse schema for " + x.name);
       continue;
     }
+    if (
+      resourceTypes.find(
+        (y) =>
+          y.name === x.name &&
+          typeof y.schema !== "string" &&
+          deepEqual(y.schema, x.schema) &&
+          y.description === x.description
+      )
+    ) {
+      log.info("skipping " + x.name + " (same as current)");
+      continue;
+    }
+    log.info("syncing " + x.name);
+
     await pushResourceType(
       workspace.workspaceId,
       x.name + ".resource-type.json",
       undefined,
-      x,
-      true
+      x
     );
   }
 }
@@ -90,7 +114,7 @@ const command = new Command()
   .name("hub")
   .description("Hub related commands. EXPERIMENTAL. INTERNAL USE ONLY.")
   .command("pull")
-  .description("pull any supported defintions. EXPERIMENTAL.")
+  .description("pull any supported definitions. EXPERIMENTAL.")
   .action(pull as any);
 
 export default command;

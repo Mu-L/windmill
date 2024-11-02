@@ -1,7 +1,8 @@
 import { BROWSER } from 'esm-env'
 import { derived, type Readable, writable } from 'svelte/store'
-import type { UserWorkspaceList } from '$lib/gen/models/UserWorkspaceList.js'
-import type { TokenResponse } from './gen'
+import { type WorkspaceDefaultScripts, type TokenResponse, type UserWorkspaceList } from './gen'
+import type { IntrospectionQuery } from 'graphql'
+import { getLocalSetting } from './utils'
 
 export interface UserExt {
 	email: string
@@ -16,21 +17,37 @@ export interface UserExt {
 	folders_owners: string[]
 }
 
-const persistedWorkspace = BROWSER && localStorage.getItem('workspace')
+const persistedWorkspace = BROWSER && getWorkspace()
 
+function getWorkspace(): string | undefined {
+	try {
+		return localStorage.getItem('workspace') ?? undefined
+	} catch (e) {
+		console.error('error interacting with local storage', e)
+	}
+	return undefined
+}
+export const tutorialsToDo = writable<number[]>([])
+export const globalEmailInvite = writable<string>('')
+export const awarenessStore = writable<Record<string, string>>(undefined)
 export const enterpriseLicense = writable<string | undefined>(undefined)
 export const workerTags = writable<string[] | undefined>(undefined)
 export const usageStore = writable<number>(0)
-export const runFormStore = writable<any>()
+export const workspaceUsageStore = writable<number>(0)
+export const initialArgsStore = writable<any>(undefined)
 export const oauthStore = writable<TokenResponse | undefined>(undefined)
 export const userStore = writable<UserExt | undefined>(undefined)
 export const workspaceStore = writable<string | undefined>(
 	persistedWorkspace ? String(persistedWorkspace) : undefined
 )
-export const premiumStore = writable<{ premium: boolean; usage?: number }>({ premium: false })
+export const defaultScripts = writable<WorkspaceDefaultScripts | undefined>(undefined)
+export const dbClockDrift = writable<number | undefined>(undefined)
+export const isPremiumStore = writable<boolean>(false)
 export const starStore = writable(1)
 export const usersWorkspaceStore = writable<UserWorkspaceList | undefined>(undefined)
-export const superadmin = writable<String | false | undefined>(undefined)
+export const superadmin = writable<string | false | undefined>(undefined)
+export const lspTokenStore = writable<string | undefined>(undefined)
+export const hubBaseUrlStore = writable<string>('https://hub.windmill.dev')
 export const userWorkspaces: Readable<
 	Array<{
 		id: string
@@ -52,30 +69,55 @@ export const userWorkspaces: Readable<
 		return originalWorkspaces
 	}
 })
-export const hubScripts = writable<
-	| Array<{
-			path: string
-			summary: string
-			approved: boolean
-			kind: string
-			app: string
-			ask_id: number
-	  }>
-	| undefined
->(undefined)
+export const copilotInfo = writable<{
+	exists_openai_resource_path: boolean
+	code_completion_enabled: boolean
+}>({
+	exists_openai_resource_path: false,
+	code_completion_enabled: false
+})
+export const codeCompletionLoading = writable<boolean>(false)
+export const metadataCompletionEnabled = writable<boolean>(true)
+export const stepInputCompletionEnabled = writable<boolean>(true)
+export const FORMAT_ON_SAVE_SETTING_NAME = 'formatOnSave'
+export const VIM_MODE_SETTING_NAME = 'vimMode'
+export const CODE_COMPLETION_SETTING_NAME = 'codeCompletionSessionEnabled'
+export const formatOnSave = writable<boolean>(
+	getLocalSetting(FORMAT_ON_SAVE_SETTING_NAME) != 'false'
+)
+export const vimMode = writable<boolean>(getLocalSetting(VIM_MODE_SETTING_NAME) == 'true')
+export const codeCompletionSessionEnabled = writable<boolean>(
+	getLocalSetting(CODE_COMPLETION_SETTING_NAME) != 'false'
+)
+export const usedTriggerKinds = writable<string[]>([])
 
-export function switchWorkspace(workspace: string | undefined) {
-	localStorage.removeItem('flow')
-	localStorage.removeItem('app')
-	workspaceStore.set(workspace)
+type SQLBaseSchema = {
+	[schemaKey: string]: {
+		[tableKey: string]: {
+			[columnKey: string]: {
+				type: string
+				default: string
+				required: boolean
+			}
+		}
+	}
 }
 
-export function clearStores(): void {
-	localStorage.removeItem('flow')
-	localStorage.removeItem('app')
-	localStorage.removeItem('workspace')
-	userStore.set(undefined)
-	workspaceStore.set(undefined)
-	usersWorkspaceStore.set(undefined)
-	superadmin.set(undefined)
+export interface SQLSchema {
+	lang: 'mysql' | 'bigquery' | 'postgresql' | 'snowflake' | 'mssql'
+	schema: SQLBaseSchema
+	publicOnly: boolean | undefined
+	stringified: string
 }
+
+export interface GraphqlSchema {
+	lang: 'graphql'
+	schema: IntrospectionQuery
+	stringified: string
+}
+
+export type DBSchema = SQLSchema | GraphqlSchema
+
+export type DBSchemas = Partial<Record<string, DBSchema>>
+
+export const dbSchemas = writable<DBSchemas>({})

@@ -5,7 +5,7 @@ import { loadFlowModuleState } from './flowStateUtils'
 import { emptyFlowModuleState } from './utils'
 
 export type FlowModuleState = {
-	schema: Schema
+	schema?: Schema
 	previewResult?: any
 	previewArgs?: any
 }
@@ -17,7 +17,6 @@ export type FlowState = Record<string, FlowModuleState>
  * It contains data loaded that are not contained in a Flow object i.e. schemas.
  * We also hold the data of the results of a test job, ran by the user.
  */
-
 
 export async function initFlowState(flow: Flow, flowStateStore: Writable<FlowState>) {
 	const modulesState: FlowState = {}
@@ -63,7 +62,6 @@ async function mapFlowModule(flowModule: FlowModule, modulesState: FlowState) {
 		const flowModuleState = await loadFlowModuleState(flowModule)
 		modulesState[flowModule.id] = flowModuleState
 	}
-
 }
 
 async function mapFlowModules(flowModules: FlowModule[], modulesState: FlowState) {

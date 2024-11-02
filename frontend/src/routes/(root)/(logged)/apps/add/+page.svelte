@@ -2,21 +2,32 @@
 	import { importStore } from '$lib/components/apps/store'
 
 	import AppEditor from '$lib/components/apps/editor/AppEditor.svelte'
-	import { AppService, Policy } from '$lib/gen'
+	import { AppService, type Policy } from '$lib/gen'
 	import { page } from '$app/stores'
 	import { decodeState } from '$lib/utils'
-	import { dirtyStore } from '$lib/components/common/confirmationModal/dirtyStore'
 	import { userStore, workspaceStore } from '$lib/stores'
 	import type { App } from '$lib/components/apps/types'
-	import { goto } from '$app/navigation'
+	import { afterNavigate, replaceState } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { sendUserToast } from '$lib/toast'
+	import { DEFAULT_THEME } from '$lib/components/apps/editor/componentsPanel/themeUtils'
+	import {
+		presets,
+		processDimension,
+		type AppComponent
+	} from '$lib/components/apps/editor/component'
+	import {
+		appComponentFromType,
+		insertNewGridItem,
+		setUpTopBarComponentContent
+	} from '$lib/components/apps/editor/appUtils'
 
 	let nodraft = $page.url.searchParams.get('nodraft')
 	const hubId = $page.url.searchParams.get('hub')
 	const templatePath = $page.url.searchParams.get('template')
 	const templateId = $page.url.searchParams.get('template_id')
 
-	const importJson = $importStore
+	const importRaw = $importStore
 	if ($importStore) {
 		$importStore = undefined
 	}
@@ -29,39 +40,44 @@
 		fullscreen: false,
 		unusedInlineScripts: [],
 		hiddenInlineScripts: [],
-		css: {}
+		theme: {
+			type: 'path',
+			path: DEFAULT_THEME
+		}
 	}
-
-	if (nodraft) {
-		goto('?', { replaceState: true })
-	}
-
+	afterNavigate(() => {
+		if (nodraft) {
+			let url = new URL($page.url.href)
+			url.search = ''
+			replaceState(url.toString(), $page.state)
+		}
+	})
 	let policy: Policy = {
 		on_behalf_of: $userStore?.username.includes('@')
 			? $userStore?.username
 			: `u/${$userStore?.username}`,
 		on_behalf_of_email: $userStore?.email,
-		execution_mode: Policy.execution_mode.PUBLISHER
+		execution_mode: 'publisher'
 	}
 
 	loadApp()
 
 	async function loadApp() {
-		if (importJson) {
-			sendUserToast('Loaded from JSON')
-			if ('value' in importJson) {
-				summary = importJson.summary
-				value = importJson.value
-				policy = importJson.policy
+		if (importRaw) {
+			sendUserToast('Loaded from YAML/JSON')
+			if ('value' in importRaw) {
+				summary = importRaw.summary
+				value = importRaw.value
+				policy = importRaw.policy
 			} else {
-				value = importJson
+				value = importRaw
 			}
 		} else if (templatePath) {
 			const template = await AppService.getAppByPath({
 				workspace: $workspaceStore!,
 				path: templatePath
 			})
-			value = template.value
+			value = template.value as any
 			sendUserToast('App loaded from template')
 			goto('?', { replaceState: true })
 		} else if (templateId) {
@@ -69,7 +85,7 @@
 				workspace: $workspaceStore!,
 				id: parseInt(templateId)
 			})
-			value = template.value
+			value = template.value as any
 			sendUserToast('App loaded from template')
 			goto('?', { replaceState: true })
 		} else if (hubId) {
@@ -78,13 +94,13 @@
 				hiddenInlineScripts: [],
 				unusedInlineScripts: [],
 				fullscreen: false,
-				...hub.app.value
+				...((hub.app.value ?? {}) as any)
 			}
 			summary = hub.app.summary
 			sendUserToast('App loaded from Hub')
 			goto('?', { replaceState: true })
 		} else if (!templatePath && !hubId && state) {
-			sendUserToast('App restored from draft', false, [
+			sendUserToast('App restored from browser stored autosave', false, [
 				{
 					label: 'Start from blank',
 					callback: () => {
@@ -93,22 +109,51 @@
 							fullscreen: false,
 							unusedInlineScripts: [],
 							hiddenInlineScripts: [],
-							css: {}
+							theme: undefined
 						}
 					}
 				}
 			])
 			value = decodeState(state)
+		} else {
+			const preset = presets['topbarcomponent']
+
+			const id = insertNewGridItem(
+				value,
+				appComponentFromType(preset.targetComponent, preset.configuration, undefined, {
+					customCss: {
+						container: {
+							class: '!p-0' as any,
+							style: ''
+						}
+					}
+				}) as (id: string) => AppComponent,
+				undefined,
+				undefined,
+				'topbar',
+				{ x: 0, y: 0 },
+				{
+					3: processDimension(preset.dims, 3),
+					12: processDimension(preset.dims, 12)
+				},
+				true,
+				true
+			)
+
+			setUpTopBarComponentContent(id, value)
+
+			value.hideLegacyTopBar = true
+			value.mobileViewOnSmallerScreens = false
+
+			value = value
 		}
 	}
-
-	$dirtyStore = false
 </script>
 
 {#if value}
 	<div class="h-screen">
 		{#key value}
-			<AppEditor versions={[]} {summary} app={value} path={''} {policy} fromHub={hubId != null} />
+			<AppEditor {summary} app={value} path={''} {policy} fromHub={hubId != null} />
 		{/key}
 	</div>
 {/if}

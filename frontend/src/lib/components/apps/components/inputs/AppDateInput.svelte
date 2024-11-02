@@ -1,12 +1,15 @@
 <script lang="ts">
 	import { getContext } from 'svelte'
 	import { twMerge } from 'tailwind-merge'
-	import { initOutput } from '../../editor/appUtils'
+	import { initConfig, initOutput } from '../../editor/appUtils'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import { concatCustomCss } from '../../utils'
+	import { initCss } from '../../utils'
 	import AlignWrapper from '../helpers/AlignWrapper.svelte'
-	import InputValue from '../helpers/InputValue.svelte'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
+	import { parseISO, format as formatDateFns } from 'date-fns'
+	import { components } from '../../editor/component'
+	import ResolveConfig from '../helpers/ResolveConfig.svelte'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
 
 	export let id: string
 	export let configuration: RichConfigurations
@@ -17,10 +20,11 @@
 
 	const { app, worldStore, selectedComponent, componentControl } =
 		getContext<AppViewerContext>('AppViewerContext')
-	let labelValue: string = 'Title'
-	let minValue: string = ''
-	let maxValue: string = ''
-	let defaultValue: string | undefined = undefined
+
+	let resolvedConfig = initConfig(
+		components['dateinputcomponent'].initialData.configuration,
+		configuration
+	)
 
 	let value: string | undefined = undefined
 
@@ -34,20 +38,53 @@
 		result: undefined as string | undefined
 	})
 
-	$: handleDefault(defaultValue)
+	$: handleDefault(resolvedConfig.defaultValue)
 
-	$: outputs?.result.set(value)
+	function formatDate(dateString: string, formatString: string = 'dd.MM.yyyy') {
+		if (formatString === '') {
+			formatString = 'dd.MM.yyyy'
+		}
+
+		try {
+			const isoDate = parseISO(dateString)
+			return formatDateFns(isoDate, formatString)
+		} catch (error) {
+			return 'Error formatting date:' + error.message
+		}
+	}
+
+	$: {
+		if (value) {
+			outputs?.result.set(formatDate(value, resolvedConfig.outputFormat))
+		} else {
+			outputs?.result.set(undefined)
+		}
+	}
 
 	function handleDefault(defaultValue: string | undefined) {
 		value = defaultValue
 	}
-	$: css = concatCustomCss($app.css?.dateinputcomponent, customCss)
+	let css = initCss($app.css?.dateinputcomponent, customCss)
 </script>
 
-<InputValue {id} input={configuration.label} bind:value={labelValue} />
-<InputValue {id} input={configuration.minDate} bind:value={minValue} />
-<InputValue {id} input={configuration.maxDate} bind:value={maxValue} />
-<InputValue {id} input={configuration.defaultValue} bind:value={defaultValue} />
+{#each Object.keys(components['dateinputcomponent'].initialData.configuration) as key (key)}
+	<ResolveConfig
+		{id}
+		{key}
+		bind:resolvedConfig={resolvedConfig[key]}
+		configuration={configuration[key]}
+	/>
+{/each}
+
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.dateinputcomponent}
+	/>
+{/each}
 
 <InitializeComponent {id} />
 
@@ -58,10 +95,14 @@
 			on:pointerdown|stopPropagation
 			type="date"
 			bind:value
-			min={minValue}
-			max={maxValue}
+			min={resolvedConfig.minDate}
+			max={resolvedConfig.maxDate}
 			placeholder="Type..."
-			class={twMerge(css?.input?.class ?? '')}
+			class={twMerge(
+				'windmillapp w-full py-1.5 text-sm px-1 app-editor-input',
+				css?.input?.class,
+				'wm-date-input'
+			)}
 			style={css?.input?.style ?? ''}
 		/>
 	{/if}

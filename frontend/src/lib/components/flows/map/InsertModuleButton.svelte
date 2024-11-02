@@ -1,132 +1,207 @@
 <script lang="ts">
-	import { Menu } from '$lib/components/common'
-	import {
-		faCode,
-		faCodeBranch,
-		faBarsStaggered,
-		faBolt,
-		faCheck
-	} from '@fortawesome/free-solid-svg-icons'
-	import { createEventDispatcher } from 'svelte'
-	import Icon from 'svelte-awesome'
-	import { Cross, Repeat, Square } from 'lucide-svelte'
+	import { createEventDispatcher, getContext } from 'svelte'
+	import { Cross, Zap } from 'lucide-svelte'
+	import StepGenQuick from '$lib/components/copilot/StepGenQuick.svelte'
+	import FlowInputsQuick from '../content/FlowInputsQuick.svelte'
+	import type { FlowModule } from '$lib/gen'
+	import type { FlowBuilderWhitelabelCustomUi } from '$lib/components/custom_ui'
+	import ToggleHubWorkspaceQuick from '$lib/components/ToggleHubWorkspaceQuick.svelte'
+	import { twMerge } from 'tailwind-merge'
+	import type { ComputeConfig } from 'svelte-floating-ui'
+	import TopLevelNode from '../pickers/TopLevelNode.svelte'
+	import PopupV2 from '$lib/components/common/popup/PopupV2.svelte'
+	import { flip, offset } from 'svelte-floating-ui/dom'
+
+	// import type { Writable } from 'svelte/store'
 
 	const dispatch = createEventDispatcher()
-	export let trigger = false
 	export let stop = false
-	export let open: boolean | undefined = undefined
+	export let index: number = 0
+	export let funcDesc = ''
+	export let modules: FlowModule[] = []
+	export let disableAi = false
+	export let kind: 'script' | 'trigger' | 'preprocessor' | 'failure' = 'script'
+	export let allowTrigger = true
+
+	type Alignment = 'start' | 'end' | 'center'
+	type Side = 'top' | 'bottom'
+	type Placement = `${Side}-${Alignment}`
+
+	export let placement: Placement = 'bottom-center'
+
+	let floatingConfig: ComputeConfig = {
+		strategy: 'fixed',
+		// @ts-ignore
+		placement,
+		middleware: [offset(8), flip()],
+		autoUpdate: true
+	}
+	$: !open && (funcDesc = '')
+	let customUi: undefined | FlowBuilderWhitelabelCustomUi = getContext('customUi')
+	let selectedKind: 'script' | 'trigger' | 'preprocessor' | 'approval' | 'flow' | 'failure' = kind
+	let preFilter: 'all' | 'workspace' | 'hub' = 'all'
+	let loading = false
+	let small = false
+	let open = false
+
+	$: small = kind === 'preprocessor' || kind === 'failure'
 </script>
 
-<Menu bind:show={open} noMinW placement="bottom-center" let:close>
-	<button
-		title="Add step"
-		slot="trigger"
-		type="button"
-		class=" text-gray-900 bg-white border mx-0.5 border-gray-300 focus:outline-none hover:bg-gray-100 focus:ring-4 focus:ring-gray-200 font-medium rounded-full text-sm w-6 h-6 flex items-center justify-center"
+<!-- <Menu transitionDuration={0} pointerDown bind:show={open} noMinW {placement} let:close> -->
+
+<!-- {floatingConfig}
+floatingClasses="mt-2"
+containerClasses="border rounded-lg shadow-lg  bg-surface"
+noTransition
+shouldUsePortal={true} -->
+
+<PopupV2 {floatingConfig} bind:open let:close target="#flow-editor">
+	<svelte:fragment let:pointerdown let:pointerup slot="button">
+		<button
+			title={`Add ${
+				kind === 'failure'
+					? ' failure module '
+					: kind === 'preprocessor'
+					? 'preprocessor step'
+					: kind === 'trigger'
+					? 'trigger'
+					: 'step'
+			}`}
+			id={`flow-editor-add-step-${index}`}
+			type="button"
+			class={twMerge(
+				'w-5 h-5 flex items-center justify-center',
+				'outline-[1px] outline dark:outline-gray-500 outline-gray-300',
+				'text-secondary',
+				'bg-surface focus:outline-none hover:bg-surface-hover rounded'
+			)}
+			on:pointerdown|preventDefault|stopPropagation={pointerdown}
+			on:pointerup={pointerup}
+		>
+			{#if kind === 'trigger'}
+				<Zap size={12} />
+			{:else}
+				<Cross size={12} />
+			{/if}
+		</button>
+	</svelte:fragment>
+	<!-- FOO -->
+	<div
+		id="flow-editor-insert-module"
+		class="flex flex-col h-[400px] {small ? 'w-[450px]' : 'w-[650px]'}  pt-1 pr-1 pl-1 gap-1.5"
+		on:wheel={(e) => {
+			e.stopPropagation()
+		}}
+		role="none"
 	>
-		<Cross size={12} />
-	</button>
-	<div class="font-mono divide-y divide-gray-100 text-xs w-40">
-		<button
-			class="w-full text-left p-2 hover:bg-gray-100"
-			on:click={() => {
-				close()
-				dispatch('new', 'script')
-			}}
-			role="menuitem"
-			tabindex="-1"
-		>
-			<Icon data={faCode} scale={0.8} class="mr-2" />
-			Action
-		</button>
-		{#if trigger}
-			<button
-				class="w-full text-left p-2 hover:bg-gray-100"
-				on:click={() => {
-					close()
-					dispatch('new', 'trigger')
+		<div class="flex flex-row items-center gap-2">
+			<StepGenQuick
+				on:escape={() => close(null)}
+				{disableAi}
+				on:insert
+				bind:funcDesc
+				{preFilter}
+				{loading}
+			/>
+			{#if selectedKind != 'preprocessor' && selectedKind != 'flow'}
+				<ToggleHubWorkspaceQuick bind:selected={preFilter} />
+			{/if}
+		</div>
+
+		<div class="flex flex-row grow min-h-0">
+			{#if kind === 'script' || kind == 'trigger'}
+				<div class="flex-none flex flex-col text-xs text-primary">
+					<TopLevelNode
+						label="Action"
+						selected={selectedKind === 'script'}
+						on:select={() => {
+							selectedKind = 'script'
+						}}
+					/>
+					{#if customUi?.triggers != false && allowTrigger}
+						<TopLevelNode
+							label="Trigger"
+							selected={selectedKind === 'trigger'}
+							on:select={() => {
+								selectedKind = 'trigger'
+							}}
+						/>
+					{/if}
+					<TopLevelNode
+						label="Approval/Prompt"
+						selected={selectedKind === 'approval'}
+						on:select={() => {
+							selectedKind = 'approval'
+						}}
+					/>
+					{#if customUi?.flowNode != false}
+						<TopLevelNode
+							label="Flow"
+							selected={selectedKind === 'flow'}
+							on:select={() => {
+								selectedKind = 'flow'
+							}}
+						/>
+					{/if}
+					{#if stop}
+						<TopLevelNode
+							label="End Flow"
+							selected={selectedKind === 'script'}
+							on:select={() => {
+								selectedKind = 'script'
+							}}
+						/>
+					{/if}
+
+					<TopLevelNode
+						label="For Loop"
+						on:select={() => {
+							close(null)
+							dispatch('new', { kind: 'forloop' })
+						}}
+					/>
+					<TopLevelNode
+						label="While Loop"
+						on:select={() => {
+							close(null)
+							dispatch('new', { kind: 'whileloop' })
+						}}
+					/>
+					<TopLevelNode
+						label="Branch to one"
+						on:select={() => {
+							close(null)
+							dispatch('new', { kind: 'branchone' })
+						}}
+					/>
+					<TopLevelNode
+						label="Branch to all"
+						on:select={() => {
+							close(null)
+							dispatch('new', { kind: 'branchall' })
+						}}
+					/>
+				</div>
+			{/if}
+
+			<FlowInputsQuick
+				{selectedKind}
+				bind:loading
+				filter={funcDesc}
+				{modules}
+				{index}
+				{disableAi}
+				{funcDesc}
+				{kind}
+				on:close={() => {
+					close(null)
 				}}
-				role="menuitem"
-				tabindex="-1"
-			>
-				<Icon data={faBolt} scale={0.8} class="mr-2" />
-				Trigger
-			</button>
-		{/if}
-		<button
-			class="w-full text-left gap-1 p-2 hover:bg-gray-100"
-			on:click={() => {
-				close()
-				dispatch('new', 'approval')
-			}}
-			role="menuitem"
-			tabindex="-1"
-		>
-			<Icon data={faCheck} class="mr-1.5" scale={0.8} />
-			Approval
-		</button>
-		<button
-			class="w-full inline-flex text-left p-2 hover:bg-gray-100"
-			on:click={() => {
-				close()
-				dispatch('new', 'forloop')
-			}}
-			role="menuitem"
-		>
-			<span class="mr-3">
-				<Repeat size={14} />
-			</span>
-
-			For Loop
-		</button>
-
-		<button
-			class="w-full text-left p-2 hover:bg-gray-100"
-			on:click={() => {
-				close()
-				dispatch('new', 'branchone')
-			}}
-			role="menuitem"
-		>
-			<Icon data={faCodeBranch} scale={0.8} class="mr-2" />
-			Branch to one
-		</button>
-
-		<button
-			class="w-full text-left p-2 hover:bg-gray-100"
-			on:click={() => {
-				close()
-				dispatch('new', 'branchall')
-			}}
-			role="menuitem"
-		>
-			<Icon data={faCodeBranch} scale={0.8} class="mr-2" />
-			Branch to all
-		</button>
-
-		<button
-			class="w-full text-left p-2 hover:bg-gray-100"
-			on:click={() => {
-				close()
-				dispatch('new', 'flow')
-			}}
-			role="menuitem"
-		>
-			<Icon data={faBarsStaggered} scale={0.8} class="mr-2" />
-			Flow
-		</button>
-		{#if stop}
-			<button
-				class="w-full text-left p-2 hover:bg-gray-100 inline-flex gap-2.5"
-				on:click={() => {
-					close()
-					dispatch('new', 'end')
-				}}
-				role="menuitem"
-			>
-				<Square size={14} />
-				End Flow
-			</button>
-		{/if}
+				on:new
+				on:pickScript
+				on:pickFlow
+				{preFilter}
+				{small}
+			/>
+		</div>
 	</div>
-</Menu>
+</PopupV2>

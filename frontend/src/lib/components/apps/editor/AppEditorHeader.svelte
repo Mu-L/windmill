@@ -1,12 +1,9 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { page } from '$app/stores'
-	import { Alert, Badge, Drawer, DrawerContent, Kbd, UndoRedo } from '$lib/components/common'
+	import { Alert, Badge, Drawer, DrawerContent, Tab, Tabs, UndoRedo } from '$lib/components/common'
 	import Button from '$lib/components/common/button/Button.svelte'
-	import { dirtyStore } from '$lib/components/common/confirmationModal/dirtyStore'
-	import Skeleton from '$lib/components/common/skeleton/Skeleton.svelte'
 	import DisplayResult from '$lib/components/DisplayResult.svelte'
-	import Dropdown from '$lib/components/Dropdown.svelte'
 	import FlowProgressBar from '$lib/components/flows/FlowProgressBar.svelte'
 	import FlowStatusViewer from '$lib/components/FlowStatusViewer.svelte'
 	import JobArgs from '$lib/components/JobArgs.svelte'
@@ -14,28 +11,38 @@
 	import Path from '$lib/components/Path.svelte'
 	import TestJobLoader from '$lib/components/TestJobLoader.svelte'
 	import Toggle from '$lib/components/Toggle.svelte'
-	import { AppService, DraftService, Job, Policy } from '$lib/gen'
+	import { AppService, DraftService, type Job, type Policy } from '$lib/gen'
 	import { redo, undo } from '$lib/history'
-	import { workspaceStore } from '$lib/stores'
-	import {
-		faClipboard,
-		faFileExport,
-		faHistory,
-		faSave,
-		faSlidersH
-	} from '@fortawesome/free-solid-svg-icons'
+	import { enterpriseLicense, workspaceStore } from '$lib/stores'
 	import {
 		AlignHorizontalSpaceAround,
+		BellOff,
 		Bug,
+		Clipboard,
+		DiffIcon,
 		Expand,
+		FileJson,
+		FileUp,
+		FormInput,
+		History,
 		Laptop2,
 		Loader2,
-		Smartphone
+		MoreVertical,
+		RefreshCw,
+		Save,
+		Smartphone,
+		FileClock
 	} from 'lucide-svelte'
-	import { getContext } from 'svelte'
-	import { Icon } from 'svelte-awesome'
+	import { createEventDispatcher, getContext } from 'svelte'
 	import { Pane, Splitpanes } from 'svelte-splitpanes'
-	import { classNames, copyToClipboard } from '../../../utils'
+	import {
+		classNames,
+		cleanValueProperties,
+		copyToClipboard,
+		truncateRev,
+		orderedJsonStringify,
+		type Value
+	} from '../../../utils'
 	import type {
 		AppInput,
 		ConnectedAppInput,
@@ -44,7 +51,7 @@
 		StaticAppInput,
 		UserAppInput
 	} from '../inputType'
-	import type { AppEditorContext, AppViewerContext } from '../types'
+	import type { App, AppEditorContext, AppViewerContext } from '../types'
 	import { BG_PREFIX, allItems, toStatic } from '../utils'
 	import AppExportButton from './AppExportButton.svelte'
 	import AppInputs from './AppInputs.svelte'
@@ -59,6 +66,27 @@
 	import { Sha256 } from '@aws-crypto/sha256-js'
 	import { sendUserToast } from '$lib/toast'
 	import DeploymentHistory from './DeploymentHistory.svelte'
+	import Awareness from '$lib/components/Awareness.svelte'
+	import { secondaryMenuLeftStore, secondaryMenuRightStore } from './settingsPanel/secondaryMenu'
+	import ButtonDropdown from '$lib/components/common/button/ButtonDropdown.svelte'
+	import { MenuItem } from '@rgossiaux/svelte-headlessui'
+	import AppEditorTutorial from './AppEditorTutorial.svelte'
+	import AppTimeline from './AppTimeline.svelte'
+	import type DiffDrawer from '$lib/components/DiffDrawer.svelte'
+	import AppReportsDrawer from './AppReportsDrawer.svelte'
+	import HighlightCode from '$lib/components/HighlightCode.svelte'
+	import { type ColumnDef, getPrimaryKeys } from '../components/display/dbtable/utils'
+	import DebugPanel from './contextPanel/DebugPanel.svelte'
+	import { getCountInput } from '../components/display/dbtable/queries/count'
+	import { getSelectInput } from '../components/display/dbtable/queries/select'
+	import { getInsertInput } from '../components/display/dbtable/queries/insert'
+	import { getUpdateInput } from '../components/display/dbtable/queries/update'
+	import { getDeleteInput } from '../components/display/dbtable/queries/delete'
+	import { collectOneOfFields } from './appUtils'
+	import Summary from '$lib/components/Summary.svelte'
+	import ToggleEnable from '$lib/components/common/toggleButton-v2/ToggleEnable.svelte'
+	import HideButton from './settingsPanel/HideButton.svelte'
+	import DeployOverrideConfirmationModal from '$lib/components/common/confirmationModal/DeployOverrideConfirmationModal.svelte'
 
 	async function hash(message) {
 		try {
@@ -70,7 +98,7 @@
 		} catch {
 			//subtle not available, trying pure js
 			const hash = new Sha256()
-			hash.update(message)
+			hash.update(message ?? '')
 			const result = Array.from(await hash.digest())
 			const hex = result.map((b) => b.toString(16).padStart(2, '0')).join('') // convert bytes to hex string
 			return hex
@@ -79,7 +107,26 @@
 
 	export let policy: Policy
 	export let fromHub: boolean = false
-	export let versions: number[]
+	export let diffDrawer: DiffDrawer | undefined = undefined
+	export let savedApp:
+		| {
+				value: App
+				draft?: any
+				path: string
+				summary: string
+				policy: any
+				draft_only?: boolean
+		  }
+		| undefined = undefined
+	export let version: number | undefined = undefined
+	export let leftPanelHidden: boolean = false
+	export let rightPanelHidden: boolean = false
+	export let bottomPanelHidden: boolean = false
+
+	let deployedValue: Value | undefined = undefined // Value to diff against
+	let deployedBy: string | undefined = undefined // Author
+	let confirmCallback: () => void = () => {} // What happens when user clicks `override` in warning
+	let open: boolean = false // Is confirmation modal open
 
 	const {
 		app,
@@ -87,12 +134,15 @@
 		breakpoint,
 		appPath,
 		jobs,
+		jobsById,
 		staticExporter,
 		errorByComponent,
-		openDebugRun
+		openDebugRun,
+		mode
 	} = getContext<AppViewerContext>('AppViewerContext')
 
-	const { history } = getContext<AppEditorContext>('AppEditorContext')
+	const { history, jobsDrawerOpen, refreshComponents } =
+		getContext<AppEditorContext>('AppEditorContext')
 
 	const loading = {
 		publish: false,
@@ -101,13 +151,9 @@
 	}
 
 	$: if ($openDebugRun == undefined) {
-		$openDebugRun = (componentId: string) => {
-			jobsDrawerOpen = true
-
-			const job = $jobs.find((job) => job.component === componentId)
-			if (job) {
-				selectedJobId = job.job
-			}
+		$openDebugRun = (jobId: string) => {
+			$jobsDrawerOpen = true
+			selectedJobId = jobId
 		}
 	}
 
@@ -117,9 +163,10 @@
 
 	let draftDrawerOpen = false
 	let saveDrawerOpen = false
-	let jobsDrawerOpen = false
 	let inputsDrawerOpen = fromHub
 	let historyBrowserDrawerOpen = false
+	let debugAppDrawerOpen = false
+	let deploymentMsg: string | undefined = undefined
 
 	function closeSaveDrawer() {
 		saveDrawerOpen = false
@@ -140,8 +187,15 @@
 				})
 		)
 	}
+
+	type TriggerableV2 = {
+		static_inputs: Record<string, any>
+		one_of_inputs?: Record<string, any[] | undefined>
+		allow_user_resources?: string[]
+	}
+
 	async function computeTriggerables() {
-		const allTriggers = (await Promise.all(
+		const allTriggers: ([string, TriggerableV2] | undefined)[] = (await Promise.all(
 			allItems($app.grid, $app.subgrids)
 				.flatMap((x) => {
 					let c = x.data as AppComponent
@@ -151,39 +205,136 @@
 					if (c.type === 'tablecomponent') {
 						r.push(...c.actionButtons.map((x) => ({ input: x.componentInput, id: x.id })))
 					}
-					return r
+					if (
+						(c.type === 'aggridcomponent' ||
+							c.type === 'aggridcomponentee' ||
+							c.type === 'dbexplorercomponent' ||
+							c.type === 'aggridinfinitecomponent' ||
+							c.type === 'aggridinfinitecomponentee') &&
+						Array.isArray(c.actions)
+					) {
+						r.push(...c.actions.map((x) => ({ input: x.componentInput, id: x.id })))
+					}
+					if (c.type === 'menucomponent') {
+						r.push(...c.menuItems.map((x) => ({ input: x.componentInput, id: x.id })))
+					}
+					if (c.type === 'dbexplorercomponent') {
+						let nr: { id: string; input: AppInput }[] = []
+						let config = c.configuration as any
+
+						const dbType = config?.type?.selected
+						let pg = config?.type?.configuration?.[dbType]
+
+						if (pg && dbType) {
+							const { table, resource } = pg
+							const tableValue = table.value
+							const resourceValue = resource.value
+							const columnDefs = (c.configuration.columnDefs as any).value as ColumnDef[]
+							const whereClause = (c.configuration.whereClause as any).value as unknown as
+								| string
+								| undefined
+							if (tableValue && resourceValue && columnDefs) {
+								r.push({
+									input: getSelectInput(resourceValue, tableValue, columnDefs, whereClause, dbType),
+									id: x.id
+								})
+
+								r.push({
+									input: getCountInput(resourceValue, tableValue, dbType, columnDefs, whereClause),
+									id: x.id + '_count'
+								})
+								console.log(
+									x.id,
+									getCountInput(resourceValue, tableValue, dbType, columnDefs, whereClause),
+									columnDefs
+								)
+								r.push({
+									input: getInsertInput(tableValue, columnDefs, resourceValue, dbType),
+									id: x.id + '_insert'
+								})
+
+								let primaryColumns = getPrimaryKeys(columnDefs)
+								let columns = columnDefs?.filter((x) => primaryColumns.includes(x.field))
+
+								r.push({
+									input: getDeleteInput(resourceValue, tableValue, columns, dbType),
+									id: x.id + '_delete'
+								})
+
+								columnDefs
+									.filter((col) => col.editable || config.allEditable.value)
+									.forEach((column) => {
+										r.push({
+											input: getUpdateInput(resourceValue, tableValue, column, columns, dbType),
+											id: x.id + '_update'
+										})
+									})
+							}
+						}
+						r.push(...nr)
+					}
+
+					const processed = r
 						.filter((x) => x.input)
 						.map(async (o) => {
 							if (o.input?.type == 'runnable') {
 								return await processRunnable(o.id, o.input.runnable, o.input.fields)
 							}
 						})
+
+					return processed as Promise<[string, TriggerableV2] | undefined>[]
 				})
 				.concat(
 					Object.values($app.hiddenInlineScripts ?? {}).map(async (v, i) => {
 						return await processRunnable(BG_PREFIX + i, v, v.fields)
-					})
+					}) as Promise<[string, TriggerableV2] | undefined>[]
 				)
-		)) as ([string, Record<string, any>] | undefined)[]
-		policy.triggerables = Object.fromEntries(
-			allTriggers.filter(Boolean) as [string, Record<string, any>][]
+		)) as ([string, TriggerableV2] | undefined)[]
+
+		delete policy.triggerables
+		const ntriggerables: Record<string, TriggerableV2> = Object.fromEntries(
+			allTriggers.filter(Boolean) as [string, TriggerableV2][]
 		)
+		policy.triggerables_v2 = ntriggerables
 	}
 
 	async function processRunnable(
 		id: string,
 		runnable: Runnable,
 		fields: Record<string, any>
-	): Promise<[string, Record<string, any>] | undefined> {
+	): Promise<[string, TriggerableV2] | undefined> {
 		const staticInputs = collectStaticFields(fields)
+		const oneOfInputs = collectOneOfFields(fields, $app)
+		const allowUserResources: string[] = Object.entries(fields)
+			.map(([k, v]) => {
+				return v['allowUserResources'] ? k : undefined
+			})
+			.filter(Boolean) as string[]
+
 		if (runnable?.type == 'runnableByName') {
 			let hex = await hash(runnable.inlineScript?.content)
-			return [`${id}:rawscript/${hex}`, staticInputs]
+			console.log('hex', hex, id)
+			return [
+				`${id}:rawscript/${hex}`,
+				{
+					static_inputs: staticInputs,
+					one_of_inputs: oneOfInputs,
+					allow_user_resources: allowUserResources
+				}
+			]
 		} else if (runnable?.type == 'runnableByPath') {
 			let prefix = runnable.runType !== 'hubscript' ? runnable.runType : 'script'
-			return [`${id}:${prefix}/${runnable.path}`, staticInputs]
+			return [
+				`${id}:${prefix}/${runnable.path}`,
+				{
+					static_inputs: staticInputs,
+					one_of_inputs: oneOfInputs,
+					allow_user_resources: allowUserResources
+				}
+			]
 		}
 	}
+
 	async function createApp(path: string) {
 		await computeTriggerables()
 		try {
@@ -193,37 +344,112 @@
 					value: $app,
 					path,
 					summary: $summary,
-					policy
+					policy,
+					deployment_message: deploymentMsg
 				}
 			})
-			$dirtyStore = false
+			savedApp = {
+				summary: $summary,
+				value: structuredClone($app),
+				path: path,
+				policy: policy
+			}
 			closeSaveDrawer()
 			sendUserToast('App deployed successfully')
+			try {
+				localStorage.removeItem(`app-${path}`)
+			} catch (e) {
+				console.error('error interacting with local storage', e)
+			}
 			goto(`/apps/edit/${appId}`)
 		} catch (e) {
 			sendUserToast('Error creating app', e)
 		}
 	}
 
-	async function updateApp(path: string) {
+	async function handleUpdateApp(npath: string) {
+		// We have to make sure there is no updates when we clicked the button
+		await compareVersions()
+
+		if (onLatest) {
+			// Handle directly
+			await updateApp(npath)
+		} else {
+			// There is onLatest, but we need more information while deploying
+			// We need it to show diff
+			// Handle through confirmation modal
+			await syncWithDeployed()
+
+			confirmCallback = async () => {
+				open = false
+				await updateApp(npath)
+			}
+			// Open confirmation modal
+			open = true
+		}
+	}
+
+	async function syncWithDeployed() {
+		const deployedApp = await AppService.getAppByPath({
+			workspace: $workspaceStore!,
+			path: appPath,
+			withStarredInfo: true
+		})
+
+		deployedBy = deployedApp.created_by
+
+		// Strip off extra information
+		deployedValue = {
+			...deployedApp,
+			starred: undefined,
+			id: undefined,
+			created_at: undefined,
+			created_by: undefined,
+			versions: undefined,
+			extra_perms: undefined //
+		}
+	}
+
+	async function updateApp(npath: string) {
 		await computeTriggerables()
 		await AppService.updateApp({
 			workspace: $workspaceStore!,
-			path: $page.params.path,
+			path: appPath,
 			requestBody: {
 				value: $app!,
 				summary: $summary,
-				policy
+				policy,
+				path: npath,
+				deployment_message: deploymentMsg
 			}
 		})
-		$dirtyStore = false
+		savedApp = {
+			summary: $summary,
+			value: structuredClone($app),
+			path: npath,
+			policy
+		}
+		const appHistory = await AppService.getAppHistoryByPath({
+			workspace: $workspaceStore!,
+			path: npath
+		})
+		version = appHistory[0]?.version
+
 		closeSaveDrawer()
 		sendUserToast('App deployed successfully')
+		if (appPath !== npath) {
+			try {
+				localStorage.removeItem(`app-${appPath}`)
+			} catch (e) {
+				console.error('error interacting with local storage', e)
+			}
+			window.location.pathname = `/apps/edit/${npath}?nodraft=true`
+		}
 	}
 
 	let secretUrl: string | undefined = undefined
 
-	$: secretUrl == undefined && policy.execution_mode == 'anonymous' && getSecretUrl()
+	$: appPath != '' && secretUrl == undefined && getSecretUrl()
 
 	async function getSecretUrl() {
 		secretUrl = await AppService.getPublicSecretOfApp({
@@ -233,20 +459,23 @@
 	}
 
 	async function setPublishState() {
+		await computeTriggerables()
 		await AppService.updateApp({
 			workspace: $workspaceStore!,
 			path: appPath,
 			requestBody: { policy }
 		})
 		if (policy.execution_mode == 'anonymous') {
-			sendUserToast('App made visible publicly at the secret URL.')
+			sendUserToast('App require no login to be accessed')
 		} else {
-			sendUserToast('App made unaccessible publicly')
+			sendUserToast('App require login and read-access')
 		}
 	}
 
 	async function save() {
-		$dirtyStore = false
+		$secondaryMenuLeftStore.isOpen = false
+		$secondaryMenuRightStore.isOpen = false
+
 		saveDrawerOpen = true
 		return
 	}
@@ -269,11 +498,29 @@
 				requestBody: {
 					path: newPath,
 					typ: 'app',
-					value: $app!
+					value: {
+						value: $app,
+						path: newPath,
+						summary: $summary,
+						policy
+					}
 				}
 			})
+			savedApp = {
+				summary: $summary,
+				value: structuredClone($app),
+				path: newPath,
+				policy,
+				draft_only: true,
+				draft: {
+					summary: $summary,
+					value: structuredClone($app),
+					path: newPath,
+					policy
+				}
+			}
+
 			draftDrawerOpen = false
-			$dirtyStore = false
 			goto(`/apps/edit/${newPath}`)
 		} catch (e) {
 			sendUserToast('Error saving initial draft', e)
@@ -281,31 +528,118 @@
 		draftDrawerOpen = false
 	}
 
-	async function saveDraft() {
-		$dirtyStore = false
+	async function saveDraft(forceSave = false) {
 		if ($page.params.path == undefined) {
+			// initial draft
 			draftDrawerOpen = true
+			return
+		}
+		if (!savedApp) {
+			return
+		}
+		const draftOrDeployed = cleanValueProperties(savedApp.draft || savedApp)
+		const current = cleanValueProperties({
+			summary: $summary,
+			value: $app,
+			path: newPath || savedApp.draft?.path || savedApp.path,
+			policy
+		})
+		if (!forceSave && orderedJsonStringify(draftOrDeployed) === orderedJsonStringify(current)) {
+			sendUserToast('No changes detected, ignoring', false, [
+				{
+					label: 'Save anyway',
+					callback: () => {
+						saveDraft(true)
+					}
+				}
+			])
 			return
 		}
 		loading.saveDraft = true
 		try {
 			await computeTriggerables()
-			$dirtyStore = false
+			let path = $page.params.path
+			if (savedApp.draft_only) {
+				await AppService.deleteApp({
+					workspace: $workspaceStore!,
+					path: path
+				})
+				await AppService.createApp({
+					workspace: $workspaceStore!,
+					requestBody: {
+						value: $app!,
+						summary: $summary,
+						policy,
+						path: newPath || path,
+						draft_only: true
+					}
+				})
+			}
 			await DraftService.createDraft({
 				workspace: $workspaceStore!,
 				requestBody: {
-					path: $page.params.path,
+					path: savedApp.draft_only ? newPath || path : path,
 					typ: 'app',
-					value: $app!
+					value: {
+						value: $app!,
+						summary: $summary,
+						policy,
+						path: newPath || path
+					}
 				}
 			})
+
+			savedApp = {
+				...(savedApp?.draft_only
+					? {
+							summary: $summary,
+							value: structuredClone($app),
+							path: savedApp.draft_only ? newPath || path : path,
+							policy
+					  }
+					: savedApp),
+				draft: {
+					summary: $summary,
+					value: structuredClone($app),
+					path: newPath || path,
+					policy
+				}
+			}
+
 			sendUserToast('Draft saved')
+			try {
+				localStorage.removeItem(`app-${path}`)
+			} catch (e) {
+				console.error('error interacting with local storage', e)
+			}
 			loading.saveDraft = false
+			if (newPath || path !== path) {
+				goto(`/apps/edit/${newPath || path}`)
+			}
 		} catch (e) {
 			loading.saveDraft = false
 			throw e
 		}
 	}
+
+	let onLatest = true
+	async function compareVersions() {
+		if (version === undefined) {
+			return
+		}
+		try {
+			const appVersion = await AppService.getAppLatestVersion({
+				workspace: $workspaceStore!,
+				path: appPath
+			})
+			onLatest = version === appVersion?.version
+		} catch (e) {
+			console.error('Error comparing versions', e)
+			onLatest = true
+		}
+	}
+
+	$: saveDrawerOpen && compareVersions()
 
 	let selectedJobId: string | undefined = undefined
 	let testJobLoader: TestJobLoader
@@ -375,13 +709,136 @@
 		}
 		lock = false
 	}
+
+	let dirtyPath = false
+	let path: Path | undefined = undefined
+
+	let moreItems = [
+		{
+			displayName: 'Deployment History',
+			icon: History,
+			action: () => {
+				historyBrowserDrawerOpen = true
+			},
+			disabled: !savedApp
+		},
+		{
+			displayName: 'Export',
+			icon: FileJson,
+			action: () => {
+				appExport.open($app)
+			}
+		},
+		// {
+		// 	displayName: 'Publish to Hub',
+		// 	icon: faGlobe,
+		// 	action: () => {
+		// 		const url = appToHubUrl(toStatic($app, $staticExporter, $summary, $hubBaseUrlStore))
+		// 		window.open(url.toString(), '_blank')
+		// 	}
+		// },
+		{
+			displayName: 'Hub compatible JSON',
+			icon: FileUp,
+			action: () => {
+				appExport.open(toStatic($app, $staticExporter, $summary).app)
+			}
+		},
+		{
+			displayName: 'App Inputs',
+			icon: FormInput,
+			action: () => {
+				inputsDrawerOpen = true
+			}
+		},
+		{
+			displayName: 'Schedule Reports',
+			icon: FileClock,
+			action: () => {
+				appReportingDrawerOpen = true
+			},
+			disabled: !savedApp || savedApp.draft_only
+		},
+		{
+			displayName: 'Diff',
+			icon: DiffIcon,
+			action: async () => {
+				if (!savedApp) {
+					return
+				}
+
+				// deployedValue should be syncronized when we open Diff
+				await syncWithDeployed()
+
+				diffDrawer?.openDrawer()
+				diffDrawer?.setDiff({
+					mode: 'normal',
+					deployed: deployedValue ?? savedApp,
+					draft: savedApp.draft,
+					current: {
+						summary: $summary,
+						value: $app,
+						path: newPath || savedApp.draft?.path || savedApp.path,
+						policy
+					}
+				})
+			},
+			disabled: !savedApp
+		},
+		// App debug menu
+		{
+			displayName: 'Troubleshoot panel',
+			icon: Bug,
+			action: () => {
+				debugAppDrawerOpen = true
+			}
+		}
+	]
+
+	let appEditorTutorial: AppEditorTutorial | undefined = undefined
+
+	export function toggleTutorial() {
+		appEditorTutorial?.toggleTutorial()
+	}
+
+	let rightColumnSelect: 'timeline' | 'detail' = 'timeline'
+
+	let appReportingDrawerOpen = false
+
+	export function openTroubleshootPanel() {
+		debugAppDrawerOpen = true
+	}
+
+	const dispatch = createEventDispatcher()
 </script>
 
 <svelte:window on:keydown={onKeyDown} />
 
 <TestJobLoader bind:this={testJobLoader} bind:isLoading={testIsLoading} bind:job />
+<UnsavedConfirmationModal
+	{diffDrawer}
+	savedValue={savedApp}
+	modifiedValue={{
+		summary: $summary,
+		value: $app,
+		path: newPath || savedApp?.draft?.path || savedApp?.path,
+		policy
+	}}
+/>
 
-<UnsavedConfirmationModal />
+<DeployOverrideConfirmationModal
+	bind:deployedBy
+	bind:confirmCallback
+	bind:open
+	{diffDrawer}
+	bind:deployedValue
+	currentValue={{
+		summary: $summary,
+		value: $app,
+		path: newPath || savedApp?.draft?.path || savedApp?.path,
+		policy
+	}}
+/>
 
 {#if appPath == ''}
 	<Drawer bind:open={draftDrawerOpen} size="800px">
@@ -389,29 +846,45 @@
 			<Alert title="Require path" type="info">
 				Choose a path to save the initial draft of the app.
 			</Alert>
+			<h3>Summary</h3>
+			<div class="w-full pt-2">
+				<!-- svelte-ignore a11y-autofocus -->
+				<input
+					autofocus
+					type="text"
+					placeholder="App summary"
+					class="text-sm w-full font-semibold"
+					on:keydown|stopPropagation
+					bind:value={$summary}
+					on:keyup={() => {
+						if (appPath == '' && $summary?.length > 0 && !dirtyPath) {
+							path?.setName(
+								$summary
+									.toLowerCase()
+									.replace(/[^a-z0-9_]/g, '_')
+									.replace(/-+/g, '_')
+									.replace(/^-|-$/g, '')
+							)
+						}
+					}}
+				/>
+			</div>
 			<div class="py-2" />
 			<Path
+				autofocus={false}
+				bind:this={path}
 				bind:error={pathError}
 				bind:path={newPath}
+				bind:dirty={dirtyPath}
 				initialPath=""
 				namePlaceholder="app"
 				kind="app"
 			/>
 			<div class="py-4" />
 
-			<h3>Summary</h3>
-			<div class="w-full pt-2">
-				<input
-					type="text"
-					placeholder="App summary"
-					class="text-sm w-full font-semibold"
-					bind:value={$summary}
-				/>
-			</div>
-
 			<div slot="actions">
 				<Button
-					startIcon={{ icon: faSave }}
+					startIcon={{ icon: Save }}
 					disabled={pathError != ''}
 					on:click={() => saveInitialDraft()}
 				>
@@ -423,35 +896,109 @@
 {/if}
 <Drawer bind:open={saveDrawerOpen} size="800px">
 	<DrawerContent title="Deploy" on:close={() => closeSaveDrawer()}>
+		{#if !onLatest}
+			<Alert title="You're not on the latest app version. " type="warning">
+				By deploying, you may overwrite changes made by other users. Press 'Deploy' to see diff.
+			</Alert>
+			<div class="py-2" />
+		{/if}
+		<span class="text-secondary text-sm font-bold">Summary</span>
+		<div class="w-full pt-2">
+			<!-- svelte-ignore a11y-autofocus -->
+			<input
+				autofocus
+				type="text"
+				placeholder="App summary"
+				class="text-sm w-full"
+				bind:value={$summary}
+				on:keydown|stopPropagation
+				on:keyup={() => {
+					if (appPath == '' && $summary?.length > 0 && !dirtyPath) {
+						path?.setName(
+							$summary
+								.toLowerCase()
+								.replace(/[^a-z0-9_]/g, '_')
+								.replace(/-+/g, '_')
+								.replace(/^-|-$/g, '')
+						)
+					}
+				}}
+			/>
+		</div>
+		<div class="py-4" />
+		<span class="text-secondary text-sm font-bold">Deployment message</span>
+		<div class="w-full pt-2">
+			<!-- svelte-ignore a11y-autofocus -->
+			<input
+				type="text"
+				placeholder="Optional deployment message"
+				class="text-sm w-full"
+				bind:value={deploymentMsg}
+			/>
+		</div>
+		<div class="py-4" />
+		<span class="text-secondary text-sm font-bold">Path</span>
 		<Path
+			bind:this={path}
+			bind:dirty={dirtyPath}
 			bind:error={pathError}
 			bind:path={newPath}
 			initialPath={appPath}
 			namePlaceholder="app"
 			kind="app"
+			autofocus={false}
 		/>
 
-		<div class="py-4" />
-
-		<h3>Summary</h3>
-		<div class="w-full pt-2">
-			<input
-				type="text"
-				placeholder="App summary"
-				class="text-sm w-full font-semibold"
-				bind:value={$summary}
-			/>
-		</div>
-
-		<div slot="actions">
+		<div slot="actions" class="flex flex-row gap-4">
 			<Button
-				startIcon={{ icon: faSave }}
+				variant="border"
+				color="light"
+				disabled={!savedApp || savedApp.draft_only}
+				on:click={async () => {
+					if (!savedApp) {
+						return
+					}
+					// deployedValue should be syncronized when we open Diff
+					await syncWithDeployed()
+
+					saveDrawerOpen = false
+					diffDrawer?.openDrawer()
+					diffDrawer?.setDiff({
+						mode: 'normal',
+						deployed: deployedValue ?? savedApp,
+						draft: savedApp.draft,
+						current: {
+							summary: $summary,
+							value: $app,
+							path: newPath || savedApp.draft?.path || savedApp.path,
+							policy
+						},
+						button: {
+							text: 'Looks good, deploy',
+							onClick: () => {
+								if (appPath == '') {
+									createApp(newPath)
+								} else {
+									handleUpdateApp(newPath)
+								}
+							}
+						}
+					})
+				}}
+			>
+				<div class="flex flex-row gap-2 items-center">
+					<DiffIcon size={14} />
+					Diff
+				</div>
+			</Button>
+			<Button
+				startIcon={{ icon: Save }}
 				disabled={pathError != ''}
 				on:click={() => {
 					if (appPath == '') {
 						createApp(newPath)
 					} else {
-						updateApp(newPath)
+						handleUpdateApp(newPath)
 					}
 				}}
 			>
@@ -465,56 +1012,69 @@
 			</Alert>
 		{:else}
 			<Alert title="App executed on behalf of you">
-				A viewer of the app will execute the runnables of the app on behalf of the publisher (you).
+				A viewer of the app will execute the runnables of the app on behalf of the publisher (you)
 				<Tooltip>
-					This is to ensure that all resources/runnable available at time of creating the app would
-					prevent the good execution of the app. To guarantee tight security, a policy is computed
-					at time of deployment of the app which only allow the scripts/flows referred to in the app
-					to be called on behalf of, and the resources are passed by reference so that their actual
-					value is . Furthermore, static parameters are not overridable. Hence, users will only be
-					able to use the app as intended by the publisher without risk for leaking resources not
-					used in the app.
+					It ensures that all required resources/runnable visible for publisher but not for viewer
+					at time of creating the app would prevent the execution of the app. To guarantee tight
+					security, a policy is computed at time of deployment of the app which only allow the
+					scripts/flows referred to in the app to be called on behalf of. Furthermore, static
+					parameters are not overridable. Hence, users will only be able to use the app as intended
+					by the publisher without risk for leaking resources not used in the app.
 				</Tooltip>
 			</Alert>
-			<div class="mt-4" />
-			<Toggle
-				options={{
-					left: `Require read-access`,
-					right: `Publish publicly for anyone knowing the secret url`
-				}}
-				checked={policy.execution_mode == 'anonymous'}
-				on:change={(e) => {
-					policy.execution_mode = e.detail
-						? Policy.execution_mode.ANONYMOUS
-						: Policy.execution_mode.PUBLISHER
-					setPublishState()
-				}}
-			/>
 
-			{#if policy.execution_mode == 'anonymous' && secretUrl}
-				{@const url = `${$page.url.hostname}/public/${$workspaceStore}/${secretUrl}`}
-				{@const href = $page.url.protocol + '//' + url}
-				<div class="my-6 box">
-					Public url:
+			<div class="mt-10" />
+
+			<h2>Public URL</h2>
+			<div class="mt-4" />
+
+			<div class="flex gap-2 items-center">
+				<Toggle
+					options={{
+						left: `Require login and read-access`,
+						right: `No login required`
+					}}
+					checked={policy.execution_mode == 'anonymous'}
+					on:change={(e) => {
+						policy.execution_mode = e.detail ? 'anonymous' : 'publisher'
+						setPublishState()
+					}}
+				/>
+			</div>
+
+			<div class="my-6 box">
+				Public url:
+				{#if secretUrl}
+					{@const url = `${$page.url.hostname}/public/${$workspaceStore}/${secretUrl}`}
+					{@const href = $page.url.protocol + '//' + url}
 					<a
 						on:click={(e) => {
 							e.preventDefault()
 							copyToClipboard(href)
 						}}
 						{href}
-						class="whitespace-nowrap text-ellipsis overflow-hidden mr-1"
+						class="whitespace-nowrap text-ellipsis overflow-hidden mr-1 inline-flex gap-2"
 					>
 						{url}
 						<span class="text-gray-700 ml-2">
-							<Icon data={faClipboard} />
+							<Clipboard />
 						</span>
 					</a>
-				</div>
+				{:else}<Loader2 class="animate-spin" />
+				{/if}
+				<div class="text-xs text-secondary"
+					>Share this url directly or embed it using an iframe (if requiring login, top-level domain
+					of embedding app must be the same as the one of Windmill)</div
+				>
+			</div>
+			<Alert type="info" title="Only latest deployed app is publicly available">
+				You will still need to deploy the app to make visible the latest changes
+			</Alert>
 
-				<Alert type="info" title="Only latest saved app is publicly available">
-					Once made public, you will still need to deploy the app to make visible the latest changes
-				</Alert>
-			{/if}
+			<a
+				href="https://www.windmill.dev/docs/advanced/external_auth_with_jwt#embed-public-apps-using-your-own-authentification"
+				class="mt-4 text-2xs">Embed this app in your own product to be used by your own users</a
+			>
 		{/if}
 	</DrawerContent>
 </Drawer>
@@ -526,225 +1086,396 @@
 </Drawer>
 
 <Drawer bind:open={historyBrowserDrawerOpen} size="1200px">
-	<DrawerContent title="Deployment History" on:close={() => historyBrowserDrawerOpen}>
-		<DeploymentHistory on:restore {versions} />
+	<DrawerContent title="Deployment History" on:close={() => (historyBrowserDrawerOpen = false)}>
+		<DeploymentHistory on:restore {appPath} />
 	</DrawerContent>
 </Drawer>
 
-<Drawer bind:open={jobsDrawerOpen} size="900px">
+<Drawer bind:open={debugAppDrawerOpen} size="800px">
+	<DrawerContent title="Troubleshoot Panel" on:close={() => (debugAppDrawerOpen = false)}>
+		<DebugPanel />
+	</DrawerContent>
+</Drawer>
+
+<Drawer bind:open={$jobsDrawerOpen} size="900px">
 	<DrawerContent
 		noPadding
 		title="Debug Runs"
-		on:close={() => (jobsDrawerOpen = false)}
+		on:close={() => {
+			$jobsDrawerOpen = false
+		}}
 		tooltip="Look at latests runs to spot potential bugs."
-		documentationLink="https://docs.windmill.dev/docs/apps/app_toolbar#debug-runs"
+		documentationLink="https://www.windmill.dev/docs/apps/app_debugging"
 	>
 		<Splitpanes class="!overflow-visible">
 			<Pane size={25}>
 				<PanelSection title="Past Runs">
 					<div class="flex flex-col gap-2 w-full">
 						{#if $jobs.length > 0}
-							<div class="flex gap-2 flex-col">
-								{#each $jobs ?? [] as { job, component } (job)}
-									<!-- svelte-ignore a11y-click-events-have-key-events -->
-									<div
-										class={classNames(
-											'border flex gap-1 truncate justify-between flex-row w-full items-center p-2 rounded-md cursor-pointer hover:bg-blue-50 hover:text-blue-400',
-											$errorByComponent[job] ? 'border border-red-500 bg-red-100' : '',
-											selectedJobId == job && !$errorByComponent[component]
-												? 'bg-blue-100 text-blue-600'
-												: ''
-										)}
-										on:click={() => (selectedJobId = job)}
-									>
-										<span class="text-xs truncate">{job}</span>
-										<Badge color="indigo">{component}</Badge>
-									</div>
+							<div class="flex gap-2 flex-col-reverse">
+								{#each $jobs ?? [] as id}
+									{@const selectedJob = $jobsById[id]}
+									{#if selectedJob}
+										<!-- svelte-ignore a11y-click-events-have-key-events -->
+										<!-- svelte-ignore a11y-no-static-element-interactions -->
+										<div
+											class={classNames(
+												'border flex gap-1 truncate justify-between flex-row w-full items-center p-2 rounded-md cursor-pointer hover:bg-surface-secondary hover:text-blue-400',
+												selectedJob.error ? 'border border-red-500 text-primary' : '',
+												selectedJob.error && $errorByComponent[selectedJob.component]?.id == id
+													? selectedJobId == id
+														? 'bg-red-600 !border-blue-600'
+														: 'bg-red-400'
+													: selectedJobId == id
+													? 'text-blue-600'
+													: ''
+											)}
+											on:click={() => {
+												selectedJobId = id
+												rightColumnSelect = 'detail'
+											}}
+										>
+											<span class="text-xs truncate">{truncateRev(selectedJob.job, 20)}</span>
+											<Badge color="indigo">{selectedJob.component}</Badge>
+										</div>
+									{/if}
 								{/each}
 							</div>
 						{:else}
-							<div class="text-sm text-gray-500">No items</div>
+							<div class="text-sm text-tertiary">No items</div>
 						{/if}
 					</div>
 				</PanelSection>
 			</Pane>
 			<Pane size={75}>
-				<div class="h-full w-full overflow-auto">
-					{#if selectedJobId}
-						{#if !job}
-							{@const jobResult = $jobs.find((j) => j.job == selectedJobId)}
-
-							{#if jobResult?.error !== undefined}
-								<Splitpanes horizontal class="grow border w-full">
-									<Pane size={50} minSize={10}>
-										<LogViewer
-											content={`Logs are avaiable in the browser console directly`}
-											isLoading={false}
-										/>
-									</Pane>
-									<Pane size={50} minSize={10} class="text-sm text-gray-600">
-										<pre class="overflow-x-auto break-words relative h-full px-2">
-											<DisplayResult result={{ error: { name: 'Frontend execution error', message: jobResult.error } }} />
-										</pre>
-									</Pane>
-								</Splitpanes>
-							{:else if jobResult?.result !== undefined}
-								<Splitpanes horizontal class="grow border w-full">
-									<Pane size={50} minSize={10}>
-										<LogViewer
-											content={`Logs are avaiable in the browser console directly`}
-											isLoading={false}
-										/>
-									</Pane>
-									<Pane size={50} minSize={10} class="text-sm text-gray-600">
-										<pre class="overflow-x-auto break-words relative h-full px-2">
-											<DisplayResult result={jobResult.result} />
-										</pre>
-									</Pane>
-								</Splitpanes>
-							{:else}
-								<Skeleton layout={[[40]]} />
-							{/if}
-						{:else}
-							<div class="flex flex-col h-full w-full gap-4 p-2 mb-4">
-								{#if job?.['running']}
-									<div class="flex flex-row-reverse w-full">
-										<Button
-											color="red"
-											variant="border"
-											on:click={() => testJobLoader?.cancelJob()}
-										>
-											<Loader2 size={14} class="animate-spin mr-2" />
-
-											Cancel
-										</Button>
-									</div>
-								{/if}
-								<div class="p-2">
-									<JobArgs args={job?.args} />
-								</div>
-								{#if job?.job_kind !== 'flow' && job?.job_kind !== 'flowpreview'}
-									<Splitpanes horizontal class="grow border w-full">
-										<Pane size={50} minSize={10}>
-											<LogViewer content={job?.logs} isLoading={testIsLoading} />
-										</Pane>
-										<Pane size={50} minSize={10} class="text-sm text-gray-600">
-											{#if job != undefined && 'result' in job && job.result != undefined}
-												<pre class="overflow-x-auto break-words relative h-full px-2"
-													><DisplayResult result={job.result} /></pre
-												>
-											{:else if testIsLoading}
-												<div class="p-2"><Loader2 class="animate-spin" /> </div>
-											{/if}
-										</Pane>
-									</Splitpanes>
+				<div class="w-full h-full flex flex-col">
+					<div>
+						<Tabs bind:selected={rightColumnSelect}>
+							<Tab value="timeline"><span class="font-semibold text-md">Timeline</span></Tab>
+							<Tab value="detail"><span class="font-semibold">Details</span></Tab>
+						</Tabs>
+					</div>
+					{#if rightColumnSelect == 'timeline'}
+						<div class="p-2 grow overflow-auto">
+							<AppTimeline />
+						</div>
+					{:else if rightColumnSelect == 'detail'}
+						<div class="grow flex flex-col w-full overflow-auto">
+							{#if selectedJobId}
+								{#if selectedJobId?.includes('Frontend')}
+									{@const jobResult = $jobsById[selectedJobId]}
+									{#if jobResult?.error !== undefined}
+										<Splitpanes horizontal class="grow border w-full">
+											<Pane size={10} minSize={10}>
+												<LogViewer
+													content={`Logs are avaiable in the browser console directly`}
+													isLoading={false}
+													tag={undefined}
+												/>
+											</Pane>
+											<Pane size={90} minSize={10} class="text-sm text-secondary">
+												<div class="relative h-full px-2">
+													<DisplayResult
+														result={{
+															error: { name: 'Frontend execution error', message: jobResult.error }
+														}}
+													/>
+												</div>
+											</Pane>
+										</Splitpanes>
+									{:else if jobResult !== undefined}
+										<Splitpanes horizontal class="grow border w-full">
+											<Pane size={10} minSize={10}>
+												<LogViewer
+													content={`Logs are avaiable in the browser console directly`}
+													isLoading={false}
+													tag={undefined}
+												/>
+											</Pane>
+											<Pane size={90} minSize={10} class="text-sm text-secondary">
+												<div class="relative h-full px-2">
+													<DisplayResult
+														workspaceId={$workspaceStore}
+														jobId={selectedJobId}
+														result={jobResult.result}
+													/>
+												</div>
+											</Pane>
+										</Splitpanes>
+									{:else}
+										<Loader2 class="animate-spin" />
+									{/if}
 								{:else}
-									<div class="mt-10" />
-									<FlowProgressBar {job} class="py-4" />
-									<div class="w-full mt-10 mb-20">
-										<FlowStatusViewer
-											jobId={job.id}
-											on:jobsLoaded={({ detail }) => {
-												job = detail
-											}}
-										/>
+									<div class="flex flex-col h-full w-full mb-4">
+										{#if job?.['running']}
+											<div class="flex flex-row-reverse w-full">
+												<Button
+													color="red"
+													variant="border"
+													on:click={() => testJobLoader?.cancelJob()}
+												>
+													<Loader2 size={14} class="animate-spin mr-2" />
+
+													Cancel
+												</Button>
+											</div>
+										{/if}
+										{#if job?.args}
+											<div class="p-2">
+												<JobArgs
+													id={job.id}
+													workspace={job.workspace_id ?? $workspaceStore ?? 'no_w'}
+													args={job?.args}
+												/>
+											</div>
+										{/if}
+										{#if job?.raw_code}
+											<div class="pb-2 pl-2 pr-2 w-full overflow-auto h-full max-h-[80px]">
+												<HighlightCode language={job?.language} code={job?.raw_code} />
+											</div>
+										{/if}
+
+										{#if job?.job_kind !== 'flow' && job?.job_kind !== 'flowpreview'}
+											{@const jobResult = $jobsById[selectedJobId]}
+											<Splitpanes horizontal class="grow border w-full">
+												<Pane size={50} minSize={10}>
+													<LogViewer
+														duration={job?.['duration_ms']}
+														jobId={job?.id}
+														content={job?.logs}
+														isLoading={testIsLoading && job?.['running'] == false}
+														tag={job?.tag}
+													/>
+												</Pane>
+												<Pane size={50} minSize={10} class="text-sm text-secondary">
+													{#if job != undefined && 'result' in job && job.result != undefined}<div
+															class="relative h-full px-2"
+															><DisplayResult
+																workspaceId={$workspaceStore}
+																jobId={selectedJobId}
+																result={job.result}
+															/></div
+														>
+													{:else if testIsLoading}
+														<div class="p-2"><Loader2 class="animate-spin" /> </div>
+													{:else if job != undefined && 'result' in job && job?.['result'] == undefined}
+														<div class="p-2 text-tertiary">Result is undefined</div>
+													{:else}
+														<div class="p-2 text-tertiary">
+															<Loader2 size={14} class="animate-spin mr-2" />
+														</div>
+													{/if}
+												</Pane>
+												{#if jobResult?.transformer}
+													<Pane size={50} minSize={10} class="text-sm text-secondary p-2">
+														<div class="font-bold">Transformer results</div>
+														{#if job != undefined && 'result' in job && job.result != undefined}
+															<div class="relative h-full px-2">
+																<DisplayResult
+																	workspaceId={$workspaceStore}
+																	jobId={selectedJobId}
+																	result={jobResult?.transformer}
+																/>
+															</div>
+														{:else if testIsLoading}
+															<div class="p-2"><Loader2 class="animate-spin" /> </div>
+														{:else if job != undefined && 'result' in job && job?.['result'] == undefined}
+															<div class="p-2 text-tertiary">Result is undefined</div>
+														{:else}
+															<div class="p-2 text-tertiary">
+																<Loader2 size={14} class="animate-spin mr-2" />
+															</div>
+														{/if}
+													</Pane>
+												{/if}
+											</Splitpanes>
+										{:else}
+											<div class="mt-10" />
+											<FlowProgressBar {job} class="py-4" />
+											<div class="w-full mt-10 mb-20">
+												<FlowStatusViewer
+													jobId={job.id}
+													on:jobsLoaded={({ detail }) => {
+														job = detail
+													}}
+												/>
+											</div>
+										{/if}
 									</div>
 								{/if}
-							</div>
-						{/if}
-					{:else}
-						<div class="text-sm p-2 text-gray-500">Select a job to see its details</div>
+							{:else}
+								<div class="text-sm p-2 text-tertiary">Select a job to see its details</div>
+							{/if}
+						</div>
 					{/if}
 				</div>
 			</Pane>
 		</Splitpanes>
+		<svelte:fragment slot="actions">
+			<Button
+				size="md"
+				color="light"
+				variant="border"
+				on:click={() => {
+					$refreshComponents?.()
+				}}
+				title="Refresh App"
+			>
+				Refresh app&nbsp;<RefreshCw size={16} />
+			</Button>
+
+			<Button
+				size="md"
+				color="light"
+				variant="border"
+				on:click={() => {
+					errorByComponent.set({})
+					jobs.set([])
+				}}
+				>Clear jobs
+			</Button>
+			{#if hasErrors}
+				<Button size="md" color="light" variant="border" on:click={() => errorByComponent.set({})}
+					>Clear Errors &nbsp;<BellOff size={14} />
+				</Button>
+			{/if}
+		</svelte:fragment>
 	</DrawerContent>
 </Drawer>
 
+<AppReportsDrawer bind:open={appReportingDrawerOpen} {appPath} />
+
 <div
-	class="border-b flex flex-row justify-between py-1 gap-2 gap-y-2 px-2 items-center overflow-y-visible"
+	class="border-b flex flex-row justify-between py-1 gap-2 gap-y-2 px-2 items-center overflow-y-visible overflow-x-auto"
 >
-	<div class="min-w-64 w-64">
-		<input
-			type="text"
-			placeholder="App summary"
-			class="text-sm w-full font-semibold"
-			bind:value={$summary}
-		/>
-	</div>
-	<div class="flex gap-4 items-center justify-center">
-		<UndoRedo
-			undoProps={{ disabled: $history?.index === 0 }}
-			redoProps={{ disabled: $history && $history?.index === $history.history.length - 1 }}
-			on:undo={() => {
-				$app = undo(history, $app)
-			}}
-			on:redo={() => {
-				$app = redo(history)
-			}}
-		/>
+	<div class="flex flex-row gap-2 items-center">
+		<Summary bind:value={$summary} />
+		<div class="flex gap-2">
+			<UndoRedo
+				undoProps={{ disabled: $history?.index === 0 }}
+				redoProps={{ disabled: $history && $history?.index === $history.history.length - 1 }}
+				on:undo={() => {
+					$app = undo(history, $app)
+				}}
+				on:redo={() => {
+					$app = redo(history)
+				}}
+			/>
 
-		<div>
-			<ToggleButtonGroup class="h-[30px]" bind:selected={$breakpoint}>
-				<ToggleButton icon={Smartphone} value="sm" />
-				<ToggleButton icon={Laptop2} value="lg" />
-			</ToggleButtonGroup>
+			{#if $app}
+				<ToggleButtonGroup class="h-[30px]" bind:selected={$app.fullscreen}>
+					<ToggleButton
+						icon={AlignHorizontalSpaceAround}
+						value={false}
+						tooltip="The max width is 1168px and the content stay centered instead of taking the full page width"
+						iconProps={{ size: 16 }}
+					/>
+					<ToggleButton
+						tooltip="The width is of the app if the full width of its container"
+						icon={Expand}
+						value={true}
+						iconProps={{ size: 16 }}
+					/>
+				</ToggleButtonGroup>
+			{/if}
+			<div class="flex flex-row gap-2">
+				<ToggleButtonGroup class="h-[30px]" bind:selected={$breakpoint}>
+					<ToggleButton
+						tooltip="Computer View"
+						icon={Laptop2}
+						value={'lg'}
+						iconProps={{ size: 16 }}
+					/>
+					<ToggleButton
+						tooltip="Mobile View"
+						icon={Smartphone}
+						value={'sm'}
+						iconProps={{ size: 16 }}
+					/>
+					{#if $breakpoint === 'sm'}
+						<ToggleEnable
+							tooltip="Desktop view is enabled by default. Enable this to customize the layout of the components for the mobile view"
+							label="Enable mobile view for smaller screens"
+							bind:checked={$app.mobileViewOnSmallerScreens}
+							iconProps={{ size: 16 }}
+							iconOnly={false}
+						/>
+					{/if}
+				</ToggleButtonGroup>
+			</div>
 		</div>
-		{#if $app}
-			<ToggleButtonGroup class="h-[30px]" bind:selected={$app.fullscreen}>
-				<ToggleButton
-					icon={AlignHorizontalSpaceAround}
-					value={false}
-					tooltip="The max width is 1168px and the content stay centered instead of taking the full page width"
-				/>
-				<ToggleButton icon={Expand} value={true} />
-			</ToggleButtonGroup>
-		{/if}
 	</div>
 
+	{#if $mode !== 'preview'}
+		<div class="flex gap-1">
+			<HideButton
+				direction="left"
+				hidden={leftPanelHidden}
+				on:click={() => {
+					if (leftPanelHidden) {
+						dispatch('showLeftPanel')
+					} else {
+						dispatch('hideLeftPanel')
+					}
+				}}
+			/>
+			<HideButton
+				hidden={bottomPanelHidden}
+				direction="bottom"
+				on:click={() => {
+					if (bottomPanelHidden) {
+						dispatch('showBottomPanel')
+					} else {
+						dispatch('hideBottomPanel')
+					}
+				}}
+			/>
+			<HideButton
+				hidden={rightPanelHidden}
+				direction="right"
+				on:click={() => {
+					if (rightPanelHidden) {
+						dispatch('showRightPanel')
+					} else {
+						dispatch('hideRightPanel')
+					}
+				}}
+			/>
+		</div>
+	{/if}
+	{#if $enterpriseLicense && appPath != ''}
+		<Awareness />
+	{/if}
 	<div class="flex flex-row gap-2 justify-end items-center overflow-visible">
-		<Dropdown
-			placement="bottom-end"
-			btnClasses="!rounded-md"
-			dropdownItems={[
-				{
-					displayName: 'Deployment History',
-					icon: faHistory,
-					action: () => {
-						historyBrowserDrawerOpen = true
-					}
-				},
-				{
-					displayName: 'JSON',
-					icon: faFileExport,
-					action: () => {
-						appExport.open($app)
-					}
-				},
-				// {
-				// 	displayName: 'Publish to Hub',
-				// 	icon: faGlobe,
-				// 	action: () => {
-				// 		const url = appToHubUrl(toStatic($app, $staticExporter, $summary))
-				// 		window.open(url.toString(), '_blank')
-				// 	}
-				// },
-				{
-					displayName: 'Hub compatible JSON',
-					icon: faFileExport,
-					action: () => {
-						appExport.open(toStatic($app, $staticExporter, $summary).app)
-					}
-				},
-				{
-					displayName: 'App Inputs',
-					icon: faSlidersH,
-					action: () => {
-						inputsDrawerOpen = true
-					}
-				}
-			]}
-		/>
+		<ButtonDropdown hasPadding={false}>
+			<svelte:fragment slot="buttonReplacement">
+				<Button nonCaptureEvent size="xs" color="light">
+					<div class="flex flex-row items-center">
+						<MoreVertical size={14} />
+					</div>
+				</Button>
+			</svelte:fragment>
+			<svelte:fragment slot="items">
+				{#each moreItems as item}
+					<MenuItem
+						on:click={item.action}
+						disabled={item.disabled}
+						class={item.disabled ? 'opacity-50' : ''}
+					>
+						<div
+							class={classNames(
+								'text-primary flex flex-row items-center text-left px-4 py-2 gap-2 cursor-pointer hover:bg-surface-hover !text-xs font-semibold'
+							)}
+						>
+							<svelte:component this={item.icon} size={14} />
+							{item.displayName}
+						</div>
+					</MenuItem>
+				{/each}
+			</svelte:fragment>
+		</ButtonDropdown>
+		<AppEditorTutorial bind:this={appEditorTutorial} />
+
 		<div class="hidden md:inline relative overflow-visible">
 			{#if hasErrors}
 				<span
@@ -757,9 +1488,9 @@
 			<Button
 				on:click={() => {
 					if (selectedJobId == undefined && $jobs.length > 0) {
-						selectedJobId = $jobs[0].job
+						selectedJobId = $jobs[$jobs.length - 1]
 					}
-					jobsDrawerOpen = true
+					$jobsDrawerOpen = true
 				}}
 				color={hasErrors ? 'red' : 'light'}
 				size="xs"
@@ -768,18 +1499,38 @@
 			>
 				<div class="flex flex-row gap-1 items-center">
 					<Bug size={14} />
-					<div> Debug runs </div>
+					<div>Debug runs</div>
+					<div class="text-2xs text-tertiary"
+						>({$jobs?.length > 99 ? '99+' : $jobs?.length ?? 0})</div
+					>
+					{#if hasErrors}
+						<Button
+							size="xs"
+							btnClasses="-my-2 !px-1 !py-0"
+							color="light"
+							variant="border"
+							on:click={() => errorByComponent.set({})}
+							><BellOff size={12} />
+						</Button>
+					{/if}
 				</div>
 			</Button>
 		</div>
 		<AppExportButton bind:this={appExport} />
 		<PreviewToggle loading={loading.save} />
-		<Button loading={loading.save} startIcon={{ icon: faSave }} on:click={saveDraft} size="xs">
-			Save draft&nbsp;<Kbd small>Ctrl</Kbd><Kbd small>S</Kbd>
+		<Button
+			loading={loading.save}
+			startIcon={{ icon: Save }}
+			on:click={() => saveDraft()}
+			size="xs"
+			disabled={$page.params.path !== undefined && !savedApp}
+			shortCut={{ key: 'S' }}
+		>
+			Draft
 		</Button>
 		<Button
 			loading={loading.save}
-			startIcon={{ icon: faSave }}
+			startIcon={{ icon: Save }}
 			on:click={save}
 			size="xs"
 			dropdownItems={appPath != ''

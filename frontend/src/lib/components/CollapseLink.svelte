@@ -1,23 +1,23 @@
 <script lang="ts">
-	import { faChevronDown, faChevronUp } from '@fortawesome/free-solid-svg-icons'
-
-	import Icon from 'svelte-awesome'
 	import { Button } from './common'
 	import { slide } from 'svelte/transition'
+	import { twMerge } from 'tailwind-merge'
+	import { ChevronDown } from 'lucide-svelte'
 
 	export let open = false
 	export let text: string
 	export let small = false
 </script>
 
-<div class="flex">
+<div class={twMerge('flex', $$props.class)}>
 	<Button
 		variant="border"
 		color="light"
-		btnClasses="text-gray-600 {small ? 'text-xs' : ''} "
+		btnClasses="text-primary {small ? 'text-xs' : ''} "
 		on:click={() => (open = !open)}
+		endIcon={{ icon: ChevronDown, classes: open ? 'transform rotate-180' : '' }}
 	>
-		{text}&nbsp;<Icon data={open ? faChevronUp : faChevronDown} scale={0.5} />
+		{text}
 	</Button>
 </div>
 {#if open}

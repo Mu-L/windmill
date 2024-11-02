@@ -7,8 +7,10 @@
  */
 
 use crate::{
-    db::{UserDB, DB},
-    users::{maybe_refresh_folders, Authed},
+    db::{ApiAuthed, DB},
+    settings::{delete_global_setting, set_global_setting_internal},
+    users::maybe_refresh_folders,
+    utils::require_super_admin,
 };
 use axum::{
     extract::{Extension, Path, Query},
@@ -16,27 +18,33 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sql_builder::{prelude::Bind, SqlBuilder};
 use sqlx::{Postgres, Transaction};
 use std::str::FromStr;
-use windmill_audit::{audit_log, ActionKind};
+use windmill_audit::audit_ee::audit_log;
+use windmill_audit::ActionKind;
 use windmill_common::{
+    db::UserDB,
     error::{Error, JsonResult, Result},
-    jobs::JobKind,
     schedule::Schedule,
     utils::{not_found_if_none, paginate, Pagination, StripPath},
 };
-use windmill_queue::{self, schedule::push_scheduled_job, QueueTransaction};
+use windmill_git_sync::{handle_deployment_metadata, DeployedObject};
+use windmill_queue::{schedule::push_scheduled_job, QueueTransaction};
 
 pub fn workspaced_service() -> Router {
     Router::new()
         .route("/list", get(list_schedule))
+        .route("/list_with_jobs", get(list_schedule_with_jobs))
         .route("/get/*path", get(get_schedule))
         .route("/exists/*path", get(exists_schedule))
         .route("/create", post(create_schedule))
         .route("/update/*path", post(edit_schedule))
         .route("/delete/*path", delete(delete_schedule))
         .route("/setenabled/*path", post(set_enabled))
+        .route("/setdefaulthandler", post(set_default_error_handler))
+    // .route("/catchup/*path", post(do_catchup).get(list_catchup))
 }
 
 pub fn global_service() -> Router {
@@ -48,11 +56,45 @@ pub struct NewSchedule {
     pub path: String,
     pub schedule: String,
     pub timezone: String,
+    pub summary: Option<String>,
+    pub no_flow_overlap: Option<bool>,
     pub script_path: String,
     pub is_flow: bool,
     pub args: Option<serde_json::Value>,
     pub enabled: Option<bool>,
     pub on_failure: Option<String>,
+    pub on_failure_times: Option<i32>,
+    pub on_failure_exact: Option<bool>,
+    pub on_failure_extra_args: Option<serde_json::Value>,
+    pub on_recovery: Option<String>,
+    pub on_recovery_times: Option<i32>,
+    pub on_recovery_extra_args: Option<serde_json::Value>,
+    pub on_success: Option<String>,
+    pub on_success_extra_args: Option<serde_json::Value>,
+    pub ws_error_handler_muted: Option<bool>,
+    pub retry: Option<serde_json::Value>,
+    pub tag: Option<String>,
+    pub paused_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ErrorOrRecoveryHandler {
+    pub handler_type: HandlerType,
+    pub override_existing: bool,
+
+    pub path: Option<String>,
+    pub extra_args: Option<serde_json::Value>,
+    pub number_of_occurence: Option<i32>,
+    pub number_of_occurence_exact: Option<bool>,
+    pub workspace_handler_muted: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all(serialize = "lowercase", deserialize = "lowercase"))]
+pub enum HandlerType {
+    Error,
+    Recovery,
+    Success,
 }
 
 async fn check_path_conflict<'c>(
@@ -65,7 +107,7 @@ async fn check_path_conflict<'c>(
         path,
         w_id
     )
-    .fetch_one(tx)
+    .fetch_one(&mut **tx)
     .await?
     .unwrap_or(false);
     if exists {
@@ -78,7 +120,7 @@ async fn check_path_conflict<'c>(
 }
 
 async fn create_schedule(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
     Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
@@ -86,7 +128,30 @@ async fn create_schedule(
     Json(ns): Json<NewSchedule>,
 ) -> Result<String> {
     let authed = maybe_refresh_folders(&ns.path, &w_id, authed, &db).await;
-    let mut tx: QueueTransaction<'_, _> = (rsmq, user_db.begin(&authed).await?).into();
+
+    #[cfg(not(feature = "enterprise"))]
+    if ns.on_recovery.is_some() {
+        return Err(Error::BadRequest(
+            "on_recovery is only available in enterprise version".to_string(),
+        ));
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    if ns.on_success.is_some() {
+        return Err(Error::BadRequest(
+            "on_success is only available in enterprise version".to_string(),
+        ));
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    if ns.on_failure_times.is_some() && ns.on_failure_times.unwrap() > 1 {
+        return Err(Error::BadRequest(
+            "on_failure with a number of times > 1 is only available in enterprise version"
+                .to_string(),
+        ));
+    }
+
+    let mut tx: QueueTransaction<'_, _> = (rsmq.clone(), user_db.begin(&authed).await?).into();
 
     cron::Schedule::from_str(&ns.schedule).map_err(|e| Error::BadRequest(e.to_string()))?;
     check_path_conflict(tx.transaction_mut(), &w_id, &ns.path).await?;
@@ -99,29 +164,59 @@ async fn create_schedule(
     )
     .await?;
 
-    let schedule = sqlx::query_as!(
-        Schedule,
+    let schedule = sqlx::query_as::<_, Schedule>(
         "INSERT INTO schedule (workspace_id, path, schedule, timezone, edited_by, script_path, \
-         is_flow, args, enabled, email, on_failure) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
-        w_id,
-        ns.path,
-        ns.schedule,
-        ns.timezone,
-        &authed.username,
-        ns.script_path,
-        ns.is_flow,
-        ns.args,
-        ns.enabled.unwrap_or(false),
-        &authed.email,
-        ns.on_failure
-    )
+            is_flow, args, enabled, email, on_failure, on_failure_times, on_failure_exact, \
+            on_failure_extra_args, on_recovery, on_recovery_times, on_recovery_extra_args, \
+            on_success, on_success_extra_args, \
+            ws_error_handler_muted, retry, summary, no_flow_overlap, tag, paused_until \
+        ) VALUES ( \
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25 \
+        ) RETURNING *")
+        .bind(&w_id)
+        .bind(&ns.path)
+        .bind(&ns.schedule)
+        .bind(&ns.timezone)
+        .bind(&authed.username)
+        .bind(&ns.script_path)
+        .bind(&ns.is_flow)
+        .bind(&ns.args)
+        .bind(&ns.enabled.unwrap_or(false))
+        .bind(&authed.email)
+        .bind(&ns.on_failure)
+        .bind(&ns.on_failure_times)
+        .bind(&ns.on_failure_exact)
+        .bind(&ns.on_failure_extra_args)
+        .bind(&ns.on_recovery)
+        .bind(&ns.on_recovery_times)
+        .bind(&ns.on_recovery_extra_args)
+        .bind(&ns.on_success)
+        .bind(&ns.on_success_extra_args)
+        .bind(&ns.ws_error_handler_muted.unwrap_or(false))
+        .bind(&ns.retry)
+        .bind(&ns.summary)
+        .bind(&ns.no_flow_overlap.unwrap_or(false))
+        .bind(&ns.tag)
+        .bind(&ns.paused_until)
     .fetch_one(&mut tx)
     .await
-    .map_err(|e| Error::InternalErr(format!("inserting schedule in {w_id}: {e}")))?;
+    .map_err(|e| Error::InternalErr(format!("inserting schedule in {w_id}: {e:#}")))?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Schedule { path: ns.path.clone() },
+        Some(format!("Schedule '{}' created", ns.path.clone())),
+        rsmq.clone(),
+        true,
+    )
+    .await?;
 
     audit_log(
         &mut tx,
-        &authed.username,
+        &authed,
         "schedule.create",
         ActionKind::Create,
         &w_id,
@@ -139,7 +234,7 @@ async fn create_schedule(
     .await?;
 
     if ns.enabled.unwrap_or(true) {
-        tx = push_scheduled_job(tx, schedule).await?
+        tx = push_scheduled_job(&db, tx, &schedule, Some(&authed.clone().into())).await?
     }
     tx.commit().await?;
 
@@ -147,7 +242,7 @@ async fn create_schedule(
 }
 
 async fn edit_schedule(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
     Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
@@ -158,37 +253,57 @@ async fn edit_schedule(
 
     let authed = maybe_refresh_folders(&path, &w_id, authed, &db).await;
     let mut tx: QueueTransaction<'_, rsmq_async::MultiplexedRsmq> =
-        (rsmq, user_db.begin(&authed).await?).into();
+        (rsmq.clone(), user_db.begin(&authed).await?).into();
 
     cron::Schedule::from_str(&es.schedule).map_err(|e| Error::BadRequest(e.to_string()))?;
 
-    let is_flow = sqlx::query_scalar!(
-        "SELECT is_flow FROM schedule WHERE path = $1 AND workspace_id = $2",
-        path,
-        w_id
-    )
-    .fetch_one(&mut tx)
-    .await?;
-
-    clear_schedule(tx.transaction_mut(), path, is_flow).await?;
-    let schedule = sqlx::query_as!(
-        Schedule,
-        "UPDATE schedule SET schedule = $1, timezone = $2, args = $3, on_failure = $4 WHERE path \
-         = $5 AND workspace_id = $6 RETURNING *",
-        es.schedule,
-        es.timezone,
-        es.args,
-        es.on_failure,
-        path,
-        w_id,
-    )
+    clear_schedule(tx.transaction_mut(), path, &w_id).await?;
+    let schedule = sqlx::query_as::<_, Schedule>(
+        "UPDATE schedule SET schedule = $1, timezone = $2, args = $3, on_failure = $4, on_failure_times = $5, \
+            on_failure_exact = $6, on_failure_extra_args = $7, on_recovery = $8, on_recovery_times = $9, \
+            on_recovery_extra_args = $10, on_success = $11, on_success_extra_args = $12, \
+            ws_error_handler_muted = $13, retry = $14, summary = $15, \
+            no_flow_overlap = $16, tag = $17, paused_until = $18
+        WHERE path = $19 AND workspace_id = $20 RETURNING *")
+        .bind(&es.schedule)
+        .bind(&es.timezone)
+        .bind(&es.args)
+        .bind(&es.on_failure)
+        .bind(&es.on_failure_times)
+        .bind(&es.on_failure_exact)
+        .bind(&es.on_failure_extra_args)
+        .bind(&es.on_recovery)
+        .bind(&es.on_recovery_times)
+        .bind(&es.on_recovery_extra_args)
+        .bind(&es.on_success)
+        .bind(&es.on_success_extra_args)
+        .bind(&es.ws_error_handler_muted.unwrap_or(false))
+        .bind(&es.retry)
+        .bind(&es.summary)
+        .bind(&es.no_flow_overlap.unwrap_or(false))
+        .bind(&es.tag)
+        .bind(&es.paused_until)
+        .bind(&path)
+        .bind(&w_id)
     .fetch_one(&mut tx)
     .await
-    .map_err(|e| Error::InternalErr(format!("updating schedule in {w_id}: {e}")))?;
+    .map_err(|e| Error::InternalErr(format!("updating schedule in {w_id}: {e:#}")))?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Schedule { path: path.to_string() },
+        None,
+        rsmq.clone(),
+        true,
+    )
+    .await?;
 
     audit_log(
         &mut tx,
-        &authed.username,
+        &authed,
         "schedule.edit",
         ActionKind::Update,
         &w_id,
@@ -203,36 +318,125 @@ async fn edit_schedule(
     .await?;
 
     if schedule.enabled {
-        tx = push_scheduled_job(tx, schedule).await?;
+        tx = push_scheduled_job(&db, tx, &schedule, None).await?;
     }
     tx.commit().await?;
 
     Ok(path.to_string())
 }
 
+#[derive(Deserialize)]
+pub struct ListScheduleQuery {
+    pub page: Option<usize>,
+    pub per_page: Option<usize>,
+    pub path: Option<String>,
+    pub is_flow: Option<bool>,
+    pub args: Option<String>,
+    pub path_start: Option<String>,
+}
+
 async fn list_schedule(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(user_db): Extension<UserDB>,
+    Path(w_id): Path<String>,
+    Query(lsq): Query<ListScheduleQuery>,
+) -> JsonResult<Vec<Schedule>> {
+    let mut tx = user_db.begin(&authed).await?;
+    let (per_page, offset) = paginate(Pagination { per_page: lsq.per_page, page: lsq.page });
+    let mut sqlb = SqlBuilder::select_from("schedule")
+        .field("*")
+        .order_by("edited_at", true)
+        .and_where("workspace_id = ?".bind(&w_id))
+        .offset(offset)
+        .limit(per_page)
+        .clone();
+    if let Some(path) = lsq.path {
+        sqlb.and_where_eq("script_path", "?".bind(&path));
+    }
+    if let Some(is_flow) = lsq.is_flow {
+        sqlb.and_where_eq("is_flow", "?".bind(&is_flow));
+    }
+    if let Some(args) = &lsq.args {
+        sqlb.and_where("args @> ?".bind(&args.replace("'", "''")));
+    }
+    if let Some(path_start) = &lsq.path_start {
+        sqlb.and_where_like_left("path", path_start);
+    }
+    let sql = sqlb.sql().map_err(|e| Error::InternalErr(e.to_string()))?;
+    let rows = sqlx::query_as::<_, Schedule>(&sql)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(rows))
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ScheduleWJobs {
+    pub workspace_id: String,
+    pub path: String,
+    pub edited_by: String,
+    pub edited_at: DateTime<chrono::Utc>,
+    pub schedule: String,
+    pub timezone: String,
+    pub enabled: bool,
+    pub script_path: String,
+    pub is_flow: bool,
+    pub args: Option<serde_json::Value>,
+    pub extra_perms: serde_json::Value,
+    pub email: String,
+    pub error: Option<String>,
+    pub on_failure: Option<String>,
+    pub on_failure_times: Option<i32>,
+    pub on_failure_exact: Option<bool>,
+    pub on_failure_extra_args: Option<serde_json::Value>,
+    pub on_recovery: Option<String>,
+    pub on_recovery_times: Option<i32>,
+    pub on_recovery_extra_args: Option<serde_json::Value>,
+    pub on_success: Option<String>,
+    pub on_success_extra_args: Option<serde_json::Value>,
+    pub ws_error_handler_muted: bool,
+    pub retry: Option<serde_json::Value>,
+    pub jobs: Option<Vec<serde_json::Value>>,
+    pub summary: Option<String>,
+    pub no_flow_overlap: bool,
+    pub tag: Option<String>,
+    pub paused_until: Option<DateTime<Utc>>,
+}
+
+async fn list_schedule_with_jobs(
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
-) -> JsonResult<Vec<Schedule>> {
+) -> JsonResult<Vec<ScheduleWJobs>> {
     let mut tx = user_db.begin(&authed).await?;
     let (per_page, offset) = paginate(pagination);
-    let rows = sqlx::query_as!(
-        Schedule,
-        "SELECT * FROM schedule WHERE workspace_id = $1 ORDER BY edited_at desc LIMIT $2 OFFSET $3",
+    let rows = sqlx::query_as!(ScheduleWJobs,
+        "SELECT schedule.*, t.jobs FROM schedule, LATERAL ( SELECT ARRAY (SELECT json_build_object('id', id, 'success', success, 'duration_ms', duration_ms) FROM completed_job WHERE
+        completed_job.schedule_path = schedule.path AND completed_job.workspace_id = $1 AND parent_job IS NULL AND is_skipped = False ORDER BY started_at DESC LIMIT 20) AS jobs ) t
+        WHERE schedule.workspace_id = $1 ORDER BY schedule.edited_at desc LIMIT $2 OFFSET $3",
         w_id,
         per_page as i64,
         offset as i64
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(Json(rows))
 }
 
+// SELECT id, title AS item_title, t.tag_array
+// FROM   items i, LATERAL (  -- this is an implicit CROSS JOIN
+//    SELECT ARRAY (
+//       SELECT t.title
+//       FROM   items_tags it
+//       JOIN   tags       t  ON t.id = it.tag_id
+//       WHERE  it.item_id = i.id
+//       ) AS tag_array
+//    ) t;
+
 async fn get_schedule(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, path)): Path<(String, StripPath)>,
 ) -> JsonResult<Schedule> {
@@ -281,33 +485,44 @@ pub async fn preview_schedule(
 }
 
 pub async fn set_enabled(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
     Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, path)): Path<(String, StripPath)>,
     Json(payload): Json<SetEnabled>,
 ) -> Result<String> {
     let mut tx: QueueTransaction<'_, rsmq_async::MultiplexedRsmq> =
-        (rsmq, user_db.begin(&authed).await?).into();
+        (rsmq.clone(), user_db.begin(&authed).await?).into();
     let path = path.to_path();
-    let schedule_o = sqlx::query_as!(
-        Schedule,
-        "UPDATE schedule SET enabled = $1, email = $2 WHERE path = $3 AND workspace_id = $4 RETURNING *",
-        &payload.enabled,
-        authed.email,
-        path,
-        w_id
-    )
+    let schedule_o = sqlx::query_as::<_, Schedule>(
+        "UPDATE schedule SET enabled = $1, email = $2 WHERE path = $3 AND workspace_id = $4 RETURNING *")
+        .bind(&payload.enabled)
+        .bind(&authed.email)
+        .bind(&path)
+        .bind(&w_id)
     .fetch_optional(&mut tx)
     .await?;
 
     let schedule = not_found_if_none(schedule_o, "Schedule", path)?;
 
-    clear_schedule(tx.transaction_mut(), path, schedule.is_flow).await?;
+    clear_schedule(tx.transaction_mut(), path, &w_id).await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Schedule { path: path.to_string() },
+        None,
+        rsmq.clone(),
+        true,
+    )
+    .await?;
 
     audit_log(
         &mut tx,
-        &authed.username,
+        &authed,
         "schedule.setenabled",
         ActionKind::Update,
         &w_id,
@@ -317,7 +532,7 @@ pub async fn set_enabled(
     .await?;
 
     if payload.enabled {
-        tx = push_scheduled_job(tx, schedule).await?;
+        tx = push_scheduled_job(&db, tx, &schedule, None).await?;
     }
     tx.commit().await?;
 
@@ -327,25 +542,112 @@ pub async fn set_enabled(
     ))
 }
 
+// pub async fn do_catchup(
+//     authed: ApiAuthed,
+//     Extension(db): Extension<DB>,
+//     Extension(user_db): Extension<UserDB>,
+//     Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
+//     Path((w_id, path)): Path<(String, StripPath)>,
+//     Json(payload): Json<SetEnabled>,
+// ) -> Result<String> {
+//     let mut tx: QueueTransaction<'_, rsmq_async::MultiplexedRsmq> =
+//         (rsmq, user_db.begin(&authed).await?).into();
+//     let path = path.to_path();
+//     let schedule_o = sqlx::query_as!(
+//         Schedule,
+//         "UPDATE schedule SET enabled = $1, email = $2 WHERE path = $3 AND workspace_id = $4 RETURNING *",
+//         &payload.enabled,
+//         authed.email,
+//         path,
+//         w_id
+//     )
+//     .fetch_optional(&mut tx)
+//     .await?;
+
+//     let schedule = not_found_if_none(schedule_o, "Schedule", path)?;
+
+//     clear_schedule(tx.transaction_mut(), path, &w_id).await?;
+
+//     audit_log(
+//         &mut tx,
+//         &authed,
+//         "schedule.setenabled",
+//         ActionKind::Update,
+//         &w_id,
+//         Some(path),
+//         Some([("enabled", payload.enabled.to_string().as_ref())].into()),
+//     )
+//     .await?;
+
+//     if payload.enabled {
+//         tx = push_scheduled_job(&db, tx, &schedule, None).await?;
+//     }
+//     tx.commit().await?;
+
+//     Ok(format!(
+//         "succesfully updated schedule at path {} to status {}",
+//         path, payload.enabled
+//     ))
+// }
+
 async fn delete_schedule(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, path)): Path<(String, StripPath)>,
 ) -> Result<String> {
     let mut tx = user_db.begin(&authed).await?;
     let path = path.to_path();
 
-    sqlx::query!(
-        "DELETE FROM schedule WHERE path = $1 AND workspace_id = $2",
+    clear_schedule(&mut tx, path, &w_id).await?;
+    let exists = sqlx::query_scalar!(
+        "SELECT 1 FROM schedule WHERE path = $1 AND workspace_id = $2",
         path,
         w_id
     )
-    .execute(&mut tx)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+
+    if exists.is_none() {
+        return Err(windmill_common::error::Error::NotFound(format!(
+            "Schedule {} not found",
+            path
+        )));
+    }
+
+    let del = sqlx::query_scalar!(
+        "DELETE FROM schedule WHERE path = $1 AND workspace_id = $2 RETURNING 1",
+        path,
+        w_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+
+    if del.is_none() {
+        return Err(windmill_common::error::Error::NotAuthorized(format!(
+            "Not authorized to delete schedule {}",
+            path
+        )));
+    }
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Schedule { path: path.to_string() },
+        Some(format!("Schedule '{}' deleted", path)),
+        rsmq.clone(),
+        true,
+    )
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "schedule.delete",
         ActionKind::Delete,
         &w_id,
@@ -357,6 +659,145 @@ async fn delete_schedule(
     tx.commit().await?;
 
     Ok(format!("schedule {} deleted", path))
+}
+
+async fn set_default_error_handler(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
+    Path(w_id): Path<String>,
+    Json(payload): Json<ErrorOrRecoveryHandler>,
+) -> Result<()> {
+    require_super_admin(&db, &authed.email).await?;
+    let (key, value) = match payload.handler_type {
+        HandlerType::Error => {
+            let key = format!("default_error_handler_{}", w_id);
+            if let Some(payload_path) = payload.path.as_ref() {
+                let value = serde_json::json!({
+                    "wsErrorHandlerMuted": payload.workspace_handler_muted,
+                    "errorHandlerPath": payload_path,
+                    "errorHandlerExtraArgs": payload.extra_args,
+                    "failedTimes": payload.number_of_occurence,
+                    "failedExact": payload.number_of_occurence_exact,
+                });
+                (key, Some(value))
+            } else {
+                (key, None)
+            }
+        }
+        HandlerType::Recovery => {
+            let key = format!("default_recovery_handler_{}", w_id);
+            if let Some(payload_path) = payload.path.as_ref() {
+                let value = serde_json::json!({
+                    "recoveryHandlerPath": payload_path,
+                    "recoveryHandlerExtraArgs": payload.extra_args,
+                    "recoveredTimes": payload.number_of_occurence,
+                });
+                (key, Some(value))
+            } else {
+                (key, None)
+            }
+        }
+        HandlerType::Success => {
+            let key = format!("default_success_handler_{}", w_id);
+            if let Some(payload_path) = payload.path.as_ref() {
+                let value = serde_json::json!({
+                    "successHandlerPath": payload_path,
+                    "successHandlerExtraArgs": payload.extra_args,
+                });
+                (key, Some(value))
+            } else {
+                (key, None)
+            }
+        }
+    };
+
+    if let Some(value_content) = value {
+        set_global_setting_internal(&db, key, value_content).await?;
+    } else {
+        delete_global_setting(&db, key.as_str()).await?;
+    }
+
+    if payload.override_existing {
+        let updated_schedules: Vec<String>;
+        match payload.handler_type {
+            HandlerType::Error => {
+                if payload.path.is_some() {
+                    updated_schedules = sqlx::query_scalar!(
+                        "UPDATE schedule SET ws_error_handler_muted = $1, on_failure = $2, on_failure_extra_args = $3, on_failure_times = $4, on_failure_exact = $5 WHERE workspace_id = $6 RETURNING path",
+                        payload.workspace_handler_muted,
+                        payload.path,
+                        payload.extra_args,
+                        payload.number_of_occurence,
+                        payload.number_of_occurence_exact,
+                        w_id,
+                    )
+                    .fetch_all(&db)
+                    .await?;
+                } else {
+                    updated_schedules = sqlx::query_scalar!(
+                        "UPDATE schedule SET ws_error_handler_muted = false, on_failure = NULL, on_failure_extra_args = NULL, on_failure_times = NULL, on_failure_exact = NULL WHERE workspace_id = $1 RETURNING path",
+                        w_id,
+                    )
+                    .fetch_all(&db)
+                    .await?;
+                }
+            }
+            HandlerType::Recovery => {
+                if payload.path.is_some() {
+                    updated_schedules = sqlx::query_scalar!(
+                        "UPDATE schedule SET on_recovery = $1, on_recovery_extra_args = $2, on_recovery_times = $3 WHERE workspace_id = $4 RETURNING path",
+                        payload.path,
+                        payload.extra_args,
+                        payload.number_of_occurence,
+                        w_id,
+                    )
+                    .fetch_all(&db)
+                    .await?;
+                } else {
+                    updated_schedules = sqlx::query_scalar!(
+                        "UPDATE schedule SET on_recovery = NULL, on_recovery_extra_args = NULL, on_recovery_times = NULL WHERE workspace_id = $1 RETURNING path",
+                        w_id,
+                    )
+                    .fetch_all(&db)
+                    .await?;
+                }
+            }
+            HandlerType::Success => {
+                if payload.path.is_some() {
+                    updated_schedules = sqlx::query_scalar!(
+                        "UPDATE schedule SET on_success = $1, on_success_extra_args = $2 WHERE workspace_id = $3 RETURNING path",
+                        payload.path,
+                        payload.extra_args,
+                        w_id,
+                    )
+                    .fetch_all(&db)
+                    .await?;
+                } else {
+                    updated_schedules = sqlx::query_scalar!(
+                        "UPDATE schedule SET on_success = NULL, on_success_extra_args = NULL WHERE workspace_id = $1 RETURNING path",
+                        w_id,
+                    )
+                    .fetch_all(&db)
+                    .await?;
+                }
+            }
+        }
+        for updated_schedule_path in updated_schedules {
+            handle_deployment_metadata(
+                &authed.email,
+                &authed.username,
+                &db,
+                &w_id,
+                DeployedObject::Schedule { path: updated_schedule_path },
+                None,
+                rsmq.clone(),
+                true,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn check_flow_conflict<'c>(
@@ -372,7 +813,7 @@ async fn check_flow_conflict<'c>(
             path,
             w_id
         )
-        .fetch_one(tx)
+        .fetch_one(&mut **tx)
         .await?
         .unwrap_or(false);
         if exists_flow {
@@ -390,25 +831,35 @@ pub struct EditSchedule {
     pub schedule: String,
     pub timezone: String,
     pub args: Option<serde_json::Value>,
+    pub summary: Option<String>,
     pub on_failure: Option<String>,
+    pub on_failure_times: Option<i32>,
+    pub on_failure_exact: Option<bool>,
+    pub on_failure_extra_args: Option<serde_json::Value>,
+    pub on_recovery: Option<String>,
+    pub on_recovery_times: Option<i32>,
+    pub on_recovery_extra_args: Option<serde_json::Value>,
+    pub on_success: Option<String>,
+    pub on_success_extra_args: Option<serde_json::Value>,
+    pub ws_error_handler_muted: Option<bool>,
+    pub retry: Option<serde_json::Value>,
+    pub no_flow_overlap: Option<bool>,
+    pub tag: Option<String>,
+    pub paused_until: Option<DateTime<Utc>>,
 }
 
 pub async fn clear_schedule<'c>(
     db: &mut Transaction<'c, Postgres>,
     path: &str,
-    is_flow: bool,
+    w_id: &str,
 ) -> Result<()> {
-    let job_kind = if is_flow {
-        JobKind::Flow
-    } else {
-        JobKind::Script
-    };
+    tracing::info!("Clearing schedule {}", path);
     sqlx::query!(
-        "DELETE FROM queue WHERE schedule_path = $1 AND running = false AND job_kind = $2",
+        "DELETE FROM queue WHERE schedule_path = $1 AND running = false AND workspace_id = $2 AND is_flow_step = false",
         path,
-        job_kind: JobKind
+        w_id
     )
-    .execute(db)
+    .execute(&mut **db)
     .await?;
     Ok(())
 }
@@ -417,3 +868,9 @@ pub async fn clear_schedule<'c>(
 pub struct SetEnabled {
     pub enabled: bool,
 }
+
+// #[derive(Deserialize)]
+// pub struct Catchup {
+//     pub from: DateTime<Utc>,
+//     pub to: Option<DateTime<Utc>>,
+// }

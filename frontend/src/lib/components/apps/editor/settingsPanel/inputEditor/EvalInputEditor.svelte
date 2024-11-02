@@ -8,18 +8,21 @@
 
 	export let componentInput: EvalAppInput | undefined
 	export let id: string
-	export let hasRows: boolean = false
 
 	const { onchange, worldStore, state } = getContext<AppViewerContext>('AppViewerContext')
 
 	$: extraLib =
 		componentInput?.expr && $worldStore
-			? buildExtraLib($worldStore?.outputsById ?? {}, id, hasRows, $state, false)
+			? buildExtraLib($worldStore?.outputsById ?? {}, id, $state, false)
 			: undefined
+
+	// 	`
+	// /** The current's app state */
+	// const state: Record<string, any> = ${JSON.stringify(state)};`
 </script>
 
 {#if componentInput?.type === 'eval'}
-	<div class="border border-gray-300">
+	<div class="border">
 		<SimpleEditor
 			lang="javascript"
 			bind:code={componentInput.expr}

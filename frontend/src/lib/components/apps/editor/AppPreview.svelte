@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { setContext } from 'svelte'
-	import { writable, type Writable } from 'svelte/store'
+	import { getContext, setContext } from 'svelte'
+	import { get, writable, type Writable } from 'svelte/store'
 	import { buildWorld } from '../rx'
 	import type {
 		App,
@@ -9,20 +9,21 @@
 		EditorBreakpoint,
 		EditorMode
 	} from '../types'
-	import { classNames } from '$lib/utils'
 	import type { Policy } from '$lib/gen'
 	import Button from '../../common/button/Button.svelte'
 	import { Unlock } from 'lucide-svelte'
-	import RecomputeAllComponents from './RecomputeAllComponents.svelte'
 	import GridViewer from './GridViewer.svelte'
-	import { Component } from './component'
+	import Component from './component/Component.svelte'
 	import { twMerge } from 'tailwind-merge'
 	import { columnConfiguration } from '../gridUtils'
-	import { HiddenComponent } from '../components'
 	import { deepEqual } from 'fast-equals'
-	import { dfs } from './appUtils'
+	import { dfs, maxHeight } from './appUtils'
 	import { BG_PREFIX, migrateApp } from '../utils'
-	import { workspaceStore } from '$lib/stores'
+	import { workspaceStore, enterpriseLicense } from '$lib/stores'
+	import DarkModeObserver from '$lib/components/DarkModeObserver.svelte'
+	import { getTheme } from './componentsPanel/themeUtils'
+	import HiddenComponent from '../components/helpers/HiddenComponent.svelte'
+	import RecomputeAllComponents from './RecomputeAllComponents.svelte'
 
 	export let app: App
 	export let appPath: string = ''
@@ -34,6 +35,14 @@
 	export let context: Record<string, any>
 	export let noBackend: boolean = false
 	export let isLocked = false
+	export let hideRefreshBar = false
+
+	export let replaceStateFn: (path: string) => void = (path: string) =>
+		window.history.replaceState(null, '', path)
+	export let gotoFn: (path: string, opt?: Record<string, any> | undefined) => void = (
+		path: string,
+		opt?: Record<string, any>
+	) => window.history.pushState(null, '', path)
 
 	migrateApp(app)
 
@@ -49,11 +58,12 @@
 
 	const allIdsInPath = writable<string[]>([])
 
-	let ncontext: any = { ...context, workspace, mode: 'viewer' }
-
-	function hashchange(e: HashChangeEvent) {
-		ncontext.hash = e.newURL.split('#')[1]
-		ncontext = ncontext
+	let ncontext: any = {
+		...context,
+		workspace,
+		mode: 'viewer',
+		summary: summary,
+		author: policy.on_behalf_of_email
 	}
 
 	function resizeWindow() {
@@ -63,13 +73,39 @@
 	resizeWindow()
 
 	const parentWidth = writable(0)
+	const darkMode: Writable<boolean> = writable(document.documentElement.classList.contains('dark'))
+
 	const state = writable({})
+
+	let parentContext = getContext<AppViewerContext>('AppViewerContext')
+
+	let worldStore = buildWorld(ncontext)
+	$: onContextChange(context)
+
+	function onContextChange(context: any) {
+		Object.assign(ncontext, context)
+		ncontext = ncontext
+		Object.entries(context).forEach(([key, value]) => {
+			get(worldStore).outputsById?.['ctx']?.[key].set(value, true)
+		})
+	}
+
+	function hashchange(e: HashChangeEvent) {
+		ncontext.hash = e.newURL.split('#')[1]
+		ncontext = ncontext
+		worldStore.update((x) => {
+			x.outputsById?.['ctx']?.['hash'].set(ncontext.hash, true)
+			return x
+		})
+	}
+
 	setContext<AppViewerContext>('AppViewerContext', {
-		worldStore: buildWorld(ncontext),
+		worldStore: worldStore,
 		initialized: writable({ initialized: false, initializedComponents: [] }),
 		app: appStore,
 		summary: writable(summary),
 		selectedComponent,
+		bgRuns: writable([]),
 		mode,
 		connectingInput,
 		breakpoint,
@@ -78,7 +114,8 @@
 		workspace,
 		onchange: undefined,
 		isEditor,
-		jobs: writable([]),
+		jobs: parentContext?.jobs ?? writable([]),
+		jobsById: parentContext?.jobsById ?? writable({}),
 		staticExporter: writable({}),
 		noBackend,
 		errorByComponent: writable({}),
@@ -89,7 +126,20 @@
 		state: state,
 		componentControl: writable({}),
 		hoverStore: writable(undefined),
-		allIdsInPath
+		allIdsInPath,
+		darkMode,
+		cssEditorOpen: writable(false),
+		previewTheme: writable(undefined),
+		debuggingComponents: writable({}),
+		replaceStateFn,
+		gotoFn,
+		policy,
+		recomputeAllContext: writable({
+			loading: false,
+			componentNumber: 0,
+			refreshing: [],
+			progress: 100
+		})
 	})
 
 	let previousSelectedIds: string[] | undefined = undefined
@@ -100,33 +150,99 @@
 			.filter((x) => x != undefined) as string[]
 	}
 
-	$: width = $breakpoint === 'sm' ? 'max-w-[640px]' : 'w-full min-w-[768px]'
+	$: width =
+		$breakpoint === 'sm' && $appStore?.mobileViewOnSmallerScreens !== false
+			? 'max-w-[640px]'
+			: 'w-full min-w-[768px]'
 	$: lockedClasses = isLocked ? '!max-h-[400px] overflow-hidden pointer-events-none' : ''
+	function onThemeChange() {
+		$darkMode = document.documentElement.classList.contains('dark')
+	}
+	const cssId = 'wm-global-style'
+
+	let css: string | undefined = undefined
+
+	appStore.subscribe(loadTheme)
+
+	async function loadTheme(currentAppStore: App) {
+		if (!currentAppStore.theme) {
+			return
+		}
+
+		if (currentAppStore.theme.type === 'inlined') {
+			css = currentAppStore.theme.css
+		} else if (currentAppStore.theme.type === 'path' && currentAppStore.theme.path) {
+			let loadedCss = await getTheme(workspace, currentAppStore.theme.path)
+			if (loadedCss) {
+				css = loadedCss.value
+			}
+		}
+	}
+
+	$: addOrRemoveCss($enterpriseLicense !== undefined || isEditor, css)
+
+	function addOrRemoveCss(isPremium: boolean, cssString: string | undefined) {
+		const existingElement = document.getElementById(cssId)
+
+		if (!isPremium) {
+			if (existingElement) {
+				existingElement.remove()
+			}
+		} else {
+			if (!existingElement && cssString) {
+				const head = document.head
+				const link = document.createElement('style')
+				link.id = cssId
+				link.innerHTML = cssString
+				head.appendChild(link)
+			} else if (existingElement) {
+				if (cssString) {
+					existingElement.innerHTML = cssString
+				} else {
+					existingElement.innerHTML = ''
+				}
+			}
+		}
+	}
+
+	let appHeight: number = 0
+
+	$: maxRow = maxHeight($appStore.grid, appHeight, $breakpoint)
 </script>
+
+<svelte:head>
+	<link rel="stylesheet" href="/tailwind_full.css" />
+</svelte:head>
+
+<DarkModeObserver on:change={onThemeChange} />
 
 <svelte:window on:hashchange={hashchange} on:resize={resizeWindow} />
 
-<div id="app-editor-top-level-drawer" />
+<div class="relative min-h-full grow" bind:clientHeight={appHeight}>
+	<div id="app-editor-top-level-drawer" />
+	<div id="app-editor-select" />
 
-<div class="relative">
 	<div
-		class="{$$props.class} {lockedClasses} {width} h-full {app.fullscreen
+		class="{$$props.class} {lockedClasses} {width} h-full bg-surface {app.fullscreen
 			? ''
-			: 'max-w-6xl'} mx-auto"
+			: 'max-w-7xl'} mx-auto"
+		id="app-content"
 	>
 		{#if $appStore.grid}
 			<div
-				class={classNames(
+				class={twMerge(
 					'mx-auto',
-					$appStore?.norefreshbar ? 'invisible h-0 overflow-hidden' : ''
+					hideRefreshBar || $appStore?.norefreshbar || $appStore.hideLegacyTopBar === true
+						? 'invisible h-0 overflow-hidden'
+						: ''
 				)}
 			>
 				<div
-					class="w-full sticky top-0 flex justify-between border-b bg-gray-50 px-4 py-1 items-center gap-4"
+					class="w-full sticky top-0 flex justify-between border-b bg-surface-secondary px-4 py-1 items-center gap-4"
 				>
 					<h2 class="truncate">{summary}</h2>
 					<RecomputeAllComponents />
-					<div class="text-2xs text-gray-600">
+					<div class="text-2xs text-secondary">
 						{policy.on_behalf_of ? `on behalf of ${policy.on_behalf_of_email}` : ''}
 					</div>
 				</div>
@@ -135,7 +251,11 @@
 
 		<div
 			style={app.css?.['app']?.['grid']?.style}
-			class={twMerge('px-4 pt-4 pb-2 overflow-visible', app.css?.['app']?.['grid']?.class ?? '')}
+			class={twMerge(
+				'p-2 overflow-visible',
+				app.css?.['app']?.['grid']?.class ?? '',
+				'wm-app-grid subgrid'
+			)}
 			bind:clientWidth={$parentWidth}
 		>
 			<div>
@@ -143,16 +263,24 @@
 					allIdsInPath={$allIdsInPath}
 					items={app.grid}
 					let:dataItem
-					rowHeight={36}
+					let:hidden
 					cols={columnConfiguration}
-					gap={[4, 2]}
+					{maxRow}
+					breakpoint={$breakpoint}
 				>
 					<!-- svelte-ignore a11y-click-events-have-key-events -->
 					<div
 						class={'h-full w-full center-center'}
 						on:pointerdown={() => ($selectedComponent = [dataItem.id])}
 					>
-						<Component render={true} component={dataItem.data} selected={false} locked={true} />
+						<Component
+							render={true}
+							component={dataItem.data}
+							selected={false}
+							locked={true}
+							fullHeight={dataItem?.[$breakpoint === 'sm' ? 3 : 12]?.fullHeight}
+							{hidden}
+						/>
 					</div>
 				</GridViewer>
 			</div>
@@ -161,6 +289,7 @@
 
 	{#if isLocked}
 		<!-- svelte-ignore a11y-click-events-have-key-events -->
+		<!-- svelte-ignore a11y-no-static-element-interactions -->
 		<div
 			on:click={() => (isLocked = false)}
 			class="absolute inset-0 center-center bg-black/20 z-50 backdrop-blur-[1px] cursor-pointer"

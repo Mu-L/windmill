@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { Button, Drawer, DrawerContent } from '$lib/components/common'
+	import { Button, Drawer, DrawerContent, Popup } from '$lib/components/common'
+	import { base } from '$lib/base'
 	import FlowModuleScript from '$lib/components/flows/content/FlowModuleScript.svelte'
 	import FlowPathViewer from '$lib/components/flows/content/FlowPathViewer.svelte'
 	import { emptySchema } from '$lib/utils'
@@ -11,24 +12,17 @@
 		StaticAppInput,
 		UserAppInput
 	} from '../../inputType'
-	import {
-		faCodeBranch,
-		faExternalLinkAlt,
-		faEye,
-		faPen,
-		faRefresh,
-		faTrashAlt
-	} from '@fortawesome/free-solid-svg-icons'
 	import type { AppViewerContext } from '../../types'
 	import { workspaceStore } from '$lib/stores'
 	import { createEventDispatcher } from 'svelte'
 	import { deepEqual } from 'fast-equals'
 	import { computeFields } from './utils'
-	import { loadSchema } from '../../utils'
-	import { inferArgs } from '$lib/infer'
+	import { inferArgs, loadSchema } from '$lib/infer'
 	import RunButton from './RunButton.svelte'
 	import { getScriptByPath } from '$lib/scripts'
 	import { sendUserToast } from '$lib/toast'
+	import { autoPlacement } from '@floating-ui/core'
+	import { ExternalLink, Eye, GitFork, Pen, RefreshCw, Trash } from 'lucide-svelte'
 
 	export let runnable: RunnableByPath
 	export let fields: Record<string, StaticAppInput | ConnectedAppInput | RowAppInput | UserAppInput>
@@ -38,22 +32,39 @@
 
 	let drawerFlowViewer: Drawer
 	let flowPath: string = ''
+	let notFound = false
 
 	const dispatch = createEventDispatcher()
 
 	async function refreshScript(x: RunnableByPath) {
-		let { schema } = await getScriptByPath(x.path)
-		if (!deepEqual(x.schema, schema)) {
-			x.schema = schema
-			fields = computeFields(schema, false, fields)
+		try {
+			let { schema } = await getScriptByPath(x.path)
+			if (!deepEqual(x.schema, schema)) {
+				x.schema = schema
+				if (!x.schema.order) {
+					x.schema.order = Object.keys(x.schema.properties ?? {})
+				}
+				fields = computeFields(schema, false, fields)
+			}
+		} catch (e) {
+			notFound = true
+			console.error(e)
 		}
 	}
 
 	async function refreshFlow(x: RunnableByPath) {
-		const { schema } = (await loadSchema($workspaceStore ?? '', x.path, 'flow')) ?? emptySchema()
-		if (!deepEqual(x.schema, schema)) {
-			x.schema = schema
-			fields = computeFields(schema, false, fields)
+		try {
+			const { schema } = (await loadSchema($workspaceStore ?? '', x.path, 'flow')) ?? emptySchema()
+			if (!deepEqual(x.schema, schema)) {
+				x.schema = schema
+				if (!x.schema.order) {
+					x.schema.order = Object.keys(x.schema.properties ?? {})
+				}
+				fields = computeFields(schema, false, fields)
+			}
+		} catch (e) {
+			notFound = true
+			console.error(e)
 		}
 	}
 
@@ -75,14 +86,20 @@
 		})
 	}
 
-	function refresh() {
+	let lastRunnable: RunnableByPath | undefined = undefined
+	function refresh(runnable) {
+		if (deepEqual(runnable, lastRunnable)) {
+			return
+		}
+		notFound = false
 		if (runnable.runType == 'script') {
 			refreshScript(runnable)
 		} else if (runnable.runType == 'flow') {
 			refreshFlow(runnable)
 		}
+		lastRunnable = runnable
 	}
-	$: runnable.runType && refresh()
+	$: refresh(runnable)
 </script>
 
 <Drawer bind:this={drawerFlowViewer} size="1200px">
@@ -98,21 +115,20 @@
 		<Button
 			variant="border"
 			size="xs"
-			startIcon={{ icon: faRefresh }}
+			color="light"
+			startIcon={{ icon: RefreshCw }}
 			on:click={async () => {
 				sendUserToast('Refreshing inputs')
-				refresh()
+				refresh(runnable)
 				$stateId = $stateId + 1
 				await tick()
 			}}
-		>
-			Refresh
-		</Button>
+		/>
 		<Button
 			size="xs"
 			variant="border"
 			color="red"
-			startIcon={{ icon: faTrashAlt }}
+			startIcon={{ icon: Trash }}
 			on:click={() => {
 				dispatch('delete')
 			}}
@@ -123,7 +139,8 @@
 			<Button
 				variant="border"
 				size="xs"
-				startIcon={{ icon: faEye }}
+				color="light"
+				startIcon={{ icon: Eye }}
 				on:click={() => {
 					flowPath = runnable.path
 					drawerFlowViewer.openDrawer()
@@ -134,26 +151,28 @@
 			<Button
 				variant="border"
 				size="xs"
-				startIcon={{ icon: faPen }}
-				endIcon={{ icon: faExternalLinkAlt }}
+				color="light"
+				startIcon={{ icon: Pen }}
+				endIcon={{ icon: ExternalLink }}
 				target="_blank"
-				href="/flows/edit/{runnable.path}?nodraft=true">Edit</Button
+				href="{base}/flows/edit/{runnable.path}?nodraft=true">Edit</Button
 			>
 			<Button
 				variant="border"
 				size="xs"
-				startIcon={{ icon: faEye }}
-				endIcon={{ icon: faExternalLinkAlt }}
+				color="light"
+				startIcon={{ icon: Eye }}
+				endIcon={{ icon: ExternalLink }}
 				target="_blank"
-				href="/flows/get/{runnable.path}?workspace={$workspaceStore}"
+				href="{base}/flows/get/{runnable.path}?workspace={$workspaceStore}"
 			>
-				Details page
+				Details
 			</Button>
 		{:else}
 			<Button
 				size="xs"
 				variant="border"
-				startIcon={{ icon: faCodeBranch }}
+				startIcon={{ icon: GitFork }}
 				on:click={() => {
 					fork(runnable.path)
 				}}
@@ -161,6 +180,37 @@
 				Fork
 			</Button>
 		{/if}
+		<Popup
+			floatingConfig={{
+				middleware: [
+					autoPlacement({
+						allowedPlacements: [
+							'bottom-start',
+							'bottom-end',
+							'top-start',
+							'top-end',
+							'top',
+							'bottom'
+						]
+					})
+				]
+			}}
+		>
+			<svelte:fragment slot="button">
+				<Button
+					nonCaptureEvent={true}
+					btnClasses={'bg-surface text-primay hover:bg-hover'}
+					color="light"
+					variant="border"
+					size="xs">Cache</Button
+				>
+			</svelte:fragment>
+			<div class="block text-primary">
+				Since this is a reference to a workspace {runnable.runType}, set the cache in the {runnable.runType}
+				settings directly by editing it. The cache will be shared by any app or flow that uses this {runnable.runType}.
+			</div>
+		</Popup>
+
 		<input
 			on:keydown|stopPropagation
 			bind:value={runnable.name}
@@ -168,9 +218,13 @@
 			class="!text-xs !rounded-xs"
 		/>
 	</div>
-	<div class="w-full">
+	<div class="w-full grow overflow-y-auto">
 		{#key $stateId}
-			{#if runnable.runType == 'script' || runnable.runType == 'hubscript'}
+			{#if notFound}
+				<div class="text-red-400"
+					>{runnable.runType} not found at {runnable.path} in workspace {$workspaceStore}</div
+				>
+			{:else if runnable.runType == 'script' || runnable.runType == 'hubscript'}
 				<div class="border">
 					<FlowModuleScript path={runnable.path} />
 				</div>

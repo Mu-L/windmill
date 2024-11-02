@@ -1,10 +1,14 @@
 <script lang="ts">
 	import { createEventDispatcher } from 'svelte'
-	import { workspaceStore } from '$lib/stores'
-	import { WorkspaceService } from '$lib/gen'
-	import { Button, ToggleButton, ToggleButtonGroup } from './common'
-	import Tooltip from './Tooltip.svelte'
+	import { globalEmailInvite, superadmin, workspaceStore } from '$lib/stores'
+	import { SettingService, UserService, WorkspaceService } from '$lib/gen'
+	import { Button, Popup } from './common'
 	import { sendUserToast } from '$lib/toast'
+	import { isCloudHosted } from '$lib/cloud'
+	import { goto } from '$lib/navigation'
+	import ToggleButtonGroup from './common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from './common/toggleButton-v2/ToggleButton.svelte'
+	import { UserPlus } from 'lucide-svelte'
 
 	const dispatch = createEventDispatcher()
 
@@ -19,54 +23,113 @@
 		}
 	}
 
+	let automateUsernameCreation = false
+	async function getAutomateUsernameCreationSetting() {
+		automateUsernameCreation =
+			((await SettingService.getGlobal({ key: 'automate_username_creation' })) as any) ?? false
+	}
+	getAutomateUsernameCreationSetting()
+
 	async function addUser() {
 		await WorkspaceService.addUser({
 			workspace: $workspaceStore!,
 			requestBody: {
 				email,
-				username,
+				username: automateUsernameCreation ? undefined : username,
 				is_admin: selected == 'admin',
 				operator: selected == 'operator'
 			}
 		})
 		sendUserToast(`Added ${email}`)
+		if (!(await UserService.existsEmail({ email }))) {
+			let isSuperadmin = $superadmin
+			if (!isCloudHosted()) {
+				const emailCopy = email
+				sendUserToast(
+					`User ${email} is not registered yet on the instance. ${
+						!isSuperadmin
+							? `If not using SSO, ask an administrator to add ${email} to the instance`
+							: ''
+					}`,
+					true,
+					isSuperadmin
+						? [
+								{
+									label: 'Add user to the instance',
+									callback: () => {
+										$globalEmailInvite = emailCopy
+										goto('#superadmin-settings')
+									}
+								}
+						  ]
+						: []
+				)
+			}
+		}
 		dispatch('new')
 	}
 
-	let selected: 'operator' | 'author' | 'admin' = 'author'
+	let selected: 'operator' | 'developer' | 'admin' = 'developer'
 </script>
 
-<div class="flex flex-row">
-	<input type="email" on:keyup={handleKeyUp} placeholder="email" bind:value={email} class="mr-4" />
-	<input
-		type="text"
-		on:keyup={handleKeyUp}
-		placeholder="username"
-		bind:value={username}
-		class="mr-4"
-	/>
-	<ToggleButtonGroup bind:selected>
-		<ToggleButton position="left" value="operator" size="sm"
-			>Operator <Tooltip
-				>An operator can only execute and view scripts/flows/apps from your workspace, and only
-				those that he has visibility on</Tooltip
-			></ToggleButton
+<Popup
+	floatingConfig={{ strategy: 'absolute', placement: 'bottom-end' }}
+	containerClasses="border rounded-lg shadow-lg p-4 bg-surface"
+>
+	<svelte:fragment slot="button">
+		<Button color="dark" size="xs" nonCaptureEvent={true} startIcon={{ icon: UserPlus }}>
+			Add new user
+		</Button>
+	</svelte:fragment>
+	<div class="flex flex-col w-72 p-2">
+		<span class="text-sm mb-2 leading-6 font-semibold">Add a new user</span>
+
+		<span class="text-xs mb-1 leading-6">Email</span>
+		<input type="email mb-1" on:keyup={handleKeyUp} placeholder="email" bind:value={email} />
+
+		{#if !automateUsernameCreation}
+			<span class="text-xs mb-1 pt-2 leading-6">Username</span>
+			<input type="text" on:keyup={handleKeyUp} placeholder="username" bind:value={username} />
+		{/if}
+
+		<span class="text-xs mb-1 pt-2 leading-6">Role</span>
+		<ToggleButtonGroup bind:selected class="mb-4">
+			<ToggleButton
+				value="operator"
+				size="sm"
+				label="Operator"
+				tooltip="An operator can only execute and view scripts/flows/apps from your workspace, and only those that he has visibility on."
+			/>
+			<ToggleButton
+				position="center"
+				value="developer"
+				size="sm"
+				label="Developer"
+				tooltip="A Developer can execute and view scripts/flows/apps, but they can also create new ones and edit those they are allowed to by their path (either u/ or Writer or Admin of their folder found at /f)."
+			/>
+			<ToggleButton
+				position="right"
+				value="admin"
+				size="sm"
+				label="Admin"
+				tooltip="An admin has full control over a specific Windmill workspace, including the ability to manage users, edit entities, and control permissions within the workspace."
+			/>
+		</ToggleButtonGroup>
+		<Button
+			variant="contained"
+			color="blue"
+			size="sm"
+			on:click={() => {
+				addUser().then(() => {
+					// @ts-ignore
+					email = undefined
+					// @ts-ignore
+					username = undefined
+				})
+			}}
+			disabled={email === undefined || (!automateUsernameCreation && username === undefined)}
 		>
-		<ToggleButton position="center" value="author" size="sm"
-			>Author <Tooltip
-				>An Author can execute and view scripts/flows/apps, but he can also create new ones</Tooltip
-			></ToggleButton
-		>
-		<ToggleButton position="right" value="admin" size="sm">Admin</ToggleButton>
-	</ToggleButtonGroup>
-	<Button
-		variant="contained"
-		color="blue"
-		size="sm"
-		btnClasses="!ml-8"
-		on:click={addUser}
-		disabled={email === undefined}
-	>
-		Add
-	</Button>
-</div>
+			Add
+		</Button>
+	</div>
+</Popup>

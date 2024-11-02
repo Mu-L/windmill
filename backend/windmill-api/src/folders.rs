@@ -8,9 +8,11 @@
 
 use std::sync::Arc;
 
+use crate::db::ApiAuthed;
+
 use crate::{
-    db::{UserDB, DB},
-    users::{AuthCache, Authed, Tokened},
+    db::DB,
+    users::{AuthCache, Tokened},
     webhook_util::{WebhookMessage, WebhookShared},
 };
 use axum::{
@@ -20,8 +22,10 @@ use axum::{
 };
 use lazy_static::lazy_static;
 use regex::Regex;
-use windmill_audit::{audit_log, ActionKind};
+use windmill_audit::audit_ee::audit_log;
+use windmill_audit::ActionKind;
 use windmill_common::{
+    db::UserDB,
     error::{self, to_anyhow, JsonResult, Result},
     users::username_to_permissioned_as,
     utils::{not_found_if_none, paginate, Pagination},
@@ -29,6 +33,7 @@ use windmill_common::{
 
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Postgres, Transaction};
+use windmill_git_sync::{handle_deployment_metadata, DeployedObject};
 
 pub fn workspaced_service() -> Router {
     Router::new()
@@ -51,11 +56,15 @@ pub struct Folder {
     pub display_name: String,
     pub owners: Vec<String>,
     pub extra_perms: serde_json::Value,
+    pub summary: Option<String>,
+    pub created_by: Option<String>,
+    pub edited_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
 pub struct NewFolder {
     pub name: String,
+    pub summary: Option<String>,
     pub display_name: Option<String>,
     pub owners: Option<Vec<String>>,
     pub extra_perms: Option<serde_json::Value>,
@@ -63,6 +72,7 @@ pub struct NewFolder {
 
 #[derive(Deserialize)]
 pub struct UpdateFolder {
+    pub summary: Option<String>,
     pub display_name: Option<String>,
     pub owners: Option<Vec<String>>,
     pub extra_perms: Option<serde_json::Value>,
@@ -71,10 +81,11 @@ pub struct UpdateFolder {
 #[derive(Deserialize)]
 pub struct Owner {
     pub owner: String,
+    pub write: Option<bool>,
 }
 
 async fn list_folders(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
@@ -84,19 +95,19 @@ async fn list_folders(
 
     let rows = sqlx::query_as!(
         Folder,
-        "SELECT workspace_id, name, display_name, owners, extra_perms FROM folder WHERE workspace_id = $1 ORDER BY name desc LIMIT $2 OFFSET $3",
+        "SELECT workspace_id, name, display_name, owners, extra_perms, summary, created_by, edited_at FROM folder WHERE workspace_id = $1 ORDER BY name desc LIMIT $2 OFFSET $3",
         w_id,
         per_page as i64,
         offset as i64
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
 
     Ok(Json(rows))
 }
 async fn list_foldernames(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
@@ -110,7 +121,7 @@ async fn list_foldernames(
         per_page as i64,
         offset as i64
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -128,7 +139,7 @@ async fn check_name_conflict<'c>(
         name,
         w_id
     )
-    .fetch_one(tx)
+    .fetch_one(&mut **tx)
     .await?
     .unwrap_or(false);
     if exists {
@@ -145,10 +156,12 @@ lazy_static! {
 }
 
 async fn create_folder(
-    authed: Authed,
+    authed: ApiAuthed,
     Tokened { token }: Tokened,
+    Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Extension(cache): Extension<Arc<AuthCache>>,
     Path(w_id): Path<String>,
     Json(ng): Json<NewFolder>,
@@ -163,46 +176,61 @@ async fn create_folder(
     check_name_conflict(&mut tx, &w_id, &ng.name).await?;
     cache.invalidate(&w_id, token).await;
     let owner = username_to_permissioned_as(&authed.username);
-    let owners = &ng.owners.unwrap_or(vec![owner.clone()]);
+    let owners = ng.owners.unwrap_or_else(|| vec![owner.clone()]);
+    let owners = if owners.contains(&owner) {
+        owners.clone()
+    } else {
+        owners
+            .iter()
+            .cloned()
+            .chain(std::iter::once(owner))
+            .collect()
+    };
 
-    if let Some(extra_perms) = ng.extra_perms.clone() {
-        for o in owners {
-            if !extra_perms
-                .get(&o)
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false)
-            {
-                return Err(windmill_common::error::Error::BadRequest(format!(
-                    "Owner {} would not have permission to write to folder and that is an inconsistent state",
-                    o
-                )));
-            }
+    let mut extra_perms = ng
+        .extra_perms
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    if extra_perms.is_object() {
+        let extra_mut = extra_perms.as_object_mut().unwrap();
+        for o in &owners {
+            extra_mut.insert(o.clone(), serde_json::json!(true));
         }
+    } else {
+        return Err(error::Error::BadRequest(
+            "extra_perms must be an object".to_string(),
+        ));
     }
-
-    let extra_perms = ng.extra_perms.unwrap_or_else(|| {
-        let mut map = serde_json::Map::new();
-        for o in owners {
-            map.insert(o.clone(), serde_json::json!(true));
-        }
-        serde_json::Value::Object(map)
-    });
 
     sqlx::query_as!(
         Folder,
-        "INSERT INTO folder (workspace_id, name, display_name, owners, extra_perms) VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO folder (workspace_id, name, display_name, owners, extra_perms, summary, created_by, edited_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now())",
         w_id,
         ng.name,
         ng.display_name.unwrap_or(ng.name.clone()),
-        owners,
+        &owners,
         extra_perms,
+        ng.summary,
+        authed.username
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
+    .await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Folder { path: format!("f/{}", ng.name) },
+        Some(format!("Folder '{}' created", ng.name)),
+        rsmq,
+        true,
+    )
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "folder.create",
         ActionKind::Create,
         &w_id,
@@ -220,13 +248,13 @@ async fn create_folder(
 }
 
 pub async fn is_owner_api(
-    authed: Authed,
+    authed: ApiAuthed,
     Path((_w_id, name)): Path<(String, String)>,
 ) -> JsonResult<bool> {
     Ok(Json(is_owner(&authed, &name)))
 }
 
-pub fn is_owner(Authed { is_admin, folders, .. }: &Authed, name: &str) -> bool {
+pub fn is_owner(ApiAuthed { is_admin, folders, .. }: &ApiAuthed, name: &str) -> bool {
     if *is_admin {
         true
     } else {
@@ -234,7 +262,7 @@ pub fn is_owner(Authed { is_admin, folders, .. }: &Authed, name: &str) -> bool {
     }
 }
 
-pub fn require_is_owner(authed: &Authed, name: &str) -> Result<()> {
+pub fn require_is_owner(authed: &ApiAuthed, name: &str) -> Result<()> {
     if is_owner(authed, name) {
         Ok(())
     } else {
@@ -246,11 +274,13 @@ pub fn require_is_owner(authed: &Authed, name: &str) -> Result<()> {
 }
 
 async fn update_folder(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, name)): Path<(String, String)>,
-    Json(ng): Json<UpdateFolder>,
+    Json(mut ng): Json<UpdateFolder>,
 ) -> Result<String> {
     use sql_builder::prelude::*;
 
@@ -260,6 +290,31 @@ async fn update_folder(
 
     if let Some(display_name) = ng.display_name {
         sqlb.set("display_name", "?".bind(&display_name));
+    }
+
+    if let Some(summary) = ng.summary {
+        sqlb.set("summary", "?".bind(&summary));
+    }
+
+    sqlb.set("edited_at", "now()");
+
+    if !authed.is_admin {
+        let prefixed_username = format!("u/{}", authed.username);
+        if ng.owners.as_ref().is_some_and(|x| {
+            !x.contains(&prefixed_username)
+                && !authed.groups.iter().any(|g| x.contains(&format!("g/{g}")))
+        }) {
+            ng.owners.as_mut().unwrap().push(prefixed_username.clone());
+            if ng.extra_perms.is_none() {
+                ng.extra_perms = Some(serde_json::Value::Object(serde_json::Map::new()));
+            }
+            ng.extra_perms
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(prefixed_username, serde_json::json!(true));
+        }
     }
     if let Some(owners) = ng.owners {
         sqlb.set(
@@ -288,7 +343,16 @@ async fn update_folder(
     let sql = sqlb
         .sql()
         .map_err(|e| error::Error::InternalErr(e.to_string()))?;
-    let nfolder = sqlx::query_as::<_, Folder>(&sql).fetch_one(&mut tx).await?;
+    let nfolder = sqlx::query_as::<_, Folder>(&sql)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    let nfolder = nfolder.ok_or_else(|| {
+        windmill_common::error::Error::NotAuthorized(format!(
+            "You are not an owner of {} and hence cannot modify it",
+            name
+        ))
+    })?;
 
     if let Some(extra_perms) = nfolder.extra_perms.as_object() {
         for o in nfolder.owners {
@@ -305,9 +369,21 @@ async fn update_folder(
         }
     }
 
-    audit_log(
-        &mut tx,
+    handle_deployment_metadata(
+        &authed.email,
         &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Folder { path: format!("f/{}", name) },
+        Some(format!("Folder '{}' updated", name)),
+        rsmq,
+        true,
+    )
+    .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
         "folder.update",
         ActionKind::Update,
         &w_id,
@@ -331,17 +407,17 @@ pub async fn get_folderopt<'c>(
 ) -> Result<Option<Folder>> {
     let folderopt = sqlx::query_as!(
         Folder,
-        "SELECT workspace_id, name, display_name, owners, extra_perms FROM folder WHERE name = $1 AND workspace_id = $2",
+        "SELECT workspace_id, name, display_name, owners, extra_perms, summary, created_by, edited_at FROM folder WHERE name = $1 AND workspace_id = $2",
         name,
         w_id
     )
-    .fetch_optional(db)
+    .fetch_optional(&mut **db)
     .await?;
     Ok(folderopt)
 }
 
 async fn get_folder(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, name)): Path<(String, String)>,
 ) -> JsonResult<Folder> {
@@ -363,7 +439,7 @@ struct FolderUsage {
     pub variables: i64,
 }
 async fn get_folder_usage(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, name)): Path<(String, String)>,
 ) -> JsonResult<FolderUsage> {
@@ -374,7 +450,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -383,7 +459,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -392,7 +468,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -401,7 +477,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -410,7 +486,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -419,7 +495,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -428,7 +504,7 @@ async fn get_folder_usage(
         name,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
@@ -444,8 +520,10 @@ async fn get_folder_usage(
 }
 
 async fn delete_folder(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Extension(webhook): Extension<WebhookShared>,
     Path((w_id, name)): Path<(String, String)>,
 ) -> Result<String> {
@@ -453,16 +531,25 @@ async fn delete_folder(
 
     not_found_if_none(get_folderopt(&mut tx, &w_id, &name).await?, "Folder", &name)?;
 
-    sqlx::query!(
-        "DELETE FROM folder WHERE name = $1 AND workspace_id = $2",
+    let del = sqlx::query_scalar!(
+        "DELETE FROM folder WHERE name = $1 AND workspace_id = $2 RETURNING 1",
         name,
         w_id
     )
-    .execute(&mut tx)
-    .await?;
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+
+    if del.is_none() {
+        return Err(windmill_common::error::Error::NotAuthorized(format!(
+            "Not authorized to delete folder {}",
+            name
+        )));
+    }
+
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "folder.delete",
         ActionKind::Delete,
         &w_id,
@@ -471,6 +558,18 @@ async fn delete_folder(
     )
     .await?;
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        DeployedObject::Folder { path: format!("f/{}", name) },
+        Some(format!("Folder '{}' deleted", name)),
+        rsmq,
+        true,
+    )
+    .await?;
 
     webhook.send_message(
         w_id.clone(),
@@ -481,11 +580,11 @@ async fn delete_folder(
 }
 
 async fn add_owner(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
     Path((w_id, name)): Path<(String, String)>,
-    Json(Owner { owner }): Json<Owner>,
+    Json(Owner { owner, .. }): Json<Owner>,
 ) -> Result<String> {
     let mut tx = user_db.begin(&authed).await?;
 
@@ -493,17 +592,27 @@ async fn add_owner(
     require_is_owner(&authed, &name)?;
 
     sqlx::query!(
-        "UPDATE folder SET owners = array_append(owners, $1) WHERE name = $2 AND workspace_id = $3 AND NOT $1 = ANY(owners) RETURNING name",
+        "UPDATE folder SET owners = array_append(owners::text[], $1) WHERE name = $2 AND workspace_id = $3 AND NOT $1 = ANY(owners) RETURNING name",
         owner,
-        name,
+        &name,
         &w_id,
     )
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    sqlx::query(&format!(
+        "UPDATE folder SET extra_perms = jsonb_set(extra_perms, '{{\"{owner}\"}}', to_jsonb($1), \
+         true) WHERE name = $2 AND workspace_id = $3 RETURNING extra_perms"
+    ))
+    .bind(true)
+    .bind(&name)
+    .bind(&w_id)
+    .fetch_optional(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "folder.add_owner",
         ActionKind::Update,
         &w_id,
@@ -521,38 +630,12 @@ async fn add_owner(
     Ok(format!("Added {} to folder {}", owner, name))
 }
 
-pub async fn get_folders_for_user(
-    w_id: &str,
-    username: &str,
-    groups: &[String],
-    db: &DB,
-) -> Result<Vec<(String, bool, bool)>> {
-    let mut perms = groups
-        .into_iter()
-        .map(|x| format!("g/{}", x))
-        .collect::<Vec<_>>();
-    perms.insert(0, format!("u/{}", username));
-    let folders = sqlx::query!(
-        "SELECT name, (EXISTS (SELECT 1 FROM (SELECT key, value FROM jsonb_each_text(extra_perms) WHERE key = ANY($1)) t  WHERE value::boolean IS true)) as write, $1 && owners::text[] as owner  FROM folder
-        WHERE extra_perms ?| $1  AND workspace_id = $2",
-        &perms[..],
-        w_id,
-    )
-    .fetch_all(db)
-    .await?
-    .into_iter()
-    .map(|x| (x.name, x.write.unwrap_or(false), x.owner.unwrap_or(false)))
-    .collect();
-
-    Ok(folders)
-}
-
 async fn remove_owner(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
     Path((w_id, name)): Path<(String, String)>,
-    Json(Owner { owner }): Json<Owner>,
+    Json(Owner { owner, write }): Json<Owner>,
 ) -> Result<String> {
     let mut tx = user_db.begin(&authed).await?;
 
@@ -560,17 +643,29 @@ async fn remove_owner(
     require_is_owner(&authed, &name)?;
 
     sqlx::query!(
-        "UPDATE folder SET owners = array_remove(owners, $1) WHERE name = $2 AND workspace_id = $3 RETURNING name",
+        "UPDATE folder SET owners = array_remove(owners, $1::varchar) WHERE name = $2 AND workspace_id = $3 RETURNING name",
         owner,
-        name,
+        &name,
         &w_id,
     )
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
+    if let Some(write) = write {
+        sqlx::query(&format!(
+        "UPDATE folder SET extra_perms = jsonb_set(extra_perms, '{{\"{owner}\"}}', to_jsonb($1), \
+         true) WHERE name = $2 AND workspace_id = $3 RETURNING extra_perms"
+    ))
+        .bind(write)
+        .bind(&name)
+        .bind(&w_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    }
+
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "folder.remove_owner",
         ActionKind::Update,
         &w_id,

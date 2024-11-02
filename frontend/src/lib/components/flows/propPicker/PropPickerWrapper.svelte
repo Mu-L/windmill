@@ -19,17 +19,21 @@
 <script lang="ts">
 	import PropPicker from '$lib/components/propertyPicker/PropPicker.svelte'
 	import PropPickerResult from '$lib/components/propertyPicker/PropPickerResult.svelte'
-	import { clickOutside } from '$lib/utils'
+	import { clickOutside, sendUserToast } from '$lib/utils'
 	import { createEventDispatcher, setContext } from 'svelte'
 	import { Pane, Splitpanes } from 'svelte-splitpanes'
 	import { writable, type Writable } from 'svelte/store'
 	import type { PickableProperties } from '../previousResults'
+	import { twMerge } from 'tailwind-merge'
 
 	export let pickableProperties: PickableProperties | undefined
 	export let result: any = undefined
+	export let extraResults: any = undefined
+	export let flow_input: any = undefined
 	export let error: boolean = false
 	export let displayContext = true
 	export let notSelectable = false
+	export let noPadding: boolean = false
 
 	const propPickerConfig = writable<PropPickerConfig | undefined>(undefined)
 	const dispatch = createEventDispatcher()
@@ -55,7 +59,11 @@
 	on:click_outside={() => propPickerConfig.set(undefined)}
 >
 	<Splitpanes>
-		<Pane minSize={20} size={60} class="relative p-2 !transition-none">
+		<Pane
+			minSize={20}
+			size={60}
+			class={twMerge('relative !transition-none', noPadding ? '' : 'p-2')}
+		>
 			<slot />
 		</Pane>
 		<Pane
@@ -66,7 +74,12 @@
 			{#if result}
 				<PropPickerResult
 					{result}
+					{extraResults}
+					{flow_input}
 					on:select={({ detail }) => {
+						if (!notSelectable && !$propPickerConfig) {
+							sendUserToast('Set cursor within an input or click on the plug first', true)
+						}
 						dispatch('select', detail)
 						if ($propPickerConfig?.onSelect(detail)) {
 							propPickerConfig.set(undefined)
@@ -80,6 +93,9 @@
 					{pickableProperties}
 					{notSelectable}
 					on:select={({ detail }) => {
+						if (!notSelectable && !$propPickerConfig) {
+							sendUserToast('Set cursor within an input or click on the plug first', true)
+						}
 						dispatch('select', detail)
 						if ($propPickerConfig?.onSelect(detail)) {
 							propPickerConfig.set(undefined)

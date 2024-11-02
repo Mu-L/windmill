@@ -3,12 +3,12 @@
 A simple CLI allowing interactions with windmill from the command line.
 ![](./vhs/output/setup.gif)
 
-You can find more information in [Windmill Docs](https://docs.windmill.dev/docs/advanced/cli)
+You can find more information in
+[Windmill Docs](https://www.windmill.dev/docs/advanced/cli)
 
 ## Installation
 
-Install the `wmill` CLI tool using
-`deno install --unstable -A https://deno.land/x/wmill/main.ts`.
+Install the `wmill` CLI tool using `npm install -g windmill-cli`.
 
 Update to the latest version using `wmill upgrade`.
 
@@ -20,7 +20,8 @@ workspace settings.
 ## Running Flows & Scripts
 
 Run a script or flow using `wmill flow/script run u/username/path/to/script` and
-pass any inputs using `--data` + Inputs specified as a JSON string or a file using `@ <filename>` or stdin using @-.
+pass any inputs using `--data` + Inputs specified as a JSON string or a file
+using `@ <filename>` or stdin using @-.
 
 Curl-style syntax using `-d @-` for stdin or `-d @<filename>` is also supported.
 

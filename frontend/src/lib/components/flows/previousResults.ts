@@ -1,6 +1,7 @@
 import type { Schema } from '$lib/common'
-import type { Flow, FlowModule } from '$lib/gen'
+import type { FlowModule, OpenFlow } from '$lib/gen'
 import { schemaToObject } from '$lib/schema'
+import { getAllSubmodules, getSubModules } from './flowExplorer'
 import type { FlowState } from './flowState'
 
 export type PickableProperties = {
@@ -17,28 +18,19 @@ type StepPropPicker = {
 
 type ModuleBranches = FlowModule[][]
 
-function getSubModules(flowModule: FlowModule): ModuleBranches {
-	if (flowModule.value.type === 'forloopflow') {
-		return [flowModule.value.modules]
-	} else if (flowModule.value.type === 'branchall') {
-		return flowModule.value.branches.map((branch) => branch.modules)
-	} else if (flowModule.value.type == 'branchone') {
-		return [...flowModule.value.branches.map((branch) => branch.modules), flowModule.value.default]
-	}
-	return []
+export function dfs(
+	id: string | undefined,
+	flow: OpenFlow,
+	getParents: boolean = true
+): FlowModule[] {
+	return dfsByModule(id, flow.value.modules, getParents)
 }
 
-function getAllSubmodules(flowModule: FlowModule): ModuleBranches {
-	return getSubModules(flowModule).map((modules) => {
-		return modules
-			.map((module) => {
-				return [module, ...getAllSubmodules(module).flat()]
-			})
-			.flat()
-	})
-}
-
-function dfs(id: string | undefined, flow: Flow, getParents: boolean = true): FlowModule[] {
+export function dfsByModule(
+	id: string | undefined,
+	modules: FlowModule[],
+	getParents: boolean = true
+): FlowModule[] {
 	if (id === undefined) {
 		return []
 	}
@@ -64,7 +56,7 @@ function dfs(id: string | undefined, flow: Flow, getParents: boolean = true): Fl
 		return undefined
 	}
 
-	return rec(id, [flow.value.modules]) ?? []
+	return rec(id, [modules]) ?? []
 }
 
 function getFlowInput(
@@ -72,51 +64,55 @@ function getFlowInput(
 	flowState: FlowState,
 	args: any,
 	schema: Schema
-) {
+): Object {
 	const parentModule = parentModules.shift()
+
+	const topFlowInput = schemaToObject(schema, args)
 
 	const parentState = parentModule ? flowState[parentModule.id] : undefined
 
 	if (parentState && parentModule) {
-		if (parentState.previewArgs) {
-			return parentState.previewArgs
+		if (
+			parentState.previewArgs &&
+			!(parentModule.value?.type === 'forloopflow' && parentModule.value?.modules?.length === 1)
+		) {
+			return { ...topFlowInput, ...parentState.previewArgs }
 		} else {
-			const parentFlowInput = getFlowInput(parentModules, flowState, args, schema)
-
+			let parentFlowInput = getFlowInput(parentModules, flowState, args, schema)
 			if (parentModule.value.type === 'forloopflow') {
+				let parentFlowInputIter = { ...parentFlowInput }
+				if (parentFlowInputIter.hasOwnProperty('iter')) {
+					parentFlowInputIter['iter_parent'] = parentFlowInputIter['iter']
+					delete parentFlowInputIter['iter']
+				}
+				let topFlowInputIter = { ...topFlowInput }
+				if (topFlowInputIter.hasOwnProperty('iter')) {
+					topFlowInputIter['iter_parent'] = topFlowInputIter['iter']
+					delete topFlowInputIter['iter']
+				}
 				return {
+					...topFlowInputIter,
+					...parentFlowInputIter,
 					iter: {
 						value: "Iteration's value",
 						index: "Iteration's index"
-					},
-					...parentFlowInput
+					}
 				}
 			} else {
-				return parentFlowInput
+				return { ...topFlowInput, ...parentFlowInput }
 			}
 		}
 	} else {
-		return schemaToObject(schema, args)
+		return topFlowInput
 	}
 }
 
-export function getStepPropPicker(
-	flowState: FlowState,
-	parentModule: FlowModule | undefined,
-	previousModule: FlowModule | undefined,
-	id: string,
-	flow: Flow,
-	args: any,
-	include_node: boolean
-): StepPropPicker {
-	const flowInput = getFlowInput(
-		dfs(parentModule?.id, flow),
-		flowState,
-		args,
-		flow.schema as Schema
-	)
-
-	const previousIds = dfs(id, flow, false)
+export function getPreviousIds(id: string, flow: OpenFlow, include_node: boolean): string[] {
+	const df = dfs(id, flow, false)
+	if (!include_node) {
+		df.shift()
+	}
+	return df
 		.map((x) => {
 			let submodules = getAllSubmodules(x)
 				.flat()
@@ -129,9 +125,69 @@ export function getStepPropPicker(
 			}
 		})
 		.flat()
-	if (!include_node) {
-		previousIds.shift()
+}
+
+export function getFailureStepPropPicker(flowState: FlowState, flow: OpenFlow, args: any) {
+	const allIds = flow.value.modules.map((x) => x.id)
+	let priorIds = Object.fromEntries(
+		allIds.map((id) => [id, flowState[id]?.previewResult ?? {}]).reverse()
+	)
+
+	const flowInput = getFlowInput(
+		dfs(flow.value.modules?.[0]?.id, flow),
+		flowState,
+		args,
+		flow.schema as Schema
+	)
+
+	return {
+		pickableProperties: {
+			flow_input: schemaToObject(flow.schema as any, args),
+			priorIds: priorIds,
+			previousId: undefined,
+			hasResume: false
+		},
+		extraLib: `
+/**
+* Error object
+*/
+declare const error: {
+	message: string
+	name: string
+	stack: string
+	step_id: string
+}
+
+/**
+* result by id
+*/
+declare const results = ${JSON.stringify(priorIds)}
+
+/**
+* flow input as an object
+*/
+declare const flow_input = ${JSON.stringify(flowInput)};
+		`
 	}
+}
+
+export function getStepPropPicker(
+	flowState: FlowState,
+	parentModule: FlowModule | undefined,
+	previousModule: FlowModule | undefined,
+	id: string,
+	flow: OpenFlow,
+	args: any,
+	include_node: boolean
+): StepPropPicker {
+	const flowInput = getFlowInput(
+		dfs(parentModule?.id, flow),
+		flowState,
+		args,
+		flow.schema as Schema
+	)
+
+	const previousIds = getPreviousIds(id, flow, include_node)
 
 	let priorIds = Object.fromEntries(
 		previousIds.map((id) => [id, flowState[id]?.previewResult ?? {}]).reverse()

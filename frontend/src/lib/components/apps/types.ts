@@ -1,5 +1,5 @@
 import type { Schema } from '$lib/common'
-import type { Preview } from '$lib/gen'
+import type { Policy, Preview } from '$lib/gen'
 import type { History } from '$lib/history'
 
 import type { Writable } from 'svelte/store'
@@ -14,11 +14,13 @@ import type {
 	ConnectedAppInput,
 	ConnectedInput,
 	EvalAppInput,
+	EvalV2AppInput,
 	InputConnection,
 	ResultAppInput,
 	RowAppInput,
 	Runnable,
 	StaticAppInput,
+	TemplateV2AppInput,
 	UploadAppInput,
 	UserAppInput
 } from './inputType'
@@ -34,7 +36,6 @@ export type Aligned = {
 }
 
 export interface GeneralAppInput {
-	onlyStatic?: boolean
 	tooltip?: string
 	placeholder?: string
 	customTitle?: string
@@ -43,6 +44,7 @@ export interface GeneralAppInput {
 export type ComponentCssProperty = {
 	class?: string
 	style?: string
+	evalClass?: RichConfiguration
 }
 
 export type ComponentCustomCSS<T extends keyof typeof components> = Partial<
@@ -55,25 +57,31 @@ export type Configuration =
 	| UserAppInput
 	| RowAppInput
 	| EvalAppInput
+	| EvalV2AppInput
 	| UploadAppInput
 	| ResultAppInput
+	| TemplateV2AppInput
 
 export type StaticConfiguration = GeneralAppInput & StaticAppInput
-export type RichConfigurationT<T> =
-	| (T & { type: AppInput['type'] })
-	| {
-			type: 'oneOf'
-			selected: string
-			tooltip?: string
-			labels?: Record<string, string>
-			configuration: Record<string, Record<string, T>>
-	  }
+export type OneOfRichConfiguration<T> = {
+	type: 'oneOf'
+	selected: string
+	tooltip?: string
+	labels?: Record<string, string>
+	configuration: Record<string, Record<string, T>>
+}
+
+export type OneOfConfiguration = OneOfRichConfiguration<
+	GeneralAppInput & (StaticAppInput | EvalAppInput | EvalV2AppInput)
+>
+
+export type RichConfigurationT<T> = (T & { type: AppInput['type'] }) | OneOfRichConfiguration<T>
 export type RichConfiguration = RichConfigurationT<Configuration>
 export type RichConfigurations = Record<string, RichConfiguration>
 
 export type StaticRichConfigurations = Record<
 	string,
-	RichConfigurationT<GeneralAppInput & (StaticAppInput | EvalAppInput)>
+	RichConfigurationT<GeneralAppInput & (StaticAppInput | EvalAppInput | EvalV2AppInput)>
 >
 
 export interface BaseAppComponent extends Partial<Aligned> {
@@ -102,16 +110,20 @@ export type GridItem = FilledItem<AppComponent>
 
 export type InlineScript = {
 	content: string
-	language: Preview.language | 'frontend'
+	language: Preview['language'] | 'frontend'
 	path?: string
 	schema?: Schema
+	lock?: string
+	cache_ttl?: number
 	refreshOn?: { id: string; key: string }[]
+	suggestedRefreshOn?: { id: string; key: string }[]
 }
 
 export type AppCssItemName = 'viewer' | 'grid' | AppComponent['type']
 
 export type HiddenRunnable = {
 	name: string
+	transformer?: InlineScript & { language: 'frontend' }
 	// inlineScript?: InlineScript | undefined
 	// type?: 'runnableByName' | 'runnableByPath'
 	fields: Record<string, StaticAppInput | ConnectedAppInput | RowAppInput | UserAppInput>
@@ -124,6 +136,16 @@ export type HiddenRunnable = {
 } & Runnable &
 	RecomputeOthersSource
 
+export type AppTheme =
+	| {
+			type: 'path'
+			path: string
+	  }
+	| {
+			type: 'inlined'
+			css: string
+	  }
+
 export type App = {
 	grid: GridItem[]
 	fullscreen: boolean
@@ -132,10 +154,14 @@ export type App = {
 		name: string
 		inlineScript: InlineScript
 	}>
+
 	//TODO: should be called hidden runnables but migration tbd
 	hiddenInlineScripts: Array<HiddenRunnable>
 	css?: Partial<Record<AppCssItemName, Record<string, ComponentCssProperty>>>
 	subgrids?: Record<string, GridItem[]>
+	theme: AppTheme | undefined
+	hideLegacyTopBar?: boolean | undefined
+	mobileViewOnSmallerScreens?: boolean | undefined
 }
 
 export type ConnectingInput = {
@@ -150,6 +176,19 @@ export interface CancelablePromise<T> extends Promise<T> {
 	cancel: () => void
 }
 
+export type ListContext = Writable<{
+	index: number
+	value: any
+	disabled: boolean
+}>
+
+export type ListInputs = {
+	set: (id: string, value: any) => void
+	remove: (id: string) => void
+}
+
+export type GroupContext = { id: string; context: Writable<Record<string, any>> }
+
 export type AppViewerContext = {
 	worldStore: Writable<World>
 	app: Writable<App>
@@ -162,13 +201,14 @@ export type AppViewerContext = {
 	mode: Writable<EditorMode>
 	connectingInput: Writable<ConnectingInput>
 	breakpoint: Writable<EditorBreakpoint>
+	bgRuns: Writable<string[]>
 	runnableComponents: Writable<
 		Record<
 			string,
 			{
 				autoRefresh: boolean
 				refreshOnStart?: boolean
-				cb: (inlineScript?: InlineScript) => CancelablePromise<void>
+				cb: ((inlineScript?: InlineScript, setRunnableJob?: boolean) => CancelablePromise<void>)[]
 			}
 		>
 	>
@@ -177,10 +217,26 @@ export type AppViewerContext = {
 	workspace: string
 	onchange: (() => void) | undefined
 	isEditor: boolean
-	jobs: Writable<{ job: string; component: string; result?: string; error?: string }[]>
+	jobs: Writable<string[]>
+	// jobByComponent: Writable<Record<string, string>>,
+	jobsById: Writable<
+		Record<
+			string,
+			{
+				job: string
+				component: string
+				result?: string
+				error?: any
+				transformer?: { result?: string; error?: string }
+				created_at?: number
+				started_at?: number
+				duration_ms?: number
+			}
+		>
+	>
 	noBackend: boolean
-	errorByComponent: Writable<Record<string, { error: string; componentId: string }>>
-	openDebugRun: Writable<((componentID: string) => void) | undefined>
+	errorByComponent: Writable<Record<string, { id?: string; error: string }>>
+	openDebugRun: Writable<((jobID: string) => void) | undefined>
 	focusedGrid: Writable<FocusedGrid | undefined>
 	stateId: Writable<number>
 	parentWidth: Writable<number>
@@ -196,19 +252,62 @@ export type AppViewerContext = {
 				setCode?: (value: string) => void
 				onDelete?: () => void
 				setValue?: (value: any) => void
+				setSelectedIndex?: (index: number) => void
+				openModal?: () => void
+				closeModal?: () => void
+				open?: () => void
+				close?: () => void
+				validate?: (key: string) => void
+				invalidate?: (key: string, error: string) => void
+				validateAll?: () => void
+				clearFiles?: () => void
+				showToast?: (message: string, error?: boolean) => void
+				recompute?: () => void
+				askNewResource?: () => void
+				setGroupValue?: (key: string, value: any) => void
 			}
 		>
 	>
 	hoverStore: Writable<string | undefined>
 	allIdsInPath: Writable<string[]>
+	darkMode: Writable<boolean>
+	cssEditorOpen: Writable<boolean>
+	previewTheme: Writable<string | undefined>
+	debuggingComponents: Writable<Record<string, number>>
+	replaceStateFn?: ((url: string) => void) | undefined
+	gotoFn?: ((url: string, opt?: Record<string, any> | undefined) => void) | undefined
+	policy: Policy
+
+	recomputeAllContext: Writable<{
+		onClick?: () => void
+		componentNumber?: number | undefined
+		interval?: number | undefined
+		refreshing?: string[] | undefined
+		setInter?: (interval: number) => void | undefined
+		progress?: number | undefined
+		loading?: boolean | undefined
+	}>
 }
 
 export type AppEditorContext = {
+	yTop: Writable<number>
+	runnableJobEditorPanel: Writable<{
+		focused: boolean
+		jobs: Record<string, string>
+		frontendJobs: Record<string, any>
+		width: number
+	}>
+	evalPreview: Writable<Record<string, any>>
+	componentActive: Writable<boolean>
+	dndItem: Writable<Record<string, (x: number, y: number, topY: number) => void>>
+	refreshComponents: Writable<(() => void) | undefined>
 	history: History<App> | undefined
 	pickVariableCallback: Writable<((path: string) => void) | undefined>
-	ontextfocus: Writable<(() => void) | undefined>
 	selectedComponentInEditor: Writable<string | undefined>
 	movingcomponents: Writable<string[] | undefined>
+	jobsDrawerOpen: Writable<boolean>
+	scale: Writable<number>
+	stylePanel: () => any
 }
 
 export type FocusedGrid = { parentComponentId: string; subGridIndex: number }

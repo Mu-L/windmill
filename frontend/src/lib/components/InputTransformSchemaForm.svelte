@@ -3,13 +3,16 @@
 	import { VariableService, type InputTransform } from '$lib/gen'
 	import { workspaceStore } from '$lib/stores'
 	import { allTrue } from '$lib/utils'
-	import { faPlus } from '@fortawesome/free-solid-svg-icons'
+	import { createEventDispatcher } from 'svelte'
 	import { Button } from './common'
+	import StepInputsGen from './copilot/StepInputsGen.svelte'
+	import type { PickableProperties } from './flows/previousResults'
 	import InputTransformForm from './InputTransformForm.svelte'
 	import ItemPicker from './ItemPicker.svelte'
 	import VariableEditor from './VariableEditor.svelte'
+	import { Plus } from 'lucide-svelte'
 
-	export let schema: Schema
+	export let schema: Schema | { properties?: Record<string, any> }
 	export let args: Record<string, InputTransform | any> = {}
 
 	export let isValid: boolean = true
@@ -18,15 +21,24 @@
 
 	export let filter: string[] | undefined = undefined
 	export let noDynamicToggle = false
+	export let pickableProperties: PickableProperties | undefined = undefined
+	export let enableAi = false
 
 	let clazz: string = ''
 	export { clazz as class }
 
 	let inputCheck: { [id: string]: boolean } = {}
+
+	const dispatch = createEventDispatcher()
+
 	$: isValid = allTrue(inputCheck) ?? false
 
 	$: if (args == undefined || typeof args !== 'object') {
 		args = {}
+	}
+
+	export function setArgs(nargs: Record<string, InputTransform | any>) {
+		args = nargs
 	}
 
 	function removeExtraKey() {
@@ -54,10 +66,25 @@
 </script>
 
 <div class="w-full {clazz}">
+	{#if enableAi}
+		<StepInputsGen
+			{pickableProperties}
+			argNames={keys
+				? keys.filter(
+						(argName) =>
+							Object.keys(schema.properties ?? {}).includes(argName) &&
+							Object.keys(args ?? {}).includes(argName) &&
+							((args[argName].type === 'static' && !args[argName].value) ||
+								(args[argName].type === 'javascript' && !args[argName].expr))
+				  )
+				: []}
+			{schema}
+		/>
+	{/if}
 	{#if keys.length > 0}
 		{#each keys as argName (argName)}
 			{#if (!filter || filter.includes(argName)) && Object.keys(schema.properties ?? {}).includes(argName)}
-				<div class="z-10">
+				<div class="z-10 pt-4">
 					<InputTransformForm
 						{previousModuleId}
 						bind:arg={args[argName]}
@@ -69,12 +96,18 @@
 						{itemPicker}
 						bind:pickForField
 						{noDynamicToggle}
+						{pickableProperties}
+						{enableAi}
+						on:change={(e) => {
+							const { argName } = e.detail
+							dispatch('changeArg', { argName })
+						}}
 					/>
 				</div>
 			{/if}
 		{/each}
 	{:else}
-		<div class="text-gray-500 text-sm">No inputs</div>
+		<div class="text-tertiary text-sm">No inputs</div>
 	{/if}
 </div>
 
@@ -95,18 +128,18 @@
 >
 	<div
 		slot="submission"
-		class="flex flex-row-reverse w-full bg-white border-t border-gray-200 rounded-bl-lg rounded-br-lg"
+		class="flex flex-row-reverse w-full bg-surface border-t border-gray-200 rounded-bl-lg rounded-br-lg"
 	>
 		<Button
 			variant="border"
 			color="blue"
 			size="sm"
-			startIcon={{ icon: faPlus }}
+			startIcon={{ icon: Plus }}
 			on:click={() => {
 				variableEditor?.initNew?.()
 			}}
 		>
-			New variable
+			New Variable
 		</Button>
 	</div>
 </ItemPicker>

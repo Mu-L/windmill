@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { page } from '$app/stores'
 	import { sendUserToast } from '$lib/toast'
 	import { onMount } from 'svelte'
@@ -22,19 +22,34 @@
 		if (rd) {
 			localStorage.removeItem('rd')
 		}
+		const closeUponLogin = localStorage.getItem('closeUponLogin') == 'true'
 		if (error) {
 			sendUserToast(`Error trying to login with ${clientName} ${error}`, true)
+			if (closeUponLogin) {
+				goto('/user/close')
+				return
+			}
 			await logoutWithRedirect(rd ?? undefined)
 		} else if (code && state && clientName) {
 			try {
 				await UserService.loginWithOauth({ requestBody: { code, state }, clientName })
 			} catch (e) {
+				if (closeUponLogin) {
+					goto('/user/close')
+					return
+				}
 				await logoutWithRedirect(rd ?? undefined)
 				sendUserToast(e.body ?? e.message, true)
 				return
 			}
+
 			if (rd?.startsWith('http')) {
-				goto(rd)
+				if (closeUponLogin) {
+					window.opener.postMessage({ type: 'success' }, '*')
+					window.close()
+					return
+				}
+				window.location.href = rd
 				return
 			}
 			if ($workspaceStore) {
@@ -56,11 +71,21 @@
 				const allWorkspaces = $usersWorkspaceStore?.workspaces
 				if (allWorkspaces?.length == 1) {
 					$workspaceStore = allWorkspaces[0].id
+					if (closeUponLogin) {
+						window.opener.postMessage({ type: 'success' }, '*')
+						window.close()
+						return
+					}
 					if (rd) {
 						goto(rd, { replaceState: true })
 					} else {
 						goto('/', { replaceState: true })
 					}
+					return
+				}
+
+				if (closeUponLogin) {
+					window.close()
 					return
 				}
 
@@ -71,10 +96,24 @@
 				}
 			}
 		} else {
+			if (closeUponLogin) {
+				goto('/user/close')
+				return
+			}
 			sendUserToast('Missing code or state as query params', true)
 			await logoutWithRedirect(rd ?? undefined)
 		}
 	})
+
+	const darkMode =
+		window.localStorage.getItem('dark-mode') ??
+		(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+
+	if (darkMode === 'dark') {
+		document.documentElement.classList.add('dark')
+	} else {
+		document.documentElement.classList.remove('dark')
+	}
 </script>
 
 <CenteredModal title="Login from {clientName}">

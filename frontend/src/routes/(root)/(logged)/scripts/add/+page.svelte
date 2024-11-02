@@ -1,12 +1,15 @@
 <script lang="ts">
-	import { NewScript, Script, ScriptService } from '$lib/gen'
+	import { type NewScript, ScriptService, type Script } from '$lib/gen'
 
 	import { page } from '$app/stores'
-	import { workspaceStore } from '$lib/stores'
+	import { defaultScripts, initialArgsStore, workspaceStore } from '$lib/stores'
 	import ScriptBuilder from '$lib/components/ScriptBuilder.svelte'
 	import type { Schema } from '$lib/common'
-	import { decodeState, emptySchema } from '$lib/utils'
-	import { dirtyStore } from '$lib/components/common/confirmationModal/dirtyStore'
+	import { decodeState, emptySchema, emptyString } from '$lib/utils'
+	import { goto } from '$lib/navigation'
+	import { replaceState } from '$app/navigation'
+	import UnsavedConfirmationModal from '$lib/components/common/confirmationModal/UnsavedConfirmationModal.svelte'
+	import type { ScheduleTrigger } from '$lib/components/triggers'
 
 	// Default
 	let schema: Schema = emptySchema()
@@ -15,26 +18,50 @@
 	const hubPath = $page.url.searchParams.get('hub')
 	const showMeta = /true|1/i.test($page.url.searchParams.get('show_meta') ?? '0')
 
+	let initialArgs = {}
+
+	if ($initialArgsStore) {
+		initialArgs = $initialArgsStore
+		$initialArgsStore = undefined
+	}
+
 	const path = $page.url.searchParams.get('path')
 
-	const initialState = $page.url.searchParams.get('state')
+	const initialState = $page.url.hash != '' ? $page.url.hash.slice(1) : undefined
 
 	let scriptBuilder: ScriptBuilder | undefined = undefined
+	let savedPrimarySchedule: ScheduleTrigger | undefined = undefined
+
+	function decodeStateAndHandleError(state) {
+		try {
+			const decoded = decodeState(state)
+			savedPrimarySchedule = decoded.primarySchedule
+			return decoded
+		} catch (e) {
+			console.error('Error decoding state', e)
+			return defaultScript()
+		}
+	}
+
+	function defaultScript() {
+		return {
+			hash: '',
+			path: path ?? '',
+			summary: '',
+			content: '',
+			schema: schema,
+			is_template: false,
+			extra_perms: {},
+			language:
+				$defaultScripts?.order?.filter(
+					(x) => $defaultScripts?.hidden == undefined || !$defaultScripts.hidden.includes(x)
+				)?.[0] ?? 'bun',
+			kind: 'script'
+		}
+	}
 
 	let script: NewScript =
-		!path && initialState != undefined
-			? decodeState(initialState)
-			: {
-					hash: '',
-					path: path ?? '',
-					summary: '',
-					content: '',
-					schema: schema,
-					is_template: false,
-					extra_perms: {},
-					language: 'deno',
-					kind: Script.kind.SCRIPT
-			  }
+		!path && initialState != undefined ? decodeStateAndHandleError(initialState) : defaultScript()
 
 	async function loadTemplate(): Promise<void> {
 		if (templatePath) {
@@ -42,7 +69,9 @@
 				workspace: $workspaceStore!,
 				path: templatePath
 			})
-			script.summary = `Copy of ${template.summary}`
+
+			// Only copy the summary if it's not empty
+			script.summary = !emptyString(template.summary) ? `Copy of ${template.summary}` : ''
 			script.description = template.description
 			script.content = template.content
 			script.schema = template.schema
@@ -59,7 +88,7 @@
 			script.description = `Fork of ${hubPath}`
 			script.content = content
 			script.summary = summary ?? ''
-			script.language = language as Script.language
+			script.language = language as Script['language']
 			scriptBuilder?.setCode(script.content)
 		}
 	}
@@ -71,12 +100,27 @@
 			loadTemplate()
 		}
 	}
-	$dirtyStore = true
+	let savedScript: Script | undefined = undefined
 </script>
 
 <ScriptBuilder
+	{initialArgs}
 	bind:this={scriptBuilder}
 	lockedLanguage={templatePath != null || hubPath != null}
+	on:deploy={(e) => {
+		let newHash = e.detail
+		goto(`/scripts/get/${newHash}?workspace=${$workspaceStore}`)
+	}}
+	on:saveInitial={(e) => {
+		let path = e.detail
+		goto(`/scripts/edit/${path}`)
+	}}
+	bind:savedScript
+	searchParams={$page.url.searchParams}
 	{script}
 	{showMeta}
-/>
+	{savedPrimarySchedule}
+	replaceStateFn={(path) => replaceState(path, $page.state)}
+>
+	<UnsavedConfirmationModal savedValue={savedScript} modifiedValue={script} />
+</ScriptBuilder>

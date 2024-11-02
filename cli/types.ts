@@ -1,16 +1,27 @@
 // deno-lint-ignore-file no-explicit-any
 
-import { colors, log, path, yamlParse, yamlStringify } from "./deps.ts";
+import {
+  Diff,
+  SEP,
+  colors,
+  log,
+  path,
+  yamlParseContent,
+  yamlStringify,
+} from "./deps.ts";
 import { pushApp } from "./apps.ts";
 import { pushFolder } from "./folder.ts";
 import { pushFlow } from "./flow.ts";
 import { pushResource } from "./resource.ts";
 import { pushResourceType } from "./resource-type.ts";
 import { pushVariable } from "./variable.ts";
-import * as Diff from "npm:diff";
 import { yamlOptions } from "./sync.ts";
 import { showDiffs } from "./main.ts";
-import { deepEqual } from "./utils.ts";
+import { deepEqual, isFileResource } from "./utils.ts";
+import { pushSchedule } from "./schedule.ts";
+import { pushWorkspaceUser } from "./user.ts";
+import { pushGroup } from "./user.ts";
+import { pushWorkspaceSettings, pushWorkspaceKey } from "./settings.ts";
 
 export interface DifferenceCreate {
   type: "CREATE";
@@ -34,6 +45,7 @@ export interface DifferenceChange {
 export type Difference = DifferenceCreate | DifferenceRemove | DifferenceChange;
 
 export type GlobalOptions = {
+  baseUrl: string | undefined;
   workspace: string | undefined;
   token: string | undefined;
 };
@@ -63,6 +75,10 @@ export function isSuperset(
 
 export function showDiff(local: string, remote: string) {
   let finalString = "";
+  if (local?.length > 20000 || remote?.length > 20000) {
+    log.info("Diff too large to display");
+    return;
+  }
   for (const part of Diff.diffLines(local, remote)) {
     if (part.removed) {
       // print red if removed without newline
@@ -92,37 +108,54 @@ export function showConflict(path: string, local: string, remote: string) {
   log.info("\n");
 }
 
-export function pushObj(
+export async function pushObj(
   workspace: string,
   p: string,
   befObj: any,
   newObj: any,
   plainSecrets: boolean,
-  checkForCreate: boolean
+  alreadySynced: string[],
+  message?: string
 ) {
   const typeEnding = getTypeStrFromPath(p);
 
   if (typeEnding === "app") {
-    pushApp(workspace, p, befObj, newObj, checkForCreate);
+    const appName = p.split(".app" + SEP)[0];
+    await pushApp(workspace, appName, appName + ".app", message);
   } else if (typeEnding === "folder") {
-    pushFolder(workspace, p, befObj, newObj, checkForCreate);
+    await pushFolder(workspace, p, befObj, newObj);
   } else if (typeEnding === "variable") {
-    pushVariable(workspace, p, befObj, newObj, plainSecrets, checkForCreate);
+    await pushVariable(workspace, p, befObj, newObj, plainSecrets);
   } else if (typeEnding === "flow") {
-    const flowName = p.split(".flow/")[0];
-    pushFlow(workspace, flowName, flowName + ".flow");
+    const flowName = p.split(".flow" + SEP)[0];
+    await pushFlow(workspace, flowName, flowName + ".flow", message);
   } else if (typeEnding === "resource") {
-    pushResource(workspace, p, befObj, newObj, checkForCreate);
+    if (!alreadySynced.includes(p)) {
+      alreadySynced.push(p);
+      await pushResource(workspace, p, befObj, newObj);
+    }
   } else if (typeEnding === "resource-type") {
-    pushResourceType(workspace, p, befObj, newObj, checkForCreate);
+    await pushResourceType(workspace, p, befObj, newObj);
+  } else if (typeEnding === "schedule") {
+    await pushSchedule(workspace, p, befObj, newObj);
+  } else if (typeEnding === "user") {
+    await pushWorkspaceUser(workspace, p, befObj, newObj);
+  } else if (typeEnding === "group") {
+    await pushGroup(workspace, p, befObj, newObj);
+  } else if (typeEnding === "settings") {
+    await pushWorkspaceSettings(workspace, p, befObj, newObj);
+  } else if (typeEnding === "encryption_key") {
+    await pushWorkspaceKey(workspace, p, befObj, newObj);
   } else {
-    throw new Error("infer type unreachable");
+    throw new Error(
+      `The item ${p} has an unrecognized type ending ${typeEnding}`
+    );
   }
 }
 
 export function parseFromPath(p: string, content: string): any {
   return p.endsWith(".yaml")
-    ? yamlParse(content)
+    ? yamlParseContent(p, content)
     : p.endsWith(".json")
     ? JSON.parse(content)
     : content;
@@ -131,7 +164,7 @@ export function parseFromFile(p: string): any {
   if (p.endsWith(".json")) {
     return JSON.parse(Deno.readTextFileSync(p));
   } else if (p.endsWith(".yaml") || p.endsWith(".yml")) {
-    return yamlParse(Deno.readTextFileSync(p));
+    return yamlParseContent(p, Deno.readTextFileSync(p));
   } else {
     throw new Error("Could not read file " + p);
   }
@@ -145,16 +178,31 @@ export function getTypeStrFromPath(
   | "resource"
   | "resource-type"
   | "folder"
-  | "app" {
-  if (p.includes(".flow/")) {
+  | "app"
+  | "schedule"
+  | "user"
+  | "group"
+  | "settings"
+  | "encryption_key" {
+  if (p.includes(".flow" + SEP)) {
     return "flow";
+  }
+  if (p.includes(".app" + SEP)) {
+    return "app";
   }
   const parsed = path.parse(p);
   if (
     parsed.ext == ".go" ||
     parsed.ext == ".ts" ||
     parsed.ext == ".sh" ||
-    parsed.ext == ".py"
+    parsed.ext == ".py" ||
+    parsed.ext == ".sql" ||
+    parsed.ext == ".gql" ||
+    parsed.ext == ".ps1" ||
+    parsed.ext == ".js" ||
+    parsed.ext == ".php" ||
+    parsed.ext == ".rs" ||
+    (parsed.ext == ".yml" && parsed.name.split(".").pop() == "playbook")
   ) {
     return "script";
   }
@@ -169,10 +217,18 @@ export function getTypeStrFromPath(
     typeEnding === "variable" ||
     typeEnding === "resource" ||
     typeEnding === "resource-type" ||
-    typeEnding === "app"
+    typeEnding === "app" ||
+    typeEnding === "schedule" ||
+    typeEnding === "user" ||
+    typeEnding === "group" ||
+    typeEnding === "settings" ||
+    typeEnding === "encryption_key"
   ) {
     return typeEnding;
   } else {
+    if (isFileResource(p)) {
+      return "resource";
+    }
     throw new Error("Could not infer type of path " + JSON.stringify(parsed));
   }
 }
@@ -185,4 +241,11 @@ export function removeType(str: string, type: string) {
     throw new Error(str + " does not end with ." + type + ".(yaml|json)");
   }
   return str.slice(0, str.length - type.length - 6);
+}
+
+export function removePathPrefix(str: string, prefix: string) {
+  if (!str.startsWith(prefix + "/")) {
+    throw new Error(str + " does not start with " + prefix);
+  }
+  return str.slice(prefix.length + 1);
 }

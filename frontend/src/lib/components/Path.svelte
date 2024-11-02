@@ -12,32 +12,43 @@
 		ResourceService,
 		ScheduleService,
 		ScriptService,
-		VariableService
+		HttpTriggerService,
+		VariableService,
+		WebsocketTriggerService
 	} from '$lib/gen'
 	import { superadmin, userStore, workspaceStore } from '$lib/stores'
-	import { faEye, faPlus } from '@fortawesome/free-solid-svg-icons'
-	import { createEventDispatcher } from 'svelte'
-	import { Icon } from 'svelte-awesome'
+	import { createEventDispatcher, getContext } from 'svelte'
 	import { writable } from 'svelte/store'
-	import { Button, Drawer, DrawerContent } from './common'
+	import { Alert, Button, Drawer, DrawerContent } from './common'
 	import Badge from './common/badge/Badge.svelte'
-	import ToggleButton from './common/toggleButton/ToggleButton.svelte'
-	import ToggleButtonGroup from './common/toggleButton/ToggleButtonGroup.svelte'
+	import ToggleButton from './common/toggleButton-v2/ToggleButton.svelte'
+	import ToggleButtonGroup from './common/toggleButton-v2/ToggleButtonGroup.svelte'
 	import FolderEditor from './FolderEditor.svelte'
 	import { random_adj } from './random_positive_adjetive'
-	import Required from './Required.svelte'
-	import Tooltip from './Tooltip.svelte'
+	import { Eye, Folder, Plus, SearchCode, User } from 'lucide-svelte'
 
-	type PathKind = 'resource' | 'script' | 'variable' | 'flow' | 'schedule' | 'app' | 'raw_app'
+	type PathKind =
+		| 'resource'
+		| 'script'
+		| 'variable'
+		| 'flow'
+		| 'schedule'
+		| 'app'
+		| 'raw_app'
+		| 'http_trigger'
+		| 'websocket_trigger'
 	let meta: Meta | undefined = undefined
+	export let fullNamePlaceholder: string | undefined = undefined
 	export let namePlaceholder = ''
 	export let initialPath: string
 	export let path = ''
 	export let error = ''
 	export let disabled = false
 	export let checkInitialPathExistence = false
-
+	export let autofocus = true
+	export let dirty = false
 	export let kind: PathKind
+	export let hideUser: boolean = false
 
 	let inputP: HTMLInputElement | undefined = undefined
 
@@ -67,6 +78,7 @@
 	}
 
 	function handleKeyUp(event: KeyboardEvent) {
+		setDirty()
 		const key = event.key
 
 		if (key === 'Enter') {
@@ -75,34 +87,54 @@
 		}
 	}
 
+	export function setName(x: string) {
+		if (meta) {
+			meta.name = x
+			onMetaChange()
+		}
+	}
+
 	export async function reset() {
 		if (path == '' || path == 'u//') {
 			if ($lastMetaUsed == undefined || $lastMetaUsed.owner != $userStore?.username) {
 				meta = {
-					ownerKind: 'user',
-					name: random_adj() + '_' + namePlaceholder,
+					ownerKind: hideUser ? 'folder' : 'user',
+					name: fullNamePlaceholder ?? random_adj() + '_' + namePlaceholder,
 					owner: ''
 				}
-				if ($userStore?.username?.includes('@')) {
-					meta.owner = $userStore!.username.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '')
-				} else {
-					meta.owner = $userStore!.username!
+				if (!hideUser) {
+					if ($userStore?.username?.includes('@')) {
+						meta.owner = $userStore!.username.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '')
+					} else {
+						meta.owner = $userStore!.username!
+					}
 				}
 			} else {
-				meta = { ...$lastMetaUsed, name: random_adj() + '_' + namePlaceholder }
+				if ($lastMetaUsed.ownerKind == 'user' && hideUser) {
+					meta = {
+						ownerKind: 'folder',
+						owner: '',
+						name: fullNamePlaceholder ?? random_adj() + '_' + namePlaceholder
+					}
+				} else {
+					meta = {
+						...$lastMetaUsed,
+						name: fullNamePlaceholder ?? random_adj() + '_' + namePlaceholder
+					}
+				}
 			}
 			let newMeta = { ...meta }
 			while (await pathExists(metaToPath(newMeta), kind)) {
 				disabled = true
 				error = 'finding an available name...'
-				newMeta.name = random_adj() + '_' + namePlaceholder
+				newMeta.name = random_adj() + '_' + (fullNamePlaceholder ?? namePlaceholder)
 			}
 			error = ''
 			disabled = false
 			meta = newMeta
 			path = metaToPath(meta)
 		} else {
-			meta = pathToMeta(path)
+			meta = pathToMeta(path, hideUser)
 		}
 	}
 
@@ -119,11 +151,18 @@
 					workspace: $workspaceStore!
 				})
 			)
-				.filter((x) => x != initialFolder)
+				.filter(
+					(x) =>
+						x != initialFolder &&
+						x != 'app_groups' &&
+						x != 'app_custom' &&
+						x != 'app_themes' &&
+						x != 'app_custom'
+				)
 				.map((x) => ({
 					name: x,
 					write:
-						($userStore?.folders?.includes(x) == true ?? false) ||
+						$userStore?.folders?.includes(x) == true ||
 						($userStore?.is_admin ?? false) ||
 						($userStore?.is_super_admin ?? false)
 				}))
@@ -176,6 +215,16 @@
 			return await ScheduleService.existsSchedule({ workspace: $workspaceStore!, path: path })
 		} else if (kind == 'app') {
 			return await AppService.existsApp({ workspace: $workspaceStore!, path: path })
+		} else if (kind == 'http_trigger') {
+			return await HttpTriggerService.existsHttpTrigger({
+				workspace: $workspaceStore!,
+				path: path
+			})
+		} else if (kind == 'websocket_trigger') {
+			return await WebsocketTriggerService.existsWebsocketTrigger({
+				workspace: $workspaceStore!,
+				path: path
+			})
 		} else {
 			return false
 		}
@@ -189,10 +238,10 @@
 			error = 'This name is not valid'
 			return false
 		} else if (meta.owner == '' && meta.ownerKind == 'folder') {
-			error = 'Folder need to be chosen'
+			error = 'Folder needs to be chosen'
 			return false
 		} else if (meta.owner == '' && meta.ownerKind == 'group') {
-			error = 'Group need to be chosen'
+			error = 'Group needs to be chosen'
 			return false
 		} else {
 			return true
@@ -208,13 +257,14 @@
 
 	function initPath() {
 		if (path != undefined && path != '') {
-			meta = pathToMeta(path)
+			meta = pathToMeta(path, hideUser)
+			onMetaChange()
 			return
 		}
 		if (initialPath == undefined || initialPath == '') {
 			reset()
 		} else {
-			meta = pathToMeta(initialPath)
+			meta = pathToMeta(initialPath, hideUser)
 			onMetaChange()
 			path = initialPath
 		}
@@ -237,6 +287,14 @@
 			meta.owner = newFolderName
 		}
 	}
+
+	function setDirty() {
+		!dirty && (dirty = true)
+	}
+
+	const openSearchWithPrefilledText: (t?: string) => void = getContext(
+		'openSearchWithPrefilledText'
+	)
 </script>
 
 <Drawer bind:this={newFolder}>
@@ -248,14 +306,9 @@
 		}}
 	>
 		{#if !folderCreated}
-			<div class="flex flex-row">
-				<input class="mr-2" placeholder="New folder name" bind:value={newFolderName} />
-				<Button
-					size="md"
-					startIcon={{ icon: faPlus }}
-					disabled={!newFolderName}
-					on:click={addFolder}
-				>
+			<div class="flex flex-col gap-2">
+				<input placeholder="New folder name" bind:value={newFolderName} />
+				<Button size="md" startIcon={{ icon: Plus }} disabled={!newFolderName} on:click={addFolder}>
 					New&nbsp;folder
 				</Button>
 			</div>
@@ -272,21 +325,20 @@
 </Drawer>
 
 <div>
-	<div class="flex flex-col sm:flex-row items-center gap-2 sm:gap-4 pb-0 mb-1">
+	<div class="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 pb-0 mb-1">
 		{#if meta != undefined}
-			<div class="flex gap-4 shrink">
-				<!-- svelte-ignore a11y-label-has-associated-control -->
-				<label class="block">
-					<span class="text-gray-700 text-sm whitespace-nowrap">Owner</span>
-
+			<!-- svelte-ignore a11y-label-has-associated-control -->
+			{#if !hideUser}
+				<div class="block">
 					<ToggleButtonGroup
 						class="mt-0.5"
 						bind:selected={meta.ownerKind}
 						on:selected={(e) => {
+							setDirty()
 							const kind = e.detail
 							if (meta) {
 								if (kind === 'folder') {
-									meta.owner = $userStore?.folders?.[0] ?? ''
+									meta.owner = folders?.[0]?.name ?? ''
 								} else if (kind === 'group') {
 									meta.owner = 'all'
 								} else {
@@ -295,32 +347,45 @@
 							}
 						}}
 					>
-						<ToggleButton light size="xs" value="user" position="left">User</ToggleButton>
+						<ToggleButton
+							icon={User}
+							{disabled}
+							light
+							size="xs"
+							value="user"
+							position="left"
+							label="User"
+						/>
 						<!-- <ToggleButton light size="xs" value="group" position="center">Group</ToggleButton> -->
-						<ToggleButton light size="xs" value="folder" position="right">Folder</ToggleButton>
+						<ToggleButton
+							icon={Folder}
+							{disabled}
+							light
+							size="xs"
+							value="folder"
+							position="right"
+							label="Folder"
+						/>
 					</ToggleButtonGroup>
-				</label>
+				</div>
+			{/if}
+			{#if !hideUser}
+				<div class="text-xl">/</div>
+			{/if}
+			<div>
 				{#if meta.ownerKind === 'user'}
 					<label class="block shrink min-w-0">
-						<span class="text-gray-700 text-sm">User</span>
 						<input
 							class="!w-36"
 							type="text"
 							bind:value={meta.owner}
 							placeholder={$userStore?.username ?? ''}
-							disabled={!($superadmin || ($userStore?.is_admin ?? false))}
+							disabled={disabled || !($superadmin || ($userStore?.is_admin ?? false))}
+							on:keydown={setDirty}
 						/>
 					</label>
 				{:else if meta.ownerKind === 'folder'}
 					<label class="block grow w-48">
-						<span class="text-gray-700 text-sm"
-							>Folder <Tooltip
-								documentationLink="https://docs.windmill.dev/docs/core_concepts/groups_and_folders"
-								>Read and write permissions are given to groups and users at the folder level and
-								shared by all items inside the folder.</Tooltip
-							></span
-						>
-
 						<div class="flex flex-row items-center gap-1 w-full">
 							<select class="grow w-full" {disabled} bind:value={meta.owner}>
 								{#if folders?.length == 0}
@@ -334,37 +399,36 @@
 								title="View folder"
 								btnClasses="!p-1.5"
 								variant="border"
+								color="light"
 								size="xs"
 								disabled={!meta.owner || meta.owner == ''}
 								on:click={viewFolder.openDrawer}
-							>
-								<Icon scale={0.8} data={faEye} /></Button
-							>
+								iconOnly
+								startIcon={{ icon: Eye }}
+							/>
 							<Button
 								title="New folder"
 								btnClasses="!p-1.5"
 								variant="border"
+								color="light"
 								size="xs"
 								{disabled}
 								on:click={newFolder.openDrawer}
-							>
-								<Icon scale={0.8} data={faPlus} /></Button
-							></div
-						>
+								iconOnly
+								startIcon={{ icon: Plus }}
+							/>
+						</div>
 					</label>
 				{/if}
 			</div>
+			<span class="text-xl">/</span>
 			<label class="block grow w-full max-w-md">
-				<span class="text-gray-700 text-sm">
-					Name
-					<Required required={true} />
-				</span>
 				<!-- svelte-ignore a11y-autofocus -->
 				<input
 					{disabled}
 					type="text"
 					id="path"
-					autofocus
+					{autofocus}
 					bind:this={inputP}
 					autocomplete="off"
 					on:keyup={handleKeyUp}
@@ -382,7 +446,7 @@
 		<div class="flex justify-start w-full">
 			<Badge
 				color="gray"
-				class="center-center !bg-gray-300 !text-gray-600 !w-[70px] !h-[24px] rounded-r-none"
+				class="center-center !bg-surface-secondary !text-tertiary !w-[70px] !h-[24px] rounded-r-none border"
 			>
 				Full path
 			</Badge>
@@ -398,8 +462,28 @@
 			/>
 			<!-- <span class="font-mono text-sm break-all">{path}</span> -->
 		</div>
-		<div class="text-red-600 text-2xs">{error}</div>
+		<div class="text-red-600 dark:text-red-400 text-2xs mt-1.5">{error}</div>
 	</div>
+
+	{#if kind != 'app' && kind != 'schedule' && kind != 'http_trigger' && kind != 'websocket_trigger' && initialPath != '' && initialPath != undefined && initialPath != path}
+		<Alert type="warning" class="mt-4" title="Moving may break other items relying on it">
+			You are renaming an item that may be depended upon by other items. This may break apps, flows
+			or resources. Find if it used elsewhere using the content search. Note that linked variables
+			and resources (having the same path) are automatically moved together.
+			<div class="flex pt-2">
+				<Button
+					variant="border"
+					color="dark"
+					on:click={() => {
+						openSearchWithPrefilledText('#')
+					}}
+					startIcon={{ icon: SearchCode }}
+				>
+					Search
+				</Button>
+			</div>
+		</Alert>
+	{/if}
 </div>
 
 <style>

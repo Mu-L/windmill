@@ -1,9 +1,11 @@
 import type {
 	App,
 	BaseAppComponent,
+	ComponentCustomCSS,
 	ConnectingInput,
 	EditorBreakpoint,
 	FocusedGrid,
+	GeneralAppInput,
 	GridItem
 } from '../types'
 import {
@@ -12,30 +14,73 @@ import {
 	getRecommendedDimensionsByComponent,
 	type AppComponent,
 	type BaseComponent,
-	type InitialAppComponent
+	type InitialAppComponent,
+	type TypedComponent
 } from './component'
 import { gridColumns } from '../gridUtils'
 import { allItems } from '../utils'
 import type { Output, World } from '../rx'
-import gridHelp from '../svelte-grid/utils/helper'
-import type { FilledItem } from '../svelte-grid/types'
-import type { EvalAppInput, StaticAppInput } from '../inputType'
+import type { FilledItem, Size } from '../svelte-grid/types'
+import type {
+	StaticAppInput,
+	EvalAppInput,
+	EvalV2AppInput,
+	InputConnectionEval,
+	StaticAppInputOnDemand,
+	AppInputs
+} from '../inputType'
 import { get, type Writable } from 'svelte/store'
 import { deepMergeWithPriority } from '$lib/utils'
 import { sendUserToast } from '$lib/toast'
 import { getNextId } from '$lib/components/flows/idUtils'
+import { enterpriseLicense } from '$lib/stores'
+import gridHelp from '../svelte-grid/utils/helper'
 
+export function findComponentSettings(app: App, id: string | undefined) {
+	if (!id) return undefined
+	if (app?.grid) {
+		const gridItem = app.grid.find((x) => x.data?.id === id)
+		if (gridItem) {
+			return { item: gridItem, parent: undefined }
+		}
+	}
+
+	if (app?.subgrids) {
+		for (const key of Object.keys(app.subgrids ?? {})) {
+			const gridItem = app.subgrids[key].find((x) => x.data?.id === id)
+			if (gridItem) {
+				return { item: gridItem, parent: key }
+			}
+		}
+	}
+
+	return undefined
+}
 export function dfs(
 	grid: GridItem[],
 	id: string,
 	subgrids: Record<string, GridItem[]>
 ): string[] | undefined {
+	if (!grid) {
+		return undefined
+	}
 	for (const item of grid) {
 		if (item.id === id) {
 			return [id]
 		} else if (
 			item.data.type == 'tablecomponent' &&
 			item.data.actionButtons.find((x) => id == x.id)
+		) {
+			return [item.id, id]
+		} else if (item.data.type == 'menucomponent' && item.data.menuItems.find((x) => id == x.id)) {
+			return [item.id, id]
+		} else if (
+			(item.data.type == 'aggridcomponent' ||
+				item.data.type == 'aggridcomponentee' ||
+				item.data.type == 'dbexplorercomponent' ||
+				item.data.type == 'aggridinfinitecomponent' ||
+				item.data.type == 'aggridinfinitecomponentee') &&
+			item.data.actions?.find((x) => id == x.id)
 		) {
 			return [item.id, id]
 		} else {
@@ -82,6 +127,19 @@ export function selectId(
 	}
 }
 
+export function connectOutput(
+	connectingInput: Writable<ConnectingInput>,
+	typ: TypedComponent['type'],
+	id: string,
+	spath: string
+) {
+	if (get(connectingInput).opened) {
+		let splitted = spath?.split('.')
+		let componentId = typ == 'containercomponent' ? splitted?.[0] : id
+		let path = typ == 'containercomponent' ? splitted?.[1] : spath
+		connectingInput.set(connectInput(get(connectingInput), componentId, path, typ))
+	}
+}
 function findGridItemById(
 	root: GridItem[],
 	subGrids: Record<string, GridItem[]> | undefined,
@@ -118,6 +176,19 @@ export function allsubIds(app: App, parentId: string): string[] {
 			if (item.data.type === 'tablecomponent') {
 				subIds.push(...item.data.actionButtons?.map((x) => x.id))
 			}
+			if (
+				(item.data.type === 'aggridcomponent' ||
+					item.data.type === 'aggridcomponentee' ||
+					item.data.type === 'dbexplorercomponent' ||
+					item.data.type === 'aggridinfinitecomponent' ||
+					item.data.type === 'aggridinfinitecomponentee') &&
+				Array.isArray(item.data.actions)
+			) {
+				subIds.push(...item.data.actions?.map((x) => x.id))
+			}
+			if (item.data.type === 'menucomponent') {
+				subIds.push(...item.data.menuItems?.map((x) => x.id))
+			}
 		}
 		return subIds
 	}
@@ -132,6 +203,17 @@ export function getNextGridItemId(app: App): string {
 	const allIds = allItems(app.grid, app.subgrids).flatMap((x) => {
 		if (x.data.type === 'tablecomponent') {
 			return [x.id, ...x.data.actionButtons.map((x) => x.id)]
+		} else if (
+			(x.data.type === 'aggridcomponent' ||
+				x.data.type === 'aggridcomponentee' ||
+				x.data.type === 'dbexplorercomponent' ||
+				x.data.type === 'aggridinfinitecomponent' ||
+				x.data.type === 'aggridinfinitecomponentee') &&
+			Array.isArray(x.data.actions)
+		) {
+			return [x.id, ...x.data.actions.map((x) => x.id)]
+		} else if (x.data.type === 'menucomponent') {
+			return [x.id, ...x.data.menuItems.map((x) => x.id)]
 		} else {
 			return [x.id]
 		}
@@ -160,12 +242,17 @@ export function createNewGridItem(
 	grid: GridItem[],
 	id: string,
 	data: AppComponent,
-	columns?: Record<number, any>
+	columns?: Record<number, any>,
+	initialPosition: { x: number; y: number } = { x: 0, y: 0 },
+	recOverride?: Record<number, Size>,
+	fixed?: boolean,
+	shouldNotFindSpace?: boolean
 ): GridItem {
 	const newComponent = {
-		fixed: false,
-		x: 0,
-		y: 0
+		fixed: fixed ?? false,
+		x: initialPosition.x,
+		y: initialPosition.y,
+		fullHeight: false
 	}
 
 	let newData: AppComponent = JSON.parse(JSON.stringify(data))
@@ -178,7 +265,7 @@ export function createNewGridItem(
 
 	gridColumns.forEach((column) => {
 		if (!columns) {
-			const rec = getRecommendedDimensionsByComponent(newData.type, column)
+			const rec = recOverride?.[column] ?? getRecommendedDimensionsByComponent(newData.type, column)
 
 			newItem[column] = {
 				...newComponent,
@@ -186,10 +273,28 @@ export function createNewGridItem(
 				h: rec.h
 			}
 		} else {
-			newItem[column] = columns[column]
+			newItem[column] = {
+				...columns[column],
+				x: initialPosition.x,
+				y: initialPosition.y
+			}
 		}
-		const position = gridHelp.findSpace(newItem, grid, column) as { x: number; y: number }
-		newItem[column] = { ...newItem[column], ...position }
+
+		let shouldComputePosition: boolean = false
+
+		// Fallback to avoid component disapearing
+		if (initialPosition.x === undefined || initialPosition.y === undefined) {
+			newItem[column].x = 0
+			newItem[column].y = 0
+			shouldComputePosition = true
+		}
+
+		// Either the final position is controlled using initialPosition or the position is computed because the component positions are wrong
+		if (!shouldNotFindSpace || shouldComputePosition) {
+			const position = gridHelp.findSpace(newItem, grid, column) as { x: number; y: number }
+
+			newItem[column] = { ...newItem[column], ...position }
+		}
 	})
 
 	return newItem
@@ -205,19 +310,51 @@ export function getGridItems(app: App, focusedGrid: FocusedGrid | undefined): Gr
 	}
 }
 
-function cleanseValue(key: string, value: { type: 'eval' | 'static'; value?: any; expr?: string }) {
+function cleanseValue(
+	key: string,
+	value: {
+		type: 'eval' | 'static' | 'evalv2'
+		value?: any
+		expr?: string
+		connections?: InputConnectionEval[]
+	}
+) {
 	if (!value) {
 		return [key, undefined]
 	}
 	if (value.type === 'static') {
 		return [key, { type: value.type, value: value.value }]
-	} else {
+	} else if (value.type === 'eval') {
 		return [key, { type: value.type, expr: value.expr }]
+	} else {
+		return [key, { type: value.type, expr: value.expr, connections: value.connections }]
 	}
 }
+
+export function cleanseOneOfConfiguration(
+	configuration: Record<
+		string,
+		Record<string, GeneralAppInput & (StaticAppInput | EvalAppInput | EvalV2AppInput)>
+	>
+) {
+	return Object.fromEntries(
+		Object.entries(configuration).map(([key, val]) => [
+			key,
+			Object.fromEntries(Object.entries(val).map(([key, val]) => cleanseValue(key, val)))
+		])
+	)
+}
+
 export function appComponentFromType<T extends keyof typeof components>(
 	type: T,
-	overrideConfiguration?: Partial<InitialAppComponent['configuration']>
+	overrideConfiguration?: Partial<InitialAppComponent['configuration']>,
+	extra?: any,
+	override?: {
+		customCss?: ComponentCustomCSS<T>
+		verticalAlignment?: 'top' | 'center' | 'bottom'
+		horizontalAlignment?: 'left' | 'center' | 'right'
+		componnetInput?: Partial<InitialAppComponent['componentInput']>
+	}
 ): (id: string) => BaseAppComponent & BaseComponent<T> {
 	return (id: string) => {
 		const init = JSON.parse(JSON.stringify(ccomponents[type].initialData)) as InitialAppComponent
@@ -232,14 +369,7 @@ export function appComponentFromType<T extends keyof typeof components>(
 						{
 							type: value.type,
 							selected: value.selected,
-							configuration: Object.fromEntries(
-								Object.entries(value.configuration).map(([key, val]) => [
-									key,
-									Object.fromEntries(
-										Object.entries(val).map(([key, val]) => cleanseValue(key, val))
-									)
-								])
-							)
+							configuration: cleanseOneOfConfiguration(value.configuration)
 						}
 					]
 				}
@@ -248,19 +378,26 @@ export function appComponentFromType<T extends keyof typeof components>(
 
 		return {
 			type,
-			//TODO remove tooltip and onlyStatic from there
+			//TODO remove tooltip from there
 			configuration: deepMergeWithPriority(configuration, overrideConfiguration ?? {}),
-			componentInput: init.componentInput,
+			componentInput: override?.componnetInput ?? init.componentInput,
 			panes: init.panes,
 			tabs: init.tabs,
 			conditions: init.conditions,
-			customCss: {},
+			nodes: init.nodes,
+			customCss: deepMergeWithPriority(
+				ccomponents[type].customCss as any,
+				override?.customCss ?? {}
+			),
 			recomputeIds: init.recomputeIds ? [] : undefined,
 			actionButtons: init.actionButtons ? [] : undefined,
+			actions: [],
+			menuItems: init.menuItems ? [] : undefined,
 			numberOfSubgrids: init.numberOfSubgrids,
-			horizontalAlignment: init.horizontalAlignment,
-			verticalAlignment: init.verticalAlignment,
-			id
+			horizontalAlignment: override?.horizontalAlignment ?? init.horizontalAlignment,
+			verticalAlignment: override?.verticalAlignment ?? init.verticalAlignment,
+			id,
+			...(extra ?? {})
 		}
 	}
 }
@@ -269,17 +406,27 @@ export function insertNewGridItem(
 	builddata: (id: string) => AppComponent,
 	focusedGrid: FocusedGrid | undefined,
 	columns?: Record<string, any>,
-	keepId?: string
+	keepId?: string,
+	initialPosition: { x: number; y: number } = { x: 0, y: 0 },
+	recOverride?: Record<number, Size>,
+	keepSubgrids?: boolean,
+	fixed?: boolean,
+	shouldNotFindSpace?: boolean
 ): string {
 	const id = keepId ?? getNextGridItemId(app)
 
 	const data = builddata(id)
+
+	if (data.type == 'aggridcomponentee' && !get(enterpriseLicense)) {
+		sendUserToast('AgGrid Enterprise Edition require Windmill Enterprise Edition', true)
+		throw Error('AgGrid Enterprise Edition require Windmill Enterprise Edition')
+	}
 	if (!app.subgrids) {
 		app.subgrids = {}
 	}
 
 	// We only want to set subgrids when we are not moving
-	if (!keepId) {
+	if (!keepId || keepSubgrids) {
 		for (let i = 0; i < (data.numberOfSubgrids ?? 0); i++) {
 			app.subgrids[`${id}-${i}`] = []
 		}
@@ -288,12 +435,115 @@ export function insertNewGridItem(
 	const key = focusedGrid
 		? `${focusedGrid?.parentComponentId}-${focusedGrid?.subGridIndex ?? 0}`
 		: undefined
+
+	if (key && app.subgrids[key] === undefined) {
+		let parent = findGridItemById(app.grid, app.subgrids, key)?.data
+		let subgrids = parent?.numberOfSubgrids
+		if (subgrids === undefined) {
+			throw Error(
+				`Invalid subgrid selected, the parent has no subgrids: ${key}, parent: ${JSON.stringify(
+					parent
+				)}`
+			)
+		}
+		if (
+			focusedGrid?.subGridIndex &&
+			(focusedGrid?.subGridIndex < 0 || focusedGrid?.subGridIndex >= subgrids)
+		) {
+			throw Error(`Invalid subgrid selected: ${key}, max subgrids: ${subgrids}`)
+		}
+		// If ever the subgrid is undefined, we want to make sure it is defined
+		app.subgrids[key] = []
+	}
+
 	let grid = focusedGrid ? app.subgrids[key!] : app.grid
 
-	const newItem = createNewGridItem(grid, id, data, columns)
+	const newItem = createNewGridItem(
+		grid,
+		id,
+		data,
+		columns,
+		initialPosition,
+		recOverride,
+		fixed,
+		shouldNotFindSpace
+	)
 	grid.push(newItem)
-
 	return id
+}
+
+export function copyComponent(
+	app: App,
+	item: GridItem,
+	parentGrid: FocusedGrid | undefined,
+	subgrids: Record<string, GridItem[]>,
+	alreadyVisited: string[]
+) {
+	if (alreadyVisited.includes(item.id)) {
+		return
+	} else {
+		alreadyVisited.push(item.id)
+	}
+	const newItem = insertNewGridItem(
+		app,
+		(id) => {
+			if (item.data.type === 'tablecomponent') {
+				return {
+					...item.data,
+					id,
+					actionButtons:
+						item.data.actionButtons.map((x) => ({
+							...x,
+							id: x.id.replace(`${item.id}_`, `${id}_`)
+						})) ?? []
+				}
+			} else if (
+				item.data.type === 'aggridcomponent' ||
+				item.data.type === 'aggridcomponentee' ||
+				item.data.type === 'dbexplorercomponent' ||
+				item.data.type === 'aggridinfinitecomponent' ||
+				item.data.type === 'aggridinfinitecomponentee'
+			) {
+				return {
+					...item.data,
+					id,
+					actionButtons:
+						(item.data.actions ?? []).map((x) => ({
+							...x,
+							id: x.id.replace(`${item.id}_`, `${id}_`)
+						})) ?? []
+				}
+			} else if (item.data.type === 'menucomponent') {
+				return {
+					...item.data,
+					id,
+					menuItems:
+						item.data.menuItems.map((x) => ({
+							...x,
+							id: x.id.replace(`${item.id}_`, `${id}_`)
+						})) ?? []
+				}
+			} else {
+				return { ...item.data, id }
+			}
+		},
+		parentGrid,
+		Object.fromEntries(gridColumns.map((column) => [column, item[column]]))
+	)
+
+	for (let i = 0; i < (item?.data?.numberOfSubgrids ?? 0); i++) {
+		subgrids[`${item.id}-${i}`].forEach((subgridItem) => {
+			copyComponent(
+				app,
+				subgridItem,
+				{ parentComponentId: newItem, subGridIndex: i },
+				subgrids,
+				alreadyVisited
+			)
+		})
+	}
+
+	return newItem
 }
 
 export function getAllSubgridsAndComponentIds(
@@ -305,6 +555,21 @@ export function getAllSubgridsAndComponentIds(
 	if (component.type === 'tablecomponent') {
 		components.push(...component.actionButtons?.map((x) => x.id))
 	}
+
+	if (
+		component.type === 'aggridcomponent' ||
+		component.type === 'aggridcomponentee' ||
+		component.type === 'dbexplorercomponent' ||
+		component.type === 'aggridinfinitecomponent' ||
+		component.type === 'aggridinfinitecomponentee'
+	) {
+		components.push(...(component.actions?.map((x) => x.id) ?? []))
+	}
+
+	if (component.type === 'menucomponent') {
+		components.push(...component.menuItems?.map((x) => x.id))
+	}
+
 	if (app.subgrids && component.numberOfSubgrids) {
 		for (let i = 0; i < component.numberOfSubgrids; i++) {
 			const key = `${component.id}-${i}`
@@ -322,14 +587,36 @@ export function getAllSubgridsAndComponentIds(
 	return [subgrids, components]
 }
 
+export function getAllGridItems(app: App): GridItem[] {
+	return app.grid
+		.concat(Object.values(app.subgrids ?? {}).flat())
+		.map((x) => {
+			if (x?.data?.type === 'tablecomponent') {
+				return [x, ...x?.data?.actionButtons?.map((x) => ({ data: x, id: x.id }))]
+			} else if (
+				(x?.data?.type === 'aggridcomponent' ||
+					x?.data?.type === 'aggridcomponentee' ||
+					x?.data?.type === 'dbexplorercomponent' ||
+					x?.data?.type === 'aggridinfinitecomponent' ||
+					x?.data?.type === 'aggridinfinitecomponentee') &&
+				Array.isArray(x?.data?.actions)
+			) {
+				return [x, ...x?.data?.actions?.map((x) => ({ data: x, id: x.id }))]
+			} else if (x?.data?.type === 'menucomponent') {
+				return [x, ...x?.data?.menuItems?.map((x) => ({ data: x, id: x.id }))]
+			}
+			return [x]
+		})
+		.flat()
+}
+
 export function deleteGridItem(
 	app: App,
 	component: AppComponent,
-	parent: string | undefined,
-	shouldKeepSubGrid: boolean
+	parent: string | undefined
 ): string[] {
 	let [subgrids, components] = getAllSubgridsAndComponentIds(app, component)
-	if (app.subgrids && !shouldKeepSubGrid) {
+	if (app.subgrids) {
 		subgrids.forEach((id) => {
 			delete app.subgrids![id]
 		})
@@ -466,15 +753,54 @@ export function initOutput<I extends Record<string, any>>(
 	) as Outputtable<I>
 }
 
+export type InitConfig<
+	T extends Record<
+		string,
+		| StaticAppInput
+		| EvalAppInput
+		| EvalV2AppInput
+		| {
+				type: 'oneOf'
+				selected: string
+				configuration: Record<
+					string,
+					Record<string, StaticAppInput | EvalAppInput | EvalV2AppInput>
+				>
+		  }
+	>
+> = {
+	[Property in keyof T]: T[Property] extends StaticAppInput
+		? T[Property]['value'] | undefined
+		: T[Property] extends { type: 'oneOf' }
+		? {
+				type: 'oneOf'
+				selected: keyof T[Property]['configuration']
+				configuration: {
+					[Choice in keyof T[Property]['configuration']]: {
+						[IT in keyof T[Property]['configuration'][Choice]]: T[Property]['configuration'][Choice][IT] extends StaticAppInput
+							? T[Property]['configuration'][Choice][IT] extends StaticAppInputOnDemand
+								? () => Promise<T[Property]['configuration'][Choice][IT]['value'] | undefined>
+								: T[Property]['configuration'][Choice][IT]['value'] | undefined
+							: undefined
+					}
+				}
+		  }
+		: undefined
+}
+
 export function initConfig<
 	T extends Record<
 		string,
 		| StaticAppInput
 		| EvalAppInput
+		| EvalV2AppInput
 		| {
 				type: 'oneOf'
 				selected: string
-				configuration: Record<string, Record<string, StaticAppInput | EvalAppInput>>
+				configuration: Record<
+					string,
+					Record<string, StaticAppInput | EvalAppInput | EvalV2AppInput>
+				>
 		  }
 	>
 >(
@@ -485,27 +811,14 @@ export function initConfig<
 		| {
 				type: 'oneOf'
 				selected: string
-				configuration: Record<string, Record<string, StaticAppInput | EvalAppInput>>
+				configuration: Record<
+					string,
+					Record<string, StaticAppInput | EvalAppInput | EvalV2AppInput | boolean>
+				>
 		  }
 		| any
 	>
-): {
-	[Property in keyof T]: T[Property] extends StaticAppInput
-		? T[Property]['value'] | undefined
-		: T[Property] extends { type: 'oneOf' }
-		? {
-				type: 'oneOf'
-				selected: keyof T[Property]['configuration']
-				configuration: {
-					[Choice in keyof T[Property]['configuration']]: {
-						[IT in keyof T[Property]['configuration'][Choice]]: T[Property]['configuration'][Choice][IT] extends StaticAppInput
-							? T[Property]['configuration'][Choice][IT]['value'] | undefined
-							: undefined
-					}
-				}
-		  }
-		: undefined
-} {
+): InitConfig<T> {
 	return JSON.parse(
 		JSON.stringify(
 			Object.fromEntries(
@@ -522,10 +835,15 @@ export function initConfig<
 									selected: value.selected,
 									type: 'oneOf',
 									configuration: Object.fromEntries(
-										Object.entries(value.configuration).map(([choice, config]) => [
-											choice,
-											initConfig(config, configuration?.[key]?.configuration?.[choice])
-										])
+										Object.entries(value.configuration).map(([choice, config]) => {
+											const conf = initConfig(config, configuration?.[key]?.configuration?.[choice])
+											Object.entries(config).forEach(([innerKey, innerValue]) => {
+												if (innerValue.type === 'static' && !(innerKey in conf)) {
+													conf[innerKey] = innerValue.value
+												}
+											})
+											return [choice, conf]
+										})
 									)
 								}
 						  ]
@@ -588,7 +906,8 @@ export function sortGridItemsPosition<T>(
 export function connectInput(
 	connectingInput: ConnectingInput,
 	componentId: string,
-	path: string
+	path: string,
+	componentType?: TypedComponent['type']
 ): ConnectingInput {
 	if (connectingInput) {
 		if (connectingInput.onConnect) {
@@ -600,7 +919,8 @@ export function connectInput(
 			input: {
 				connection: {
 					componentId,
-					path
+					path,
+					componentType
 				},
 				type: 'connected'
 			},
@@ -644,55 +964,319 @@ export function recursivelyFilterKeyInJSON(
 	return filteredJSON
 }
 
-export function clearErrorByComponentId(
-	id: string,
-	errorByComponent: Record<
-		string,
-		{
-			error: string
-			componentId: string
-		}
-	>
-) {
-	return Object.entries(errorByComponent).reduce((acc, [key, value]) => {
-		if (value.componentId !== id) {
-			acc[key] = value
-		}
-		return acc
-	}, {})
+export function collectOneOfFields(fields: AppInputs, app: App): Record<string, any[]> {
+	return Object.fromEntries(
+		Object.entries(fields ?? {})
+			.filter(([k, v]) => v.type == 'evalv2')
+			.map(([k, v]) => {
+				let field = v as EvalV2AppInput
+				if (!field.connections || field.connections.length !== 1) {
+					return [k, undefined]
+				}
+				const c = field.connections[0]
+
+				const gridItem = findGridItem(app, c.componentId)
+
+				if (field.expr !== c.componentId + '.' + c.id) {
+					return [k, undefined]
+				}
+
+				if (gridItem) {
+					const c = gridItem.data as AppComponent
+					if (c) {
+						if (
+							c.type === 'resourceselectcomponent' ||
+							c.type === 'selectcomponent' ||
+							c.type === 'multiselectcomponent' ||
+							c.type === 'multiselectcomponentv2'
+						) {
+							if (
+								(c.type === 'selectcomponent' ||
+									c.type === 'multiselectcomponent' ||
+									c.type === 'multiselectcomponentv2') &&
+								c.configuration?.create?.type === 'static' &&
+								c.configuration?.create?.value === true
+							) {
+								return [k, undefined]
+							}
+							if (c.configuration?.items?.type === 'static') {
+								const items = c.configuration.items.value
+								if (items && Array.isArray(items)) {
+									if (c.type === 'multiselectcomponent' || c.type === 'multiselectcomponentv2') {
+										return [k, items]
+									} else {
+										const options = items
+											.filter(
+												(item) => item && typeof item === 'object' && 'value' in item && item.value
+											)
+											.map((item) => item.value)
+
+										return [k, options]
+									}
+								}
+							}
+						}
+					}
+				}
+
+				return [k, undefined]
+			})
+			.filter(([k, v]) => v !== undefined)
+	)
 }
 
-export function clearJobsByComponentId(
-	id: string,
-	jobs: {
-		job: string
-		component: string
-	}[]
-) {
-	return jobs.filter((job) => job.component !== id)
-}
+export const ROW_HEIGHT = 36
+export const ROW_GAP_Y = 2
+export const ROW_GAP_X = 4
 
-// Returns the error message for the latest job for a component if an error occurred, otherwise undefined
-export function getErrorFromLatestResult(
-	id: string,
-	errorByComponent: Record<
-		string, // job id
-		{
-			error: string
-			componentId: string
-		}
-	>,
-	jobs: {
-		job: string
-		component: string
-	}[]
+export function maxHeight(
+	grid: GridItem[],
+	windowHeight: number,
+	breakpoint: EditorBreakpoint = 'lg'
 ) {
-	// find last jobId for component id
-	const lastJob = jobs.find((job) => job.component === id)
+	const totalRowHeight = ROW_HEIGHT + ROW_GAP_Y
+	let maxRows = Math.floor((windowHeight - ROW_GAP_Y) / totalRowHeight)
 
-	if (lastJob?.job && errorByComponent[lastJob.job]) {
-		return errorByComponent[lastJob.job].error
-	} else {
-		return undefined
+	if (!grid.length) {
+		return maxRows
 	}
+
+	const breakpointKey = breakpoint === 'sm' ? 3 : 12
+	const maxRowPerGrid = grid.reduce((max, item) => {
+		const y = item[breakpointKey].y
+		const h = item[breakpointKey].h
+		return Math.max(max, y + h)
+	}, 0)
+
+	return Math.max(maxRowPerGrid, maxRows)
+}
+
+export function isTableAction(id: string, app: App): boolean {
+	const [tableId, actionId] = id.split('_')
+
+	if (!tableId || !actionId) {
+		return false
+	}
+
+	const table = findGridItem(app, tableId)
+	if (
+		!table ||
+		(table.data.type !== 'tablecomponent' &&
+			table.data.type !== 'aggridcomponent' &&
+			table.data.type !== 'aggridcomponentee' &&
+			table.data.type !== 'dbexplorercomponent' &&
+			table.data.type !== 'aggridinfinitecomponent' &&
+			table.data.type !== 'aggridinfinitecomponentee')
+	) {
+		return false
+	}
+	return true
+}
+
+export function setUpTopBarComponentContent(id: string, app: App) {
+	insertNewGridItem(
+		app,
+		appComponentFromType(
+			'textcomponent',
+
+			{
+				disableNoText: {
+					value: true,
+					type: 'static',
+					fieldType: 'boolean'
+				},
+				tooltip: {
+					type: 'evalv2',
+
+					fieldType: 'text',
+					expr: '`Author: ${ctx.author}`',
+					connections: [
+						{
+							componentId: 'ctx',
+							id: 'author'
+						}
+					]
+				}
+			},
+			undefined,
+			{
+				customCss: {
+					text: {
+						class: 'text-xl font-semibold whitespace-nowrap truncate' as any,
+						style: ''
+					}
+				},
+				verticalAlignment: 'center',
+				componnetInput: {
+					type: 'templatev2',
+					fieldType: 'template',
+					eval: '${ctx.summary}',
+					connections: [
+						{
+							id: 'summary',
+							componentId: 'ctx'
+						}
+					] as InputConnectionEval[]
+				}
+			}
+		) as (id: string) => AppComponent,
+		{
+			parentComponentId: id,
+			subGridIndex: 0
+		},
+		undefined,
+		'title',
+		undefined,
+		{
+			3: {
+				w: 6,
+				h: 1
+			},
+			12: {
+				w: 6,
+				h: 1
+			}
+		}
+	)
+
+	insertNewGridItem(
+		app,
+		appComponentFromType('recomputeallcomponent', undefined, undefined, {
+			horizontalAlignment: 'right'
+		}) as (id: string) => AppComponent,
+		{
+			parentComponentId: id,
+			subGridIndex: 0
+		},
+		undefined,
+		'recomputeall',
+		undefined,
+		{
+			3: {
+				w: 3,
+				h: 1
+			},
+			12: {
+				w: 6,
+				h: 1
+			}
+		}
+	)
+}
+
+export function isContainer(type: string): boolean {
+	return (
+		type === 'containercomponent' ||
+		type === 'tabscomponent' ||
+		type === 'verticalsplitpanescomponent' ||
+		type === 'horizontalsplitpanescomponent' ||
+		type === 'steppercomponent' ||
+		type === 'listcomponent' ||
+		type === 'decisiontreecomponent'
+	)
+}
+
+export function subGridIndexKey(type: string | undefined, id: string, world: World): number {
+	switch (type) {
+		case 'containercomponent':
+		case 'verticalsplitpanescomponent':
+		case 'horizontalsplitpanescomponent':
+		case 'listcomponent':
+			return 0
+		case 'tabscomponent': {
+			return (world?.outputsById?.[id]?.selectedTabIndex?.peak() as number) ?? 0
+		}
+		case 'steppercomponent': {
+			return (world?.outputsById?.[id]?.currentStepIndex?.peak() as number) ?? 0
+		}
+		case 'decisiontreecomponent': {
+			return (world?.outputsById?.[id]?.currentNodeIndex?.peak() as number) ?? 0
+		}
+	}
+
+	return 0
+}
+
+export function computePosition(
+	clientX: number,
+	clientY: number,
+	xPerPx: number,
+	yPerPx: number,
+	overlapped?: string,
+	element?: HTMLElement
+) {
+	const overlappedElement = overlapped
+		? document.getElementById(`component-${overlapped}`)
+		: document.getElementById('root-grid')
+
+	const xRelativeToElement = element ? clientX - element.getBoundingClientRect().left : 0
+	const yRelativeToElement = element ? clientY - element.getBoundingClientRect().top : 0
+
+	const xRelativeToOverlappedElement = overlappedElement
+		? clientX - overlappedElement.getBoundingClientRect().left - xRelativeToElement
+		: 0
+	const yRelativeToOverlappedElement = overlappedElement
+		? clientY - overlappedElement.getBoundingClientRect().top - yRelativeToElement
+		: 0
+
+	const gridX = Math.max(Math.round(xRelativeToOverlappedElement / xPerPx) ?? 0, 0)
+	const gridY = Math.max(Math.round(yRelativeToOverlappedElement / yPerPx) ?? 0, 0)
+
+	return {
+		x: gridX,
+		y: gridY
+	}
+}
+
+export function getDeltaYByComponent(type: string) {
+	switch (type) {
+		case 'steppercomponent': {
+			return '36px + 0.5rem'
+		}
+		case 'tabscomponent': {
+			return '32px'
+		}
+		default:
+			return '0px'
+	}
+}
+
+export function getDeltaXByComponent(type: string) {
+	switch (type) {
+		case 'steppercomponent': {
+			return '0.5rem'
+		}
+		case 'tabscomponent': {
+			return '0px'
+		}
+		default:
+			return '0px'
+	}
+}
+
+export type GridShadow = {
+	x: number
+	y: number
+	xPerPx: number
+	yPerPx: number
+	w: number
+	h: number
+}
+
+export function areShadowsTheSame(
+	shadow1: GridShadow | undefined,
+	shadow2: GridShadow | undefined
+) {
+	if (!shadow1 || !shadow2) {
+		return false
+	}
+
+	return (
+		shadow1.x === shadow2.x &&
+		shadow1.y === shadow2.y &&
+		shadow1.xPerPx === shadow2.xPerPx &&
+		shadow1.yPerPx === shadow2.yPerPx &&
+		shadow1.w === shadow2.w &&
+		shadow1.h === shadow2.h
+	)
 }

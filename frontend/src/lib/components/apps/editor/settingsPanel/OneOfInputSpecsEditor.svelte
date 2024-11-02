@@ -2,6 +2,7 @@
 	import Tooltip from '$lib/components/Tooltip.svelte'
 	import { addWhitespaceBeforeCapitals, capitalize } from '$lib/utils'
 	import type { RichConfiguration } from '../../types'
+	import { cleanseOneOfConfiguration } from '../appUtils'
 	import InputsSpecEditor from './InputsSpecEditor.svelte'
 
 	export let key: string
@@ -11,8 +12,11 @@
 	export let shouldCapitalize: boolean
 	export let id: string
 	export let resourceOnly: boolean
-	export let rowColumns: boolean
 	export let tooltip: string | undefined
+	export let disabledOptions: string[] = []
+	export let acceptSelf: boolean = false
+	export let recomputeOnInputChanged = true
+	export let showOnDemandOnlyToggle = true
 
 	$: {
 		if (oneOf == undefined) {
@@ -27,6 +31,24 @@
 		if (oneOf?.configuration[oneOf?.selected] == undefined) {
 			oneOf.configuration[oneOf.selected] = {}
 		}
+
+		// If the configuration is empty, we set the first one as selected.
+		// It happens when the configuration was added after the component was created
+		if (oneOf.selected === '') {
+			oneOf = {
+				configuration: cleanseOneOfConfiguration(inputSpecsConfiguration),
+				selected: Object.keys(inputSpecsConfiguration ?? {})[0],
+				type: 'oneOf'
+			}
+		}
+	}
+
+	function getValueOfDeprecated(obj: object): boolean {
+		if (!obj) return false
+
+		let innerObject = obj[Object.keys(obj)[0]]
+
+		return innerObject?.deprecated
 	}
 </script>
 
@@ -34,7 +56,7 @@
 	<div class="mb-2 text-sm font-semibold">
 		{capitalize(addWhitespaceBeforeCapitals(key))}&nbsp;
 		{#if tooltip}
-			<Tooltip>{tooltip}</Tooltip>
+			<Tooltip light>{tooltip}</Tooltip>
 		{/if}
 	</div>
 	<select
@@ -45,7 +67,9 @@
 		}}
 	>
 		{#each Object.keys(inputSpecsConfiguration ?? {}) as choice}
-			<option value={choice}>{labels?.[choice] ?? choice}</option>
+			{#if (!disabledOptions.includes(choice) && !getValueOfDeprecated(inputSpecsConfiguration[choice])) || oneOf.selected === choice}
+				<option value={choice}>{labels?.[choice] ?? choice}</option>
+			{/if}
 		{/each}
 	</select>
 	{#if oneOf.selected !== 'none' && oneOf.selected !== 'errorOverlay'}
@@ -53,24 +77,33 @@
 	{/if}
 	<div class="flex flex-col gap-4">
 		{#each Object.keys(inputSpecsConfiguration?.[oneOf.selected] ?? {}) as nestedKey}
-			{@const config = inputSpecsConfiguration?.[oneOf.selected]?.[nestedKey]}
+			{@const config = {
+				...inputSpecsConfiguration?.[oneOf.selected]?.[nestedKey],
+				...oneOf.configuration?.[oneOf.selected]?.[nestedKey]
+			}}
+
 			{#if config && oneOf.configuration[oneOf.selected]}
 				<InputsSpecEditor
+					{recomputeOnInputChanged}
 					key={nestedKey}
 					bind:componentInput={oneOf.configuration[oneOf.selected][nestedKey]}
 					{id}
+					{acceptSelf}
 					userInputEnabled={false}
 					{shouldCapitalize}
 					{resourceOnly}
-					hasRows={rowColumns}
 					fieldType={config?.['fieldType']}
 					subFieldType={config?.['subFieldType']}
 					format={config?.['format']}
 					selectOptions={config?.['selectOptions']}
 					placeholder={config?.['placeholder']}
-					onlyStatic={config?.['onlyStatic']}
 					customTitle={config?.['customTitle']}
-					noVariablePicker={config?.['noVariablePicker']}
+					tooltip={config?.['tooltip']}
+					fileUpload={config?.['fileUpload']}
+					loading={config?.['loading']}
+					documentationLink={config?.['documentationLink']}
+					allowTypeChange={config?.['allowTypeChange']}
+					{showOnDemandOnlyToggle}
 				/>
 			{/if}
 		{/each}

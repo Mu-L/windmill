@@ -1,21 +1,23 @@
-import type { Schema } from '$lib/common'
 import {
 	JobService,
-	ScriptService,
 	type Flow,
 	type FlowModule,
 	type InputTransform,
-	type Job
+	type Job,
+	type RestartedFrom,
+	type OpenFlow,
+	type FlowModuleValue
 } from '$lib/gen'
-import { inferArgs } from '$lib/infer'
-import { loadSchema, loadSchemaFlow } from '$lib/scripts'
 import { workspaceStore } from '$lib/stores'
-import { emptySchema } from '$lib/utils'
+import { cleanExpr, emptySchema } from '$lib/utils'
 import { get } from 'svelte/store'
 import type { FlowModuleState } from './flowState'
 import type { PickableProperties } from './previousResults'
 import { NEVER_TESTED_THIS_FAR } from './models'
 import { sendUserToast } from '$lib/toast'
+import type { Schema } from '$lib/common'
+import { parseOutputs } from '$lib/infer'
+import type { ExtendedOpenFlow } from './types'
 
 function create_context_function_template(eval_string: string, context: Record<string, any>) {
 	return `
@@ -70,7 +72,34 @@ export function evalValue(
 	return v
 }
 
-export function cleanInputs(flow: Flow | any): Flow {
+export function filteredContentForExport(flow: ExtendedOpenFlow) {
+	let o = {
+		summary: flow.summary,
+		description: flow.description,
+		value: flow.value,
+		schema: flow.schema
+	}
+	if (flow.dedicated_worker) {
+		o['dedicated_worker'] = flow.dedicated_worker
+	}
+	if (flow.visible_to_runner_only) {
+		o['visible_to_runner_only'] = flow.visible_to_runner_only
+	}
+	if (flow.ws_error_handler_muted) {
+		o['ws_error_handler_muted'] = flow.ws_error_handler_muted
+	}
+	if (flow.tag) {
+		o['tag'] = flow.tag
+	}
+	return o
+}
+
+export function cleanInputs(flow: OpenFlow | any): OpenFlow & {
+	tag?: string
+	ws_error_handler_muted?: boolean
+	dedicated_worker?: boolean
+	visible_to_runner_only?: boolean
+} {
 	const newFlow: Flow = JSON.parse(JSON.stringify(flow))
 	newFlow.value.modules.forEach((mod) => {
 		if (mod.value.type == 'rawscript' || mod.value.type == 'script') {
@@ -87,78 +116,11 @@ export function cleanInputs(flow: Flow | any): Flow {
 			})
 		}
 	})
+	if (newFlow.value.concurrency_key == '') {
+		newFlow.value.concurrency_key = undefined
+	}
 
 	return newFlow
-}
-
-export function cleanExpr(expr: string): string {
-	return expr
-		.split('\n')
-		.filter((x) => x != '' && !x.startsWith(`import `))
-		.join('\n')
-}
-
-export async function loadSchemaFromModule(module: FlowModule): Promise<{
-	input_transforms: Record<string, InputTransform>
-	schema: Schema
-}> {
-	const mod = module.value
-
-	if (mod.type == 'rawscript' || mod.type === 'script' || mod.type === 'flow') {
-		let schema: Schema
-		if (mod.type === 'rawscript') {
-			schema = emptySchema()
-			await inferArgs(mod.language!, mod.content ?? '', schema)
-		} else if (mod.type == 'script' && mod.path && mod.path != '') {
-			schema = await loadSchema(mod.path!, mod.hash)
-		} else if (mod.type == 'flow' && mod.path && mod.path != '') {
-			schema = await loadSchemaFlow(mod.path!)
-		} else {
-			return {
-				input_transforms: {},
-				schema: emptySchema()
-			}
-		}
-
-		const keys = Object.keys(schema?.properties ?? {})
-
-		let input_transforms = mod.input_transforms ?? {}
-
-		if (JSON.stringify(keys.sort()) !== JSON.stringify(Object.keys(input_transforms).sort())) {
-			input_transforms = keys.reduce((accu, key) => {
-				let nv =
-					input_transforms[key] ??
-					(module.id == 'failure' && ['message', 'name'].includes(key)
-						? { type: 'javascript', expr: `error.${key}` }
-						: {
-								type: 'static',
-								value: undefined
-						  })
-				accu[key] = nv
-				return accu
-			}, {})
-		}
-
-		return {
-			input_transforms: input_transforms,
-			schema: schema ?? emptySchema()
-		}
-	}
-
-	return {
-		input_transforms: {},
-		schema: emptySchema()
-	}
-}
-
-const dynamicTemplateRegex = new RegExp(/\$\{(.*)\}/)
-
-export function isCodeInjection(expr: string | undefined): boolean {
-	if (!expr) {
-		return false
-	}
-
-	return dynamicTemplateRegex.test(expr)
 }
 
 export function getDefaultExpr(
@@ -181,14 +143,21 @@ export function jobsToResults(jobs: Job[]) {
 	})
 }
 
-export async function runFlowPreview(args: Record<string, any>, flow: Flow) {
+export async function runFlowPreview(
+	args: Record<string, any>,
+	flow: OpenFlow & { tag?: string },
+	path: string,
+	restartedFrom: RestartedFrom | undefined
+) {
 	const newFlow = flow
 	return await JobService.runFlowPreview({
 		workspace: get(workspaceStore) ?? '',
 		requestBody: {
 			args,
 			value: newFlow.value,
-			path: newFlow.path
+			path: path,
+			tag: newFlow.tag,
+			restarted_from: restartedFrom
 		}
 	})
 }
@@ -215,24 +184,131 @@ export function emptyFlowModuleState(): FlowModuleState {
 	}
 }
 
-export async function findNextAvailablePath(path: string): Promise<string> {
-	try {
-		await ScriptService.getScriptByPath({
-			workspace: get(workspaceStore)!,
-			path
-		})
+export function isInputFilled(
+	inputTransforms: Record<string, InputTransform>,
+	key: string,
+	schema: Schema | undefined
+): boolean {
+	const required = schema?.required?.includes(key) ?? false
 
-		const [_, version] = path.split(/.*_([0-9]*)/)
+	if (!required) {
+		return true
+	}
 
-		if (version.length > 0) {
-			path = path.slice(0, -(version.length + 1))
+	if (inputTransforms.hasOwnProperty(key)) {
+		const transform = inputTransforms[key]
+		if (
+			transform?.type === 'static' &&
+			(transform?.value === undefined || transform?.value === '' || transform?.value === null)
+		) {
+			return false
+		} else if (
+			transform?.type === 'javascript' &&
+			(transform?.expr === undefined || transform?.expr === '' || transform?.expr === null)
+		) {
+			return false
+		}
+	}
+
+	return true
+}
+
+async function isConnectedToMissingModule(
+	argName: string,
+	flowModuleValue: FlowModuleValue,
+	moduleIds: string[]
+): Promise<string | undefined> {
+	const type = flowModuleValue.type
+
+	if (type === 'rawscript' || type === 'script' || type === 'flow') {
+		const input = flowModuleValue?.input_transforms[argName]
+		const val: string = input.type === 'static' ? String(input.value) : input.expr
+
+		try {
+			const outputs = await parseOutputs(val, true)
+			let error: string = ''
+
+			outputs?.forEach(([componentId, id]) => {
+				if (componentId === 'results') {
+					if (!moduleIds.includes(id)) {
+						error += `Input ${argName} is connected to a missing module with id ${id}\n`
+					}
+				}
+			})
+
+			return error
+		} catch (e) {
+			return `Input ${argName} expression is invalid`
+		}
+	}
+
+	return
+}
+
+export async function computeFlowStepWarning(
+	argName: string,
+	flowModuleValue: FlowModuleValue,
+	messages: Record<
+		string,
+		{
+			message: string
+			type: 'error' | 'warning'
+		}
+	>,
+	schema: Schema | undefined,
+	moduleIds: string[] = []
+) {
+	if (messages[argName]) {
+		delete messages[argName]
+	}
+
+	const type = flowModuleValue.type
+	if (type == 'rawscript' || type == 'script' || type == 'flow') {
+		if (!isInputFilled(flowModuleValue.input_transforms, argName, schema)) {
+			messages[argName] = {
+				message: `Input ${argName} is required but not filled`,
+				type: 'warning'
+			}
 		}
 
-		path = `${path}_${Number(version) + 1}`
+		const errorMessage = await isConnectedToMissingModule(argName, flowModuleValue, moduleIds)
 
-		return findNextAvailablePath(path)
-	} catch (e) {
-		// Catching an error means the path is available
-		return path
+		if (errorMessage) {
+			messages[argName] = {
+				message: errorMessage,
+				type: 'error'
+			}
+		} else {
+			if (messages[argName]?.type === 'error') {
+				delete messages[argName]
+			}
+		}
 	}
+
+	return messages
+}
+
+export async function initFlowStepWarnings(
+	flowModuleValue: FlowModuleValue,
+	schema: Schema | undefined,
+	moduleIds: string[] = []
+) {
+	const messages: Record<
+		string,
+		{
+			message: string
+			type: 'error' | 'warning'
+		}
+	> = {}
+	const type = flowModuleValue.type
+
+	if (type == 'rawscript' || type == 'script' || type == 'flow') {
+		const keys = Object.keys(flowModuleValue.input_transforms ?? {})
+		const promises = keys.map(async (key) => {
+			await computeFlowStepWarning(key, flowModuleValue, messages, schema, moduleIds)
+		})
+		await Promise.all(promises)
+	}
+
+	return messages
 }

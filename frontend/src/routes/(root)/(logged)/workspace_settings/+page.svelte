@@ -1,89 +1,161 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { page } from '$app/stores'
 	import { isCloudHosted } from '$lib/cloud'
-	import AddUser from '$lib/components/AddUser.svelte'
 	import CenteredPage from '$lib/components/CenteredPage.svelte'
-	import { Alert, Badge, Button, Skeleton, Tab, Tabs } from '$lib/components/common'
-	import ToggleButton from '$lib/components/common/toggleButton/ToggleButton.svelte'
-	import ToggleButtonGroup from '$lib/components/common/toggleButton/ToggleButtonGroup.svelte'
-	import InviteUser from '$lib/components/InviteUser.svelte'
-	import PageHeader from '$lib/components/PageHeader.svelte'
-	import ScriptPicker from '$lib/components/ScriptPicker.svelte'
-	import SearchItems from '$lib/components/SearchItems.svelte'
-	import Slider from '$lib/components/Slider.svelte'
-	import TableCustom from '$lib/components/TableCustom.svelte'
-	import Toggle from '$lib/components/Toggle.svelte'
-	import Tooltip from '$lib/components/Tooltip.svelte'
-	import { WORKSPACE_SHOW_SLACK_CMD, WORKSPACE_SHOW_WEBHOOK_CLI_SYNC } from '$lib/consts'
-	import type { User } from '$lib/gen'
-	import {
-		OauthService,
-		Script,
-		UserService,
-		WorkspaceService,
-		type WorkspaceInvite
-	} from '$lib/gen'
-	import { superadmin, userStore, usersWorkspaceStore, workspaceStore } from '$lib/stores'
-	import { sendUserToast } from '$lib/toast'
-	import { capitalize } from '$lib/utils'
-	import { faSlack } from '@fortawesome/free-brands-svg-icons'
-	import { faBarsStaggered, faExternalLink, faScroll } from '@fortawesome/free-solid-svg-icons'
+	import { Alert, Badge, Button, Tab, Tabs } from '$lib/components/common'
 
-	let users: User[] | undefined = undefined
-	let invites: WorkspaceInvite[] = []
-	let filteredUsers: User[] | undefined = undefined
-	let userFilter = ''
-	let scriptPath: string
+	import DeployToSetting from '$lib/components/DeployToSetting.svelte'
+	import ErrorOrRecoveryHandler from '$lib/components/ErrorOrRecoveryHandler.svelte'
+	import PageHeader from '$lib/components/PageHeader.svelte'
+	import ResourcePicker from '$lib/components/ResourcePicker.svelte'
+	import ScriptPicker from '$lib/components/ScriptPicker.svelte'
+	import S3FilePicker from '$lib/components/S3FilePicker.svelte'
+
+	import Tooltip from '$lib/components/Tooltip.svelte'
+	import WorkspaceUserSettings from '$lib/components/settings/WorkspaceUserSettings.svelte'
+	import { WORKSPACE_SHOW_SLACK_CMD, WORKSPACE_SHOW_WEBHOOK_CLI_SYNC } from '$lib/consts'
+	import { OauthService, WorkspaceService, JobService, ResourceService } from '$lib/gen'
+	import {
+		enterpriseLicense,
+		copilotInfo,
+		superadmin,
+		userStore,
+		usersWorkspaceStore,
+		workspaceStore,
+		hubBaseUrlStore
+	} from '$lib/stores'
+	import { sendUserToast } from '$lib/toast'
+	import { emptyString, tryEvery } from '$lib/utils'
+	import {
+		Code2,
+		Slack,
+		XCircle,
+		RotateCw,
+		CheckCircle2,
+		X,
+		Plus,
+		Loader2,
+		Save,
+		ExternalLink
+	} from 'lucide-svelte'
+	import BarsStaggered from '$lib/components/icons/BarsStaggered.svelte'
+
+	import PremiumInfo from '$lib/components/settings/PremiumInfo.svelte'
+	import Toggle from '$lib/components/Toggle.svelte'
+	import TestOpenaiKey from '$lib/components/copilot/TestOpenaiKey.svelte'
+	import Portal from '$lib/components/Portal.svelte'
+
+	import { fade } from 'svelte/transition'
+	import ChangeWorkspaceName from '$lib/components/settings/ChangeWorkspaceName.svelte'
+	import ChangeWorkspaceId from '$lib/components/settings/ChangeWorkspaceId.svelte'
+	import {
+		convertBackendSettingsToFrontendSettings,
+		convertFrontendToBackendSetting,
+		type S3ResourceSettings
+	} from '$lib/workspace_settings'
+	import { base } from '$lib/base'
+	import { hubPaths } from '$lib/hub'
+
+	type GitSyncTypeMap = {
+		scripts: boolean
+		flows: boolean
+		apps: boolean
+		folders: boolean
+		resourceTypes: boolean
+		resources: boolean
+		variables: boolean
+		secrets: boolean
+		schedules: boolean
+		users: boolean
+		groups: boolean
+	}
+	type GitSyncType =
+		| 'script'
+		| 'flow'
+		| 'app'
+		| 'folder'
+		| 'resourcetype'
+		| 'resource'
+		| 'variable'
+		| 'secret'
+		| 'schedule'
+		| 'user'
+		| 'group'
+
+	let s3FileViewer: S3FilePicker
+
 	let initialPath: string
+	let scriptPath: string
 	let team_name: string | undefined
-	let auto_invite_domain: string | undefined
 	let itemKind: 'flow' | 'script' = 'flow'
-	let operatorOnly: boolean | undefined = undefined
-	let premium_info: { premium: boolean; usage?: number } | undefined = undefined
-	let nbDisplayed = 30
 	let plan: string | undefined = undefined
 	let customer_id: string | undefined = undefined
 	let webhook: string | undefined = undefined
+	let workspaceToDeployTo: string | undefined = undefined
+	let errorHandlerSelected: 'custom' | 'slack' = 'slack'
+	let errorHandlerInitialScriptPath: string
+	let errorHandlerScriptPath: string
+	let errorHandlerItemKind: 'flow' | 'script' = 'script'
+	let errorHandlerExtraArgs: Record<string, any> = {}
+	let errorHandlerMutedOnCancel: boolean | undefined = undefined
+	let openaiResourceInitialPath: string | undefined = undefined
+
+	let s3ResourceSettings: S3ResourceSettings = {
+		resourceType: 's3',
+		resourcePath: undefined,
+		publicResource: undefined,
+		secondaryStorage: undefined
+	}
+	let gitSyncSettings: {
+		include_path: string[]
+		repositories: {
+			exclude_types_override: GitSyncTypeMap
+			script_path: string
+			git_repo_resource_path: string
+			use_individual_branch: boolean
+			group_by_folder: boolean
+		}[]
+		include_type: GitSyncTypeMap
+	}
+	let gitSyncTestJobs: {
+		jobId: string | undefined
+		status: 'running' | 'success' | 'failure' | undefined
+	}[]
+	let workspaceDefaultAppPath: string | undefined = undefined
+	let workspaceEncryptionKey: string | undefined = undefined
+	let editedWorkspaceEncryptionKey: string | undefined = undefined
+	let workspaceReencryptionInProgress: boolean = false
+	let encryptionKeyRegex = /^[a-zA-Z0-9]{64}$/
+	let codeCompletionEnabled: boolean = false
 	let tab =
 		($page.url.searchParams.get('tab') as
 			| 'users'
 			| 'slack'
 			| 'premium'
-			| 'export_delete'
-			| 'webhook') ?? 'users'
+			| 'general'
+			| 'webhook'
+			| 'deploy_to'
+			| 'error_handler') ?? 'users'
+	let usingOpenaiClientCredentialsOauth = false
 
-	// function getDropDownItems(username: string): DropdownItem[] {
-	// 	return [
-	// 		{
-	// 			displayName: 'Manage user',
-	// 			href: `/admin/user/manage/${username}`
-	// 		},
-	// 		{
-	// 			displayName: 'Delete',
-	// 			action: () => deleteUser(username)
-	// 		}
-	// 	];
-	// }
-
-	// async function deleteUser(username: string): Promise<void> {
-	// 	try {
-	// 		await UserService.deleteUser({ workspace: $workspaceStore!, username });
-	// 		users = await UserService.listUsers({ workspace: $workspaceStore! });
-	// 		fuse?.setCollection(users);
-	// 		sendUserToast(`User ${username} has been removed`);
-	// 	} catch (err) {
-	// 		console.error(err);
-	// 		sendUserToast(`Cannot delete user: ${err}`, true);
-	// 	}
-	// }
+	const latestGitSyncHubScript = hubPaths.gitSync
 
 	async function editSlackCommand(): Promise<void> {
-		await WorkspaceService.editSlackCommand({
-			workspace: $workspaceStore!,
-			requestBody: { slack_command_script: `${itemKind}/${scriptPath}` }
-		})
-		sendUserToast(`slack command script set to ${scriptPath}`)
+		initialPath = scriptPath
+		if (scriptPath) {
+			await WorkspaceService.editSlackCommand({
+				workspace: $workspaceStore!,
+				requestBody: { slack_command_script: `${itemKind}/${scriptPath}` }
+			})
+			sendUserToast(`slack command script set to ${scriptPath}`)
+		} else {
+			await WorkspaceService.editSlackCommand({
+				workspace: $workspaceStore!,
+				requestBody: { slack_command_script: undefined }
+			})
+			sendUserToast(`slack command script removed`)
+		}
 	}
 
 	async function editWebhook(): Promise<void> {
@@ -103,567 +175,626 @@
 		}
 	}
 
+	async function editCopilotConfig(openaiResourcePath: string): Promise<void> {
+		// in JS, an empty string is also falsy
+		openaiResourceInitialPath = openaiResourcePath
+		if (openaiResourcePath) {
+			await WorkspaceService.editCopilotConfig({
+				workspace: $workspaceStore!,
+				requestBody: {
+					openai_resource_path: openaiResourcePath,
+					code_completion_enabled: codeCompletionEnabled
+				}
+			})
+			copilotInfo.set({
+				exists_openai_resource_path: true,
+				code_completion_enabled: codeCompletionEnabled
+			})
+		} else {
+			await WorkspaceService.editCopilotConfig({
+				workspace: $workspaceStore!,
+				requestBody: {
+					openai_resource_path: undefined,
+					code_completion_enabled: codeCompletionEnabled
+				}
+			})
+			copilotInfo.set({
+				exists_openai_resource_path: true,
+				code_completion_enabled: codeCompletionEnabled
+			})
+		}
+		sendUserToast(`Copilot settings updated`)
+	}
+
+	async function editWindmillLFSSettings(): Promise<void> {
+		const large_file_storage = convertFrontendToBackendSetting(s3ResourceSettings)
+		await WorkspaceService.editLargeFileStorageConfig({
+			workspace: $workspaceStore!,
+			requestBody: {
+				large_file_storage: large_file_storage
+			}
+		})
+		console.log('Large file storage settings changed', large_file_storage)
+		sendUserToast(`Large file storage settings changed`)
+	}
+
+	async function editWindmillGitSyncSettings(): Promise<void> {
+		let alreadySeenResource: string[] = []
+		let repositories = gitSyncSettings.repositories.map((elmt) => {
+			alreadySeenResource.push(elmt.git_repo_resource_path)
+			let exclude_types_override = gitSyncTypeMapToArray(elmt.exclude_types_override, true)
+			return {
+				exclude_types_override: exclude_types_override,
+				script_path: elmt.script_path,
+				git_repo_resource_path: `$res:${elmt.git_repo_resource_path.replace('$res:', '')}`,
+				use_individual_branch: elmt.use_individual_branch,
+				group_by_folder: elmt.group_by_folder
+			}
+		})
+
+		let include_path = gitSyncSettings.include_path.filter((elmt) => {
+			return !emptyString(elmt)
+		})
+
+		let include_type = gitSyncTypeMapToArray(gitSyncSettings.include_type, true)
+
+		if (alreadySeenResource.some((res, index) => alreadySeenResource.indexOf(res) !== index)) {
+			sendUserToast('Same Git resource used more than once', true)
+			return
+		}
+		if (repositories.length > 0 || include_path.length > 1 || include_path[0] !== 'f/**') {
+			await WorkspaceService.editWorkspaceGitSyncConfig({
+				workspace: $workspaceStore!,
+				requestBody: {
+					git_sync_settings: {
+						repositories: repositories,
+						include_path: include_path,
+						include_type: include_type
+					}
+				}
+			})
+			sendUserToast('Workspace Git sync settings updated')
+		} else {
+			await WorkspaceService.editWorkspaceGitSyncConfig({
+				workspace: $workspaceStore!,
+				requestBody: {
+					git_sync_settings: undefined
+				}
+			})
+			sendUserToast('Workspace Git sync settings reset')
+		}
+	}
+
+	function gitSyncTypeMapToArray(typesMap: GitSyncTypeMap, expectedValue: boolean): GitSyncType[] {
+		let result: GitSyncType[] = []
+		if (typesMap.scripts == expectedValue) {
+			result.push('script')
+		}
+		if (typesMap.flows == expectedValue) {
+			result.push('flow')
+		}
+		if (typesMap.apps == expectedValue) {
+			result.push('app')
+		}
+		if (typesMap.folders == expectedValue) {
+			result.push('folder')
+		}
+		if (typesMap.resourceTypes == expectedValue) {
+			result.push('resourcetype')
+		}
+		if (typesMap.resources == expectedValue) {
+			result.push('resource')
+		}
+		if (typesMap.variables == expectedValue) {
+			result.push('variable')
+		}
+		if (typesMap.secrets == expectedValue) {
+			result.push('secret')
+		}
+		if (typesMap.schedules == expectedValue) {
+			result.push('schedule')
+		}
+		if (typesMap.users == expectedValue) {
+			result.push('user')
+		}
+		if (typesMap.groups == expectedValue) {
+			result.push('group')
+		}
+		return result
+	}
+
+	function resetGitSyncRepositoryExclude(type: string) {
+		gitSyncSettings.repositories.forEach((elmt) => {
+			elmt.exclude_types_override[type] = false
+		})
+	}
+
+	async function editWorkspaceDefaultApp(appPath: string | undefined): Promise<void> {
+		if (emptyString(appPath)) {
+			await WorkspaceService.editWorkspaceDefaultApp({
+				workspace: $workspaceStore!,
+				requestBody: {
+					default_app_path: undefined
+				}
+			})
+			sendUserToast('Workspace default app reset')
+		} else {
+			await WorkspaceService.editWorkspaceDefaultApp({
+				workspace: $workspaceStore!,
+				requestBody: {
+					default_app_path: appPath
+				}
+			})
+			sendUserToast('Workspace default app set')
+		}
+	}
+
+	async function loadWorkspaceEncryptionKey(): Promise<void> {
+		let resp = await WorkspaceService.getWorkspaceEncryptionKey({
+			workspace: $workspaceStore!
+		})
+		workspaceEncryptionKey = resp.key
+		editedWorkspaceEncryptionKey = resp.key
+	}
+
+	async function setWorkspaceEncryptionKey(): Promise<void> {
+		if (
+			emptyString(editedWorkspaceEncryptionKey) ||
+			workspaceEncryptionKey === editedWorkspaceEncryptionKey
+		) {
+			return
+		}
+		const timeStart = new Date().getTime()
+		workspaceReencryptionInProgress = true
+		await WorkspaceService.setWorkspaceEncryptionKey({
+			workspace: $workspaceStore!,
+			requestBody: {
+				new_key: editedWorkspaceEncryptionKey ?? '' // cannot be undefined at this point
+			}
+		})
+		await loadWorkspaceEncryptionKey()
+		const timeEnd = new Date().getTime()
+		sendUserToast('All workspace secrets have been re-encrypted with the new key')
+		setTimeout(() => {
+			workspaceReencryptionInProgress = false
+		}, 1000 - (timeEnd - timeStart))
+	}
+
 	async function loadSettings(): Promise<void> {
 		const settings = await WorkspaceService.getSettings({ workspace: $workspaceStore! })
 		team_name = settings.slack_name
-		auto_invite_domain = settings.auto_invite_domain
-		operatorOnly = settings.auto_invite_operator
+
+		if (settings.slack_command_script) {
+			itemKind = settings.slack_command_script.split('/')[0] as 'flow' | 'script'
+		}
 		scriptPath = (settings.slack_command_script ?? '').split('/').slice(1).join('/')
+		initialPath = scriptPath
 		plan = settings.plan
 		customer_id = settings.customer_id
-		initialPath = scriptPath
+		workspaceToDeployTo = settings.deploy_to
 		webhook = settings.webhook
-	}
-
-	async function listUsers(): Promise<void> {
-		users = await UserService.listUsers({ workspace: $workspaceStore! })
-	}
-
-	async function listInvites(): Promise<void> {
-		invites = await WorkspaceService.listPendingInvites({ workspace: $workspaceStore! })
-	}
-
-	let allowedAutoDomain = false
-
-	async function getDisallowedAutoDomain() {
-		allowedAutoDomain = await WorkspaceService.isDomainAllowed()
-	}
-
-	async function loadPremiumInfo() {
-		if (isCloudHosted()) {
-			premium_info = await WorkspaceService.getPremiumInfo({ workspace: $workspaceStore! })
+		openaiResourceInitialPath = settings.openai_resource_path
+		errorHandlerItemKind = settings.error_handler?.split('/')[0] as 'flow' | 'script'
+		errorHandlerScriptPath = (settings.error_handler ?? '').split('/').slice(1).join('/')
+		errorHandlerInitialScriptPath = errorHandlerScriptPath
+		errorHandlerMutedOnCancel = settings.error_handler_muted_on_cancel
+		if (emptyString($enterpriseLicense)) {
+			errorHandlerSelected = 'custom'
+		} else {
+			errorHandlerSelected =
+				emptyString(errorHandlerScriptPath) ||
+				(errorHandlerScriptPath.startsWith('hub/') &&
+					errorHandlerScriptPath.endsWith('/workspace-or-schedule-error-handler-slack'))
+					? 'slack'
+					: 'custom'
 		}
-	}
-	$: domain = $userStore?.email.split('@')[1]
+		errorHandlerExtraArgs = settings.error_handler_extra_args ?? {}
+		codeCompletionEnabled = settings.code_completion_enabled
+		workspaceDefaultAppPath = settings.default_app
 
-	$: {
-		if ($workspaceStore) {
-			getDisallowedAutoDomain()
-			listUsers()
-			listInvites()
-			loadSettings()
-			loadPremiumInfo()
-		}
-	}
+		s3ResourceSettings = convertBackendSettingsToFrontendSettings(settings.large_file_storage)
 
-	async function removeAllInvitesFromDomain() {
-		await Promise.all(
-			invites
-				.filter((x) => x.email.endsWith('@' + auto_invite_domain ?? ''))
-				.map(({ email, is_admin, operator }) =>
-					WorkspaceService.deleteInvite({
-						workspace: $workspaceStore ?? '',
-						requestBody: {
-							email,
-							is_admin,
-							operator
-						}
+		if (settings.git_sync !== undefined && settings.git_sync !== null) {
+			gitSyncTestJobs = []
+			gitSyncSettings = {
+				include_path:
+					settings.git_sync.include_path?.length ?? 0 > 0
+						? settings.git_sync.include_path ?? []
+						: ['f/**'],
+				repositories: (settings.git_sync.repositories ?? []).map((settings) => {
+					gitSyncTestJobs.push({
+						jobId: undefined,
+						status: undefined
 					})
-				)
+					return {
+						git_repo_resource_path: settings.git_repo_resource_path.replace('$res:', ''),
+						script_path: settings.script_path,
+						use_individual_branch: settings.use_individual_branch ?? false,
+						group_by_folder: settings.group_by_folder ?? false,
+						exclude_types_override: {
+							scripts: (settings.exclude_types_override?.indexOf('script') ?? -1) >= 0,
+							flows: (settings.exclude_types_override?.indexOf('flow') ?? -1) >= 0,
+							apps: (settings.exclude_types_override?.indexOf('app') ?? -1) >= 0,
+							resourceTypes: (settings.exclude_types_override?.indexOf('resourcetype') ?? -1) >= 0,
+							resources: (settings.exclude_types_override?.indexOf('resource') ?? -1) >= 0,
+							variables: (settings.exclude_types_override?.indexOf('variable') ?? -1) >= 0,
+							secrets: (settings.exclude_types_override?.indexOf('secret') ?? -1) >= 0,
+							schedules: (settings.exclude_types_override?.indexOf('schedule') ?? -1) >= 0,
+							folders: (settings.exclude_types_override?.indexOf('folder') ?? -1) >= 0,
+							users: (settings.exclude_types_override?.indexOf('user') ?? -1) >= 0,
+							groups: (settings.exclude_types_override?.indexOf('group') ?? -1) >= 0
+						}
+					}
+				}),
+				include_type: {
+					scripts: (settings.git_sync.include_type?.indexOf('script') ?? -1) >= 0,
+					flows: (settings.git_sync.include_type?.indexOf('flow') ?? -1) >= 0,
+					apps: (settings.git_sync.include_type?.indexOf('app') ?? -1) >= 0,
+					resourceTypes: (settings.git_sync.include_type?.indexOf('resourcetype') ?? -1) >= 0,
+					resources: (settings.git_sync.include_type?.indexOf('resource') ?? -1) >= 0,
+					variables: (settings.git_sync.include_type?.indexOf('variable') ?? -1) >= 0,
+					secrets: (settings.git_sync.include_type?.indexOf('secret') ?? -1) >= 0,
+					schedules: (settings.git_sync.include_type?.indexOf('schedule') ?? -1) >= 0,
+					folders: (settings.git_sync.include_type?.indexOf('folder') ?? -1) >= 0,
+					users: (settings.git_sync.include_type?.indexOf('user') ?? -1) >= 0,
+					groups: (settings.git_sync.include_type?.indexOf('group') ?? -1) >= 0
+				}
+			}
+		} else {
+			gitSyncSettings = {
+				include_path: ['f/**'],
+				repositories: [],
+				include_type: {
+					scripts: true,
+					flows: true,
+					apps: true,
+					folders: true,
+					resourceTypes: false,
+					resources: false,
+					variables: false,
+					secrets: false,
+					schedules: false,
+					users: false,
+					groups: false
+				}
+			}
+			gitSyncTestJobs = []
+		}
+		if (settings.deploy_ui != undefined && settings.deploy_ui != null) {
+			deployUiSettings = {
+				include_path:
+					settings.deploy_ui.include_path?.length ?? 0 > 0
+						? settings.deploy_ui.include_path ?? []
+						: [],
+				include_type: {
+					scripts: (settings.deploy_ui.include_type?.indexOf('script') ?? -1) >= 0,
+					flows: (settings.deploy_ui.include_type?.indexOf('flow') ?? -1) >= 0,
+					apps: (settings.deploy_ui.include_type?.indexOf('app') ?? -1) >= 0,
+					resources: (settings.deploy_ui.include_type?.indexOf('resource') ?? -1) >= 0,
+					variables: (settings.deploy_ui.include_type?.indexOf('variable') ?? -1) >= 0,
+					secrets: (settings.deploy_ui.include_type?.indexOf('secret') ?? -1) >= 0
+				}
+			}
+		}
+
+		// check openai_client_credentials_oauth
+		usingOpenaiClientCredentialsOauth = await ResourceService.existsResourceType({
+			workspace: $workspaceStore!,
+			path: 'openai_client_credentials_oauth'
+		})
+	}
+
+	let deployUiSettings: {
+		include_path: string[]
+		include_type: {
+			scripts: boolean
+			flows: boolean
+			apps: boolean
+			resources: boolean
+			variables: boolean
+			secrets: boolean
+		}
+	}
+
+	$: $workspaceStore && loadSettings()
+
+	async function editErrorHandler() {
+		if (errorHandlerScriptPath) {
+			if (errorHandlerScriptPath !== undefined && isSlackHandler(errorHandlerScriptPath)) {
+				errorHandlerExtraArgs['slack'] = '$res:f/slack_bot/bot_token'
+			}
+			await WorkspaceService.editErrorHandler({
+				workspace: $workspaceStore!,
+				requestBody: {
+					error_handler: `${errorHandlerItemKind}/${errorHandlerScriptPath}`,
+					error_handler_extra_args: errorHandlerExtraArgs,
+					error_handler_muted_on_cancel: errorHandlerMutedOnCancel
+				}
+			})
+			sendUserToast(`workspace error handler set to ${errorHandlerScriptPath}`)
+		} else {
+			await WorkspaceService.editErrorHandler({
+				workspace: $workspaceStore!,
+				requestBody: {
+					error_handler: undefined,
+					error_handler_extra_args: undefined,
+					error_handler_muted_on_cancel: undefined
+				}
+			})
+			sendUserToast(`workspace error handler removed`)
+		}
+	}
+
+	function isSlackHandler(scriptPath: string) {
+		return (
+			scriptPath.startsWith('hub/') &&
+			scriptPath.endsWith('/workspace-or-schedule-error-handler-slack')
 		)
 	}
 
-	const plans = {
-		Free: [
-			'Users use their individual global free-tier quotas when doing executions in this workspace',
-			'<b>1 000</b> free global executions per-user per month'
-		],
-		Team: [
-			`<b>$10/mo</b> per seat`,
-			`Every seat includes <b>10 000</b> executions`,
-			`Every seat includes either 1 user OR 2 operators`
-		],
-		Enterprise: [
-			`<b>Dedicated</b> and isolated database and workers available (EU/US/Asia)`,
-			`<b>Dedicated</b> entire cluster available for (EU/US/Asia)`,
-			`<b>SAML</b> support with group syncing`,
-			`<b>SLA</b>`,
-			`<b>Priority Support 24/7 with 3h response time and automation engineer assistance</b>`,
-			`<b>Design partners for Roadmap</b>`,
-			`<div class="mt-4">Self-hosted licenses also available</div>`
-		]
+	async function runGitSyncTestJob(settingsIdx: number) {
+		let gitSyncRepository = gitSyncSettings.repositories[settingsIdx]
+		if (emptyString(gitSyncRepository.script_path)) {
+			return
+		}
+		let jobId = await JobService.runScriptByPath({
+			workspace: $workspaceStore!,
+			path: hubPaths.gitSyncTest,
+			skipPreprocessor: true,
+			requestBody: {
+				repo_url_resource_path: gitSyncRepository.git_repo_resource_path.replace('$res:', '')
+			}
+		})
+		gitSyncTestJobs[settingsIdx] = {
+			jobId: jobId,
+			status: 'running'
+		}
+		tryEvery({
+			tryCode: async () => {
+				const testResult = await JobService.getCompletedJob({
+					workspace: $workspaceStore!,
+					id: jobId
+				})
+				gitSyncTestJobs[settingsIdx].status = testResult.success ? 'success' : 'failure'
+			},
+			timeoutCode: async () => {
+				try {
+					await JobService.cancelQueuedJob({
+						workspace: $workspaceStore!,
+						id: jobId,
+						requestBody: {
+							reason: 'Git sync test job timed out after 5s'
+						}
+					})
+				} catch (err) {
+					console.error(err)
+				}
+			},
+			interval: 500,
+			timeout: 5000
+		})
 	}
 </script>
 
-<SearchItems
-	filter={userFilter}
-	items={users}
-	bind:filteredItems={filteredUsers}
-	f={(x) => x.email + ' ' + x.name + ' ' + x.company}
-/>
+<Portal name="workspace-settings">
+	<S3FilePicker bind:this={s3FileViewer} readOnlyMode={false} fromWorkspaceSettings={true} />
+</Portal>
 
 <CenteredPage>
 	{#if $userStore?.is_admin || $superadmin}
-		<PageHeader title="Workspace Settings of {$workspaceStore}" />
+		<PageHeader title="Workspace settings: {$workspaceStore}"
+			>{#if $superadmin}
+				<Button
+					variant="border"
+					color="dark"
+					size="sm"
+					on:click={() => goto('#superadmin-settings')}
+				>
+					Instance settings
+				</Button>
+			{/if}</PageHeader
+		>
 
 		<div class="overflow-x-auto scrollbar-hidden">
-			<Tabs bind:selected={tab}>
-				<Tab size="md" value="users">
-					<div class="flex gap-2 items-center my-1"> Users & Invites </div>
+			<Tabs
+				bind:selected={tab}
+				on:selected={() => {
+					// setQueryWithoutLoad($page.url, [{ key: 'tab', value: tab }], 0)
+					$page.url.searchParams.set('tab', tab)
+					goto(`?${$page.url.searchParams.toString()}`)
+				}}
+			>
+				<Tab size="xs" value="users">
+					<div class="flex gap-2 items-center my-1"> Users</div>
+				</Tab>
+				<Tab size="xs" value="git_sync">
+					<div class="flex gap-2 items-center my-1">Git Sync</div>
+				</Tab>
+				<Tab size="xs" value="deploy_to">
+					<div class="flex gap-2 items-center my-1">Deployment UI</div>
 				</Tab>
 				{#if WORKSPACE_SHOW_SLACK_CMD}
-					<Tab size="md" value="slack">
-						<div class="flex gap-2 items-center my-1"> Slack Command </div>
+					<Tab size="xs" value="slack">
+						<div class="flex gap-2 items-center my-1"> Slack </div>
 					</Tab>
 				{/if}
 				{#if isCloudHosted()}
-					<Tab size="md" value="premium">
+					<Tab size="xs" value="premium">
 						<div class="flex gap-2 items-center my-1"> Premium Plans </div>
 					</Tab>
 				{/if}
-				<Tab size="md" value="export_delete">
-					<div class="flex gap-2 items-center my-1"> Export & Delete Workspace </div>
-				</Tab>
 				{#if WORKSPACE_SHOW_WEBHOOK_CLI_SYNC}
-					<Tab size="md" value="webhook">
-						<div class="flex gap-2 items-center my-1">Webhook for CLI Sync</div>
+					<Tab size="xs" value="webhook">
+						<div class="flex gap-2 items-center my-1">Webhook</div>
 					</Tab>
 				{/if}
+				<Tab size="xs" value="error_handler">
+					<div class="flex gap-2 items-center my-1">Error Handler</div>
+				</Tab>
+				<Tab size="xs" value="openai">
+					<div class="flex gap-2 items-center my-1">Windmill AI</div>
+				</Tab>
+				<Tab size="xs" value="windmill_lfs">
+					<div class="flex gap-2 items-center my-1"> Object Storage (S3)</div>
+				</Tab>
+				<Tab size="xs" value="default_app">
+					<div class="flex gap-2 items-center my-1"> Default App </div>
+				</Tab>
+				<Tab size="xs" value="encryption">
+					<div class="flex gap-2 items-center my-1"> Encryption </div>
+				</Tab>
+				<Tab size="xs" value="general">
+					<div class="flex gap-2 items-center my-1"> General </div>
+				</Tab>
 			</Tabs>
 		</div>
 		{#if tab == 'users'}
-			<PageHeader title="Members ({users?.length ?? ''})" primary={false} />
-
-			<AddUser on:new={listUsers} />
-
-			<div class="pt-2 pb-1">
-				<input placeholder="Search users" bind:value={userFilter} class="input mt-1" />
-			</div>
-			<div class="overflow-auto max-h-screen mb-20">
-				<TableCustom>
-					<tr slot="header-row">
-						<th>email</th>
-						<th>username</th>
-						<th
-							>executions (<abbr title="past 5 weeks">5w</abbr>) <Tooltip
-								>An execution is calculated as 1 for any runs of scripts + 1 for each seconds above
-								the first one</Tooltip
-							>
-						</th>
-						<th />
-						<th />
-						<th />
-					</tr>
-					<tbody slot="body">
-						{#if filteredUsers}
-							{#each filteredUsers.slice(0, nbDisplayed) as { email, username, is_admin, operator, usage, disabled } (email)}
-								<tr class="border">
-									<td>{email}</td>
-									<td>{username}</td>
-									<td>{usage?.executions}</td>
-									<td
-										><div class="flex gap-1"
-											>{#if disabled}
-												<Badge color="red">disabled</Badge>
-											{/if}</div
-										></td
-									>
-									<td>
-										<div>
-											<ToggleButtonGroup
-												selected={is_admin ? 'admin' : operator ? 'operator' : 'author'}
-												on:selected={async (e) => {
-													if (is_admin && email == $userStore?.email && e.detail != 'admin') {
-														sendUserToast(
-															'Admins cannot be demoted by themselves, ask another admin to demote you',
-															true
-														)
-														e.preventDefault()
-														listUsers()
-														return
-													}
-													const body =
-														e.detail == 'admin'
-															? { is_admin: true, operator: false }
-															: e.detail == 'operator'
-															? { is_admin: false, operator: true }
-															: { is_admin: false, operator: false }
-													await UserService.updateUser({
-														workspace: $workspaceStore ?? '',
-														username,
-														requestBody: body
-													})
-													listUsers()
-												}}
-											>
-												<ToggleButton position="left" value="operator" size="xs"
-													>Operator <Tooltip
-														>An operator can only execute and view scripts/flows/apps from your
-														workspace, and only those that he has visibility on</Tooltip
-													></ToggleButton
-												>
-												<ToggleButton position="center" value="author" size="xs"
-													>Author <Tooltip
-														>An Author can execute and view scripts/flows/apps, but he can also
-														create new ones</Tooltip
-													></ToggleButton
-												>
-												<ToggleButton position="right" value="admin" size="xs">Admin</ToggleButton>
-											</ToggleButtonGroup>
-										</div>
-									</td>
-									<td>
-										<div class="flex gap-1">
-											<button
-												class="text-blue-500"
-												on:click={async () => {
-													await UserService.updateUser({
-														workspace: $workspaceStore ?? '',
-														username,
-														requestBody: {
-															disabled: !disabled
-														}
-													})
-													listUsers()
-												}}>{disabled ? 'enable' : 'disable'}</button
-											>
-											|
-											<button
-												class="text-red-500"
-												on:click={async () => {
-													await UserService.deleteUser({
-														workspace: $workspaceStore ?? '',
-														username
-													})
-													sendUserToast('User removed')
-													listUsers()
-												}}>remove</button
-											>
-										</div>
-									</td>
-								</tr>
-							{/each}
-							{#if filteredUsers?.length > 50}
-								<span class="text-xs"
-									>{nbDisplayed} items out of {filteredUsers.length}
-									<button class="ml-4" on:click={() => (nbDisplayed += 30)}>load 30 more</button
-									></span
-								>
-							{/if}
-						{:else}
-							{#each new Array(6) as _}
-								<tr class="border">
-									{#each new Array(4) as _}
-										<td>
-											<Skeleton layout={[[2]]} />
-										</td>
-									{/each}
-								</tr>
-							{/each}
-						{/if}
-					</tbody>
-				</TableCustom>
-			</div>
-			<PageHeader title="Pending Invites ({invites.length ?? ''})" primary={false}>
-				<InviteUser on:new={listInvites} />
-			</PageHeader>
-
-			<div class="overflow-auto max-h-screen">
-				<TableCustom>
-					<tr slot="header-row">
-						<th>email</th>
-						<th>role</th>
-						<th />
-					</tr>
-					<tbody slot="body">
-						{#each invites as { email, is_admin, operator }}
-							<tr class="border">
-								<td>{email}</td>
-								<td
-									>{#if operator}<Badge>operator</Badge>{:else if is_admin}<Badge>admin</Badge>{/if}
-								</td>
-								<td>
-									<button
-										class="ml-2 text-red-500"
-										on:click={async () => {
-											await WorkspaceService.deleteInvite({
-												workspace: $workspaceStore ?? '',
-												requestBody: {
-													email,
-													is_admin,
-													operator
-												}
-											})
-											listInvites()
-										}}>cancel</button
-									></td
-								>
-							</tr>
-						{/each}
-					</tbody>
-				</TableCustom>
-			</div>
-
-			<div class="mt-10" />
-			<PageHeader title="Auto Invite" primary={false} />
-			<div class="flex gap-2">
-				{#if auto_invite_domain != domain}
-					<div>
-						<Button
-							disabled={!allowedAutoDomain}
-							on:click={async () => {
-								await WorkspaceService.editAutoInvite({
-									workspace: $workspaceStore ?? '',
-									requestBody: { operator: false }
-								})
-								loadSettings()
-								listInvites()
-							}}>Set auto-invite to {domain}</Button
-						>
+			<WorkspaceUserSettings />
+		{:else if tab == 'deploy_to'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold">
+						Link this workspace to another Staging / Prod workspace
 					</div>
-				{/if}
-				{#if auto_invite_domain}
-					<div class="flex flex-col gap-y-2">
-						<Toggle
-							bind:checked={operatorOnly}
-							options={{
-								right: `Auto-invited users to join as operators`
-							}}
-							on:change={async (e) => {
-								await removeAllInvitesFromDomain()
-								await WorkspaceService.editAutoInvite({
-									workspace: $workspaceStore ?? '',
-									requestBody: { operator: e.detail }
-								})
-								loadSettings()
-								listInvites()
-							}}
-						/>
-						<div>
-							<Button
-								on:click={async () => {
-									await removeAllInvitesFromDomain()
-									await WorkspaceService.editAutoInvite({
-										workspace: $workspaceStore ?? '',
-										requestBody: { operator: undefined }
-									})
-									loadSettings()
-									listInvites()
-								}}>Unset auto-invite from {auto_invite_domain} domain</Button
-							>
-						</div>
+					<div class="text-tertiary text-xs">
+						Connecting this workspace with another staging/production workspace enables web-based
+						deployment to that workspace.
+						<a
+							href="https://www.windmill.dev/docs/core_concepts/staging_prod"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
 					</div>
-				{/if}
+				</div>
 			</div>
-			{#if !allowedAutoDomain}
-				<div class="text-red-400 text-sm mb-2">{domain} domain not allowed for auto-invite</div>
+			{#if $enterpriseLicense}
+				<DeployToSetting bind:workspaceToDeployTo bind:deployUiSettings />
+			{:else}
+				<div class="my-2"
+					><Alert type="error" title="Enterprise license required"
+						>Deploy to staging/prod from the web UI is only available with an enterprise license</Alert
+					></div
+				>
 			{/if}
 		{:else if tab == 'premium'}
-			{#if isCloudHosted()}
-				<div class="mt-4" />
-				{#if customer_id}
-					<div class="mt-2 mb-2">
+			<PremiumInfo {customer_id} {plan} />
+		{:else if tab == 'slack'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold"> Connect workspace to Slack </div>
+					<div class="text-tertiary text-xs">
+						Connect your Windmill workspace to your Slack workspace to trigger a script or a flow
+						with a '/windmill' command or to configure Slack error handlers.
+						<a
+							href="https://www.windmill.dev/docs/integrations/slack"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+
+				{#if team_name}
+					<div class="flex flex-col gap-2 max-w-sm">
 						<Button
-							endIcon={{ icon: faExternalLink }}
-							href="/api/w/{$workspaceStore}/workspaces/billing_portal">Customer Portal</Button
+							size="sm"
+							endIcon={{ icon: Slack }}
+							btnClasses="mt-2"
+							variant="border"
+							on:click={async () => {
+								await OauthService.disconnectSlack({
+									workspace: $workspaceStore ?? ''
+								})
+								loadSettings()
+								sendUserToast('Disconnected Slack')
+							}}
 						>
-						<p class="text-xs text-gray-600 mt-1">
-							See invoices, change billing information or subscription details</p
+							Disconnect Slack
+						</Button>
+						<Button
+							size="sm"
+							endIcon={{ icon: Code2 }}
+							href="{base}/scripts/add?hub=hub%2F314%2Fslack%2Fexample_of_responding_to_a_slack_command_slack"
 						>
+							Create a script to handle slack commands
+						</Button>
+						<Button size="sm" endIcon={{ icon: BarsStaggered }} href="{base}/flows/add?hub=28">
+							Create a flow to handle slack commands
+						</Button>
+					</div>
+				{:else}
+					<div class="flex flex-row gap-2">
+						<Button
+							size="xs"
+							color="dark"
+							href="{base}/api/oauth/connect_slack"
+							startIcon={{ icon: Slack }}
+						>
+							Connect to Slack
+						</Button>
+						<Badge color="red">Not connnected</Badge>
 					</div>
 				{/if}
-
-				<div class="text-sm mb-4 box p-2 max-w-3xl">
-					{#if premium_info?.premium}
-						<div class="flex flex-col gap-0.5">
-							{#if plan}
-								<div class="mb-2"
-									><div class=" inline text-2xl font-bold float-right"
-										>{capitalize(plan ?? 'free')} plan</div
-									></div
-								>
-							{:else}
-								<div class="inline text-2xl font-bold">Free plan</div>
-							{/if}
-
-							{#if plan}
-								{@const team_factor = plan == 'team' ? 10 : 40}
-								{@const user_nb = users?.filter((x) => !x.operator)?.length ?? 0}
-								{@const operator_nb = users?.filter((x) => x.operator)?.length ?? 0}
-								{@const seats_from_users = Math.ceil(user_nb + operator_nb / 2)}
-								{@const seats_from_comps = Math.ceil((premium_info?.usage ?? 0) / 10000)}
-
-								<div>
-									Authors:
-									<div class="inline text-2xl font-bold float-right">{user_nb}</div>
-									<Tooltip
-										>Actual pricing is calculated on the MAXIMUM number of users in a given billing
-										period, see the customer portal for more info.</Tooltip
-									>
-								</div>
-								<div>
-									Operators:
-									<div class="inline text-2xl font-bold float-right">{operator_nb}</div>
-									<Tooltip
-										>Actual pricing is calculated on the MAXIMUM number of operators in a given
-										billing period, see the customer portal for more info.</Tooltip
-									>
-								</div>
-
-								<div>
-									Seats from authors + operators:
-									<div class="inline text-2xl font-bold float-right mb-8"
-										>ceil({user_nb} + {operator_nb}/2) = {seats_from_users}</div
-									>
-								</div>
-								<div>
-									Computations executed this month:
-									<div class=" inline text-2xl font-bold float-right"
-										>{premium_info?.usage ?? 0}
-									</div>
-								</div>
-								<div>
-									Seats from computations:
-									<div class="inline text-2xl font-bold float-right mb-8"
-										>ceil({premium_info?.usage ?? 0} / 10 000) = {seats_from_comps}</div
-									>
-								</div>
-
-								<div>
-									Total seats:
-									<div class=" inline text-2xl font-bold float-right">
-										max({seats_from_comps}, {seats_from_users}) * {team_factor} = ${Math.max(
-											seats_from_comps,
-											seats_from_users
-										) * team_factor}/mo
-									</div>
-								</div>
-							{/if}
-						</div>
-					{:else}
-						This workspace is <b>NOT</b> on a team plan. Users use their global free-tier quotas when
-						doing executions in this workspace. Upgrade to a Team or Enterprise plan to unlock unlimited
-						executions in this workspace.
+			</div>
+			<div class="bg-surface-disabled p-4 rounded-md flex flex-col gap-1">
+				<div class="text-primary font-md font-semibold">
+					Script or flow to run on /windmill command
+				</div>
+				<div class="relative">
+					{#if !team_name}
+						<div class="absolute top-0 right-0 bottom-0 left-0 bg-surface-disabled/50 z-40" />
 					{/if}
+					<ScriptPicker
+						kinds={['script']}
+						allowFlow
+						bind:itemKind
+						bind:scriptPath
+						{initialPath}
+						on:select={editSlackCommand}
+					/>
 				</div>
 
-				<div class="flex flex-col gap-1 mb-4">
-					<Slider text="What is an execution?">
-						<Alert type="info" title="A computation is 1s of execution">
-							The single credit-unit is called an "execution". An execution corresponds to a single
-							job whose duration is less than 1s. For any additional seconds of computation, an
-							additional execution is accounted for. Jobs are executed on one powerful virtual CPU
-							with 2Gb of memory. Most jobs will take less than 200ms to execute.
-						</Alert>
-					</Slider>
+				<div class="prose text-2xs text-tertiary">
+					Pick a script or flow meant to be triggered when the `/windmill` command is invoked. Upon
+					connection, templates for a <a href="{$hubBaseUrlStore}/scripts/slack/1405/">script</a>
+					and <a href="{$hubBaseUrlStore}/flows/28/">flow</a> are available.
 
-					<Slider text="Operator vs Author">
-						<Alert type="info" title="Operator vs Author"
-							>An author can write scripts/flows/apps/variables/resources. An operator can only
-							run/view them.</Alert
-						>
-					</Slider>
-				</div>
+					<br /><br />
 
-				<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-					{#each Object.entries(plans) as [planTitle, planDesc]}
-						<div class="box p-4 text-sm flex flex-col h-full overflow-hidden">
-							<h2 class="mb-4">{planTitle}</h2>
-							<ul class="list-disc text-lg p-4">
-								{#each planDesc as item}
-									<li class="mt-2">{@html item}</li>
-								{/each}
-							</ul>
+					The script or flow chosen is passed the parameters `response_url: string` and `text:
+					string` respectively the url to reply directly to the trigger and the text of the command.
 
-							<div class="grow" />
-							{#if planTitle == 'Team'}
-								{#if plan != 'team'}
-									<div class="mt-4 mx-auto">
-										<Button size="lg" href="/api/w/{$workspaceStore}/workspaces/checkout?plan=team"
-											>Upgrade to the Team plan</Button
-										>
-									</div>
-								{:else}
-									<div class="mx-auto text-lg font-semibold">Workspace is on the team plan</div>
-								{/if}
-							{:else if planTitle == 'Enterprise'}
-								{#if plan != 'enterprise'}
-									<div class="mt-4 mx-auto">
-										<Button size="lg" href="https://www.windmill.dev/pricing" target="_blank"
-											>See more</Button
-										>
-									</div>
-								{:else}
-									<div class="mx-auto text-lg font-semibold">Workspace is on enterprise plan</div>
-								{/if}
-							{:else if !plan}
-								<div class="mx-auto text-lg font-semibold">Workspace is on the free plan</div>
-							{:else}
-								<div class="mt-4 w-full">
-									<Button href="/api/w/{$workspaceStore}/workspaces/checkout"
-										>Upgrade to the {planTitle} plan</Button
-									>
-								</div>
-							{/if}
-						</div>
-					{/each}
+					<br /><br />
+
+					It can take additionally the following args: channel_id, user_name, user_id, command,
+					trigger_id, api_app_id
+
+					<br /><br />
+
+					<span class="font-bold text-xs">
+						The script or flow is permissioned as group "slack" that will be automatically created
+						after connection to Slack.
+					</span>
+
+					<br /><br />
+
+					See more on <a href="https://www.windmill.dev/docs/integrations/slack">documentation</a>.
 				</div>
-			{/if}
-		{:else if tab == 'slack'}
-			<div class="mt-2"
-				><Alert type="info" title="Send commands from slack"
-					>Connect your windmill workspace to your slack workspace to trigger a script or a flow
-					with a '/windmill' command</Alert
-				></div
-			>
-			<p class="text-xs text-gray-700 my-1 mt-2">
-				Status: {#if team_name}Connected to slack workspace <Badge>{team_name}</Badge>{:else}Not
-					connected{/if}
-			</p>
-			{#if team_name}
-				<div class="flex flex-col gap-2 max-w-sm">
-					<Button
-						size="sm"
-						endIcon={{ icon: faSlack }}
-						btnClasses="mt-2"
-						variant="border"
-						on:click={async () => {
-							await OauthService.disconnectSlack({
-								workspace: $workspaceStore ?? ''
-							})
-							loadSettings()
-							sendUserToast('Disconnected Slack')
-						}}
-					>
-						Disconnect Slack
-					</Button>
-					<Button
-						size="sm"
-						endIcon={{ icon: faScroll }}
-						href="/scripts/add?hub=hub%2F314%2Fslack%2Fexample_of_responding_to_a_slack_command_slack"
-					>
-						Create a script to handle slack commands
-					</Button>
-					<Button size="sm" endIcon={{ icon: faBarsStaggered }} href="/flows/add?hub=28">
-						Create a flow to handle slack commands
-					</Button>
-				</div>
-			{:else}
-				<Button size="sm" endIcon={{ icon: faSlack }} href="/api/oauth/connect_slack">
-					Connect to Slack
-				</Button>
-			{/if}
-			<h3 class="mt-5 text-gray-700"
-				>Script or flow to run on /windmill command <Tooltip>
-					The script or flow to be triggered when the `/windmill` command is invoked. The script or
-					flow chosen is passed the parameters <pre>response_url: string, text: string</pre>
-					respectively the url to reply directly to the trigger and the text of the command.</Tooltip
-				>
-			</h3>
-			<ScriptPicker
-				kind={Script.kind.SCRIPT}
-				allowFlow
-				bind:itemKind
-				bind:scriptPath
-				{initialPath}
-				on:select={editSlackCommand}
-			/>
-		{:else if tab == 'export_delete'}
+			</div>
+		{:else if tab == 'general'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class=" text-primary text-lg font-semibold">General</div>
+			</div>
+
+			<div class="flex flex-col gap-10">
+				<ChangeWorkspaceName />
+				<ChangeWorkspaceId />
+			</div>
+
 			<PageHeader title="Export workspace" primary={false} />
 			<div class="flex justify-start">
 				<Button
 					size="sm"
-					href="/api/w/{$workspaceStore ?? ''}/workspaces/tarball?archive_type=zip"
+					href="{base}/api/w/{$workspaceStore ?? ''}/workspaces/tarball?archive_type=zip"
 					target="_blank"
 				>
 					Export workspace as zip file
@@ -717,28 +848,892 @@
 				{/if}
 			</div>
 		{:else if tab == 'webhook'}
-			<PageHeader title="Webhook on changes" primary={false} />
-
-			<div class="mt-2"
-				><Alert type="info" title="Send events to an external service"
-					>Connect your windmill workspace to an external service to sync or get notified about any
-					changes</Alert
-				></div
-			>
-
-			<h3 class="mt-5 text-gray-700"
-				>URL to send requests to<Tooltip>
-					This URL will be POSTed to with a JSON body depending on the type of event. The type is
-					indicated by the <pre>type</pre> field. The other fields are dependent on the type.
-				</Tooltip>
-			</h3>
-
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold"> Workspace Webhook</div>
+					<div class="text-tertiary text-xs">
+						Connect your Windmill workspace to an external service to sync or get notified about any
+						change.
+						<a
+							href="https://www.windmill.dev/docs/core_concepts/webhooks#workspace-webhook"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			<div class="flex flex-col gap-4 my-4">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-base font-semibold"> URL to send requests to</div>
+					<div class="text-tertiary text-xs">
+						This URL will be POSTed to with a JSON body depending on the type of event. The type is
+						indicated by the type field. The other fields are dependent on the type.
+					</div>
+				</div>
+			</div>
 			<div class="flex gap-2">
 				<input class="justify-start" type="text" bind:value={webhook} />
-				<Button color="blue" btnClasses="justify-end" size="md" on:click={editWebhook}
-					>Set Webhook</Button
+				<Button color="blue" btnClasses="justify-end" on:click={editWebhook}>Set Webhook</Button>
+			</div>
+		{:else if tab == 'error_handler'}
+			{#if !$enterpriseLicense}
+				<div class="pt-4" />
+				<Alert type="info" title="Workspace error handler is an EE feature">
+					Workspace error handler is a Windmill EE feature. It enables using your current Slack
+					connection or a custom script to send notifications anytime any job would fail.
+				</Alert>
+				<div class="pb-2" />
+			{/if}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold"> Workspace Error Handler</div>
+					<div class="text-tertiary text-xs">
+						Define a script or flow to be executed automatically in case of error in the workspace.
+						<a
+							href="https://www.windmill.dev/docs/core_concepts/error_handling#workspace-error-handler"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			<div class="flex flex-col gap-4 my-4">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-base font-semibold">
+						Script or flow to run as error handler</div
+					>
+				</div>
+			</div>
+			<ErrorOrRecoveryHandler
+				isEditable={true}
+				errorOrRecovery="error"
+				showScriptHelpText={true}
+				customInitialScriptPath={errorHandlerInitialScriptPath}
+				bind:handlerSelected={errorHandlerSelected}
+				bind:handlerPath={errorHandlerScriptPath}
+				customScriptTemplate="/scripts/add?hub=hub%2F9083%2Fwindmill%2Fworkspace_error_handler_template"
+				bind:customHandlerKind={errorHandlerItemKind}
+				bind:handlerExtraArgs={errorHandlerExtraArgs}
+			>
+				<svelte:fragment slot="custom-tab-tooltip">
+					<Tooltip>
+						<div class="flex gap-20 items-start mt-3">
+							<div class="text-sm">
+								The following args will be passed to the error handler:
+								<ul class="mt-1 ml-2">
+									<li><b>path</b>: The path of the script or flow that errored.</li>
+									<li>
+										<b>email</b>: The email of the user who ran the script or flow that errored.
+									</li>
+									<li><b>error</b>: The error details.</li>
+									<li><b>job_id</b>: The job id.</li>
+									<li><b>is_flow</b>: Whether the error comes from a flow.</li>
+									<li><b>workspace_id</b>: The workspace id of the failed script or flow.</li>
+								</ul>
+								<br />
+								The error handler will be executed by the automatically created group g/error_handler.
+								If your error handler requires variables or resources, you need to add them to the group.
+							</div>
+						</div>
+					</Tooltip>
+				</svelte:fragment>
+			</ErrorOrRecoveryHandler>
+
+			<div class="flex flex-col mt-5 gap-5 items-start">
+				<Toggle
+					disabled={!$enterpriseLicense ||
+						(errorHandlerSelected === 'slack' &&
+							!emptyString(errorHandlerScriptPath) &&
+							emptyString(errorHandlerExtraArgs['channel']))}
+					bind:checked={errorHandlerMutedOnCancel}
+					options={{ right: 'Do not run error handler for canceled jobs' }}
+				/>
+				<Button
+					disabled={!$enterpriseLicense ||
+						(errorHandlerSelected === 'slack' &&
+							!emptyString(errorHandlerScriptPath) &&
+							emptyString(errorHandlerExtraArgs['channel']))}
+					size="sm"
+					on:click={editErrorHandler}
+				>
+					Save
+				</Button>
+			</div>
+		{:else if tab == 'openai'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold"> Windmill AI</div>
+					<div class="text-tertiary text-xs">
+						Select an OpenAI resource to unlock Windmill AI features.
+					</div>
+					<div class="text-tertiary text-xs">
+						Windmill AI uses OpenAI's GPT-4o for all AI features.
+						<a
+							href="https://www.windmill.dev/docs/core_concepts/ai_generation"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			<div class="mt-5 flex gap-1">
+				{#key [openaiResourceInitialPath, usingOpenaiClientCredentialsOauth]}
+					<ResourcePicker
+						resourceType={usingOpenaiClientCredentialsOauth
+							? 'openai_client_credentials_oauth'
+							: 'openai'}
+						initialValue={openaiResourceInitialPath}
+						on:change={(ev) => {
+							editCopilotConfig(ev.detail)
+						}}
+					/>
+				{/key}
+				<TestOpenaiKey disabled={!openaiResourceInitialPath} />
+			</div>
+			<div class="mt-3">
+				<Toggle
+					class="mr-2"
+					bind:checked={codeCompletionEnabled}
+					options={{ right: 'Enable code completion' }}
+					on:change={() => {
+						editCopilotConfig(openaiResourceInitialPath || '')
+					}}
+				/>
+			</div>
+		{:else if tab == 'windmill_lfs'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold"
+						>Workspace object storage (S3/Azure Blob)</div
+					>
+					<div class="text-tertiary text-xs">
+						Connect your Windmill workspace to your S3 bucket or your Azure Blob storage to enable
+						users to read and write from S3 without having to have access to the credentials.
+						<a
+							href="https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill#workspace-object-storage"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			{#if !$enterpriseLicense}
+				<Alert type="info" title="S3 storage is limited to 20 files in Windmill CE">
+					Windmill S3 bucket browser will not work for buckets containing more than 20 files and
+					uploads are limited to files {'<'} 50MB. Consider upgrading to Windmill EE to use this feature
+					with large buckets.
+				</Alert>
+			{:else}
+				<Alert type="info" title="Logs storage is set at the instance level">
+					This setting is only for storage of large files allowing to upload files directly to
+					object storage using S3Object and use the wmill sdk to read and write large files backed
+					by an object storage. Large-scale log management and distributed dependency caching is
+					under <a
+						href="https://www.windmill.dev/docs/core_concepts/object_storage_in_windmill#instance-object-storage"
+						class="text-blue-500">Instance object storage</a
+					>, set by the superadmins in the instance settings UI.
+				</Alert>
+			{/if}
+			{#if s3ResourceSettings}
+				<div class="mt-5">
+					<div class="w-full">
+						<Tabs bind:selected={s3ResourceSettings.resourceType}>
+							<Tab exact size="xs" value="s3">S3</Tab>
+							<Tab size="xs" value="azure_blob">Azure Blob</Tab>
+							<Tab exact size="xs" value="s3_aws_oidc">AWS OIDC</Tab>
+							<Tab size="xs" value="azure_workload_identity">Azure Workload Identity</Tab>
+						</Tabs>
+					</div>
+					<div class="w-full flex gap-1 mt-4">
+						<ResourcePicker
+							resourceType={s3ResourceSettings.resourceType}
+							bind:value={s3ResourceSettings.resourcePath}
+						/>
+						<Button
+							size="sm"
+							variant="contained"
+							color="dark"
+							disabled={emptyString(s3ResourceSettings.resourcePath)}
+							on:click={async () => {
+								if ($workspaceStore) {
+									s3FileViewer?.open?.(undefined)
+								}
+							}}>Browse content (save first)</Button
+						>
+					</div>
+				</div>
+				{#if s3ResourceSettings.resourceType == 's3'}
+					<div class="flex flex-col mt-5 mb-1 gap-1">
+						<Toggle
+							disabled={emptyString(s3ResourceSettings.resourcePath)}
+							bind:checked={s3ResourceSettings.publicResource}
+							options={{
+								right:
+									'S3 resource details and content can be accessed by all users of this workspace',
+								rightTooltip:
+									'If set, all users of this workspace will have access the to entire content of the S3 bucket, as well as the resource details and the "open preview" button. This effectively by-pass the permissions set on the resource and makes it public to everyone.'
+							}}
+						/>
+						{#if s3ResourceSettings.publicResource === true}
+							<div class="pt-2" />
+
+							<Alert type="warning" title="S3 bucket content and resource details are shared">
+								S3 resource public access is ON, which means that the entire content of the S3
+								bucket will be accessible to all the users of this workspace regardless of whether
+								they have access the resource or not. Similarly, certain Windmill SDK endpoints can
+								be used in scripts to access the resource details, including public and private
+								keys.
+							</Alert>
+						{/if}
+					</div>
+				{:else}
+					<div class="flex flex-col mt-5 mb-1 gap-1">
+						<Toggle
+							disabled={emptyString(s3ResourceSettings.resourcePath)}
+							bind:checked={s3ResourceSettings.publicResource}
+							options={{
+								right: 'object storage content can be accessed by all users of this workspace',
+								rightTooltip:
+									'If set, all users of this workspace will have access the to entire content of the object storage.'
+							}}
+						/>
+						{#if s3ResourceSettings.publicResource === true}
+							<div class="pt-2" />
+							<Alert type="warning" title="object content">
+								object public access is ON, which means that the entire content of the object store
+								will be accessible to all the users of this workspace regardless of whether they
+								have access the resource or not.
+							</Alert>
+						{/if}
+					</div>
+				{/if}
+				<div class="mt-6">
+					<div class="flex mt-2 flex-col gap-y-4 max-w-3xl">
+						{#each s3ResourceSettings.secondaryStorage ?? [] as secondaryStorage, idx}
+							<div class="flex gap-1 items-center">
+								<input
+									class="max-w-[200px]"
+									type="text"
+									bind:value={secondaryStorage[0]}
+									placeholder="Storage name"
+								/>
+								<select class="max-w-[125px]" bind:value={secondaryStorage[1].resourceType}>
+									<option value="s3">S3</option>
+									<option value="azure_blob">Azure Blob</option>
+									<option value="s3_aws_oidc">AWS OIDC</option>
+									<option value="azure_workload_identity">Azure Workload Identity</option>
+								</select>
+								<ResourcePicker
+									resourceType={secondaryStorage[1].resourceType}
+									bind:value={secondaryStorage[1].resourcePath}
+								/>
+								<Button
+									size="sm"
+									variant="contained"
+									color="dark"
+									disabled={emptyString(secondaryStorage[1].resourcePath)}
+									on:click={async () => {
+										if ($workspaceStore) {
+											s3FileViewer?.open?.({ s3: '', storage: secondaryStorage[0] })
+										}
+									}}>Browse content (save first)</Button
+								>
+								<button
+									transition:fade|local={{ duration: 100 }}
+									class="rounded-full p-1 bg-surface-secondary duration-200 hover:bg-surface-hover ml-2"
+									aria-label="Clear"
+									on:click={() => {
+										if (s3ResourceSettings.secondaryStorage) {
+											s3ResourceSettings.secondaryStorage.splice(idx, 1)
+											s3ResourceSettings.secondaryStorage = [...s3ResourceSettings.secondaryStorage]
+										}
+									}}
+								>
+									<X size={14} />
+								</button>
+							</div>
+						{/each}
+						<div class="flex gap-1">
+							<Button
+								size="xs"
+								variant="border"
+								on:click={() => {
+									if (s3ResourceSettings.secondaryStorage === undefined) {
+										s3ResourceSettings.secondaryStorage = []
+									}
+									s3ResourceSettings.secondaryStorage.push([
+										`storage_${s3ResourceSettings.secondaryStorage.length + 1}`,
+										{ resourcePath: '', resourceType: 's3', publicResource: false }
+									])
+									s3ResourceSettings.secondaryStorage = s3ResourceSettings.secondaryStorage
+								}}><Plus size={14} />Add secondary storage</Button
+							>
+							<Tooltip>
+								Secondary storage is a feature that allows you to read and write from storage that
+								isn't your main storage by specifying it in the s3 object as "secondary_storage"
+								with the name of it
+							</Tooltip>
+						</div>
+					</div>
+				</div>
+				<div class="flex mt-5 mb-5 gap-1">
+					<Button
+						color="blue"
+						disabled={emptyString(s3ResourceSettings.resourcePath)}
+						on:click={() => {
+							editWindmillLFSSettings()
+							console.log('Saving S3 settings', s3ResourceSettings)
+						}}>Save storage settings</Button
+					>
+				</div>
+			{/if}
+		{:else if tab == 'git_sync'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold"> Git Sync </div>
+					<div class="text-tertiary text-xs">
+						Connect the Windmill workspace to a Git repository to automatically commit and push
+						scripts, flows, and apps to the repository on each deploy.
+						<a
+							href="https://www.windmill.dev/docs/advanced/git_sync"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			{#if !$enterpriseLicense}
+				<div class="mb-2" />
+
+				<Alert type="warning" title="Syncing workspace to Git is an EE feature">
+					Automatically saving scripts to a Git repository on each deploy is a Windmill EE feature.
+				</Alert>
+				<div class="mb-2" />
+			{/if}
+			{#if gitSyncSettings != undefined}
+				<div class="flex mt-5 mb-5 gap-8">
+					<Button
+						color="blue"
+						disabled={!$enterpriseLicense ||
+							gitSyncSettings?.repositories?.some((elmt) =>
+								emptyString(elmt.git_repo_resource_path)
+							)}
+						on:click={() => {
+							editWindmillGitSyncSettings()
+							console.log('Saving git sync settings', gitSyncSettings)
+						}}>Save git sync settings {!$enterpriseLicense ? '(ee only)' : ''}</Button
+					>
+
+					<Button
+						color="dark"
+						target="_blank"
+						endIcon={{ icon: ExternalLink }}
+						href={`/runs?job_kinds=deploymentcallbacks&workspace=${$workspaceStore}`}
+						>See sync jobs</Button
+					>
+				</div>
+
+				<div class="flex flex-wrap gap-20">
+					<div class="max-w-md w-full">
+						{#if Array.isArray(gitSyncSettings?.include_path)}
+							<h4 class="flex gap-2 mb-4"
+								>Path filters<Tooltip>
+									Only scripts, flows and apps with their path matching one of those filters will be
+									synced to the Git repositories below. The filters allow '*'' and '**' characters,
+									with '*'' matching any character allowed in paths until the next slash (/) and
+									'**' matching anything including slashes.
+									<br />By default everything in folders will be synced.
+								</Tooltip></h4
+							>
+							{#each gitSyncSettings.include_path ?? [] as gitSyncRegexpPath, idx}
+								<div class="flex mt-1 items-center">
+									<input type="text" bind:value={gitSyncRegexpPath} id="arg-input-array" />
+									<button
+										transition:fade|local={{ duration: 100 }}
+										class="rounded-full p-1 bg-surface-secondary duration-200 hover:bg-surface-hover ml-2"
+										aria-label="Clear"
+										on:click={() => {
+											gitSyncSettings.include_path.splice(idx, 1)
+											gitSyncSettings.include_path = [...gitSyncSettings.include_path]
+										}}
+									>
+										<X size={14} />
+									</button>
+								</div>
+							{/each}
+						{/if}
+						<div class="flex mt-2">
+							<Button
+								variant="border"
+								color="light"
+								size="xs"
+								btnClasses="mt-1"
+								on:click={() => {
+									gitSyncSettings.include_path = [...gitSyncSettings.include_path, '']
+								}}
+								id="git-sync-add-path-filter"
+								startIcon={{ icon: Plus }}
+							>
+								Add filter
+							</Button>
+						</div>
+						<div class="pt-2" />
+						<Alert type="info" title="Only new updates trigger git sync">
+							Only new changes matching the filters will trigger a git sync. You still need to
+							initalize the repo to the desired state first.
+						</Alert>
+					</div>
+
+					<div class="max-w-md w-full">
+						<h4 class="flex gap-2 mb-4"
+							>Type filters<Tooltip>
+								On top of the filter path above, you can include only certain type of object to be
+								synced with the Git repository.
+								<br />By default everything is synced.
+							</Tooltip></h4
+						>
+						<div class="flex flex-col gap-2 mt-1">
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.scripts}
+								on:change={(_) => resetGitSyncRepositoryExclude('scripts')}
+								options={{ right: 'Scripts' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.flows}
+								on:change={(_) => resetGitSyncRepositoryExclude('flows')}
+								options={{ right: 'Flows' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.apps}
+								on:change={(_) => resetGitSyncRepositoryExclude('apps')}
+								options={{ right: 'Apps' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.folders}
+								on:change={(_) => resetGitSyncRepositoryExclude('folders')}
+								options={{ right: 'Folders' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.resources}
+								on:change={(_) => resetGitSyncRepositoryExclude('resources')}
+								options={{ right: 'Resources' }}
+							/>
+							<div class="flex gap-3">
+								<Toggle
+									bind:checked={gitSyncSettings.include_type.variables}
+									on:change={(ev) => {
+										resetGitSyncRepositoryExclude('variables')
+										resetGitSyncRepositoryExclude('secrets')
+										if (!ev.detail) {
+											gitSyncSettings.include_type.secrets = false
+										}
+									}}
+									options={{ right: 'Variables ' }}
+								/>
+								<span>-</span>
+								<Toggle
+									disabled={!gitSyncSettings.include_type.variables}
+									bind:checked={gitSyncSettings.include_type.secrets}
+									on:change={(_) => resetGitSyncRepositoryExclude('secrets')}
+									options={{ left: 'Include secrets' }}
+								/>
+							</div>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.schedules}
+								on:change={(_) => resetGitSyncRepositoryExclude('schedules')}
+								options={{ right: 'Schedules' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.resourceTypes}
+								on:change={(_) => resetGitSyncRepositoryExclude('resourcetypes')}
+								options={{ right: 'Resource Types' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.users}
+								on:change={(_) => resetGitSyncRepositoryExclude('users')}
+								options={{ right: 'Users' }}
+							/>
+							<Toggle
+								bind:checked={gitSyncSettings.include_type.groups}
+								on:change={(_) => resetGitSyncRepositoryExclude('groups')}
+								options={{ right: 'Groups' }}
+							/>
+						</div>
+					</div>
+				</div>
+
+				<h4 class="flex gap-2 mt-5 mb-5"
+					>Repositories to sync<Tooltip>
+						The changes will be deployed to all the repositories set below.
+					</Tooltip></h4
+				>
+				{#if Array.isArray(gitSyncSettings.repositories)}
+					{#each gitSyncSettings.repositories as gitSyncRepository, idx}
+						<div class="flex mt-5 mb-1 gap-1 items-center text-xs">
+							<h6>Repository #{idx + 1}</h6>
+							<button
+								transition:fade|local={{ duration: 100 }}
+								class="rounded-full p-1 bg-surface-secondary duration-200 hover:bg-surface-hover ml-2"
+								aria-label="Clear"
+								on:click={() => {
+									gitSyncSettings.repositories.splice(idx, 1)
+									gitSyncSettings.repositories = [...gitSyncSettings.repositories]
+								}}
+							>
+								<X size={14} />
+							</button>
+						</div>
+						<div class="flex mt-5 mb-1 gap-1">
+							{#key gitSyncRepository}
+								<ResourcePicker
+									resourceType="git_repository"
+									initialValue={gitSyncRepository.git_repo_resource_path}
+									on:change={(ev) => {
+										gitSyncRepository.git_repo_resource_path = ev.detail
+									}}
+								/>
+								<Button
+									disabled={emptyString(gitSyncRepository.script_path)}
+									btnClasses="w-32 text-center"
+									color="dark"
+									on:click={() => runGitSyncTestJob(idx)}
+									size="xs">Test connection</Button
+								>
+							{/key}
+						</div>
+
+						<div class="flex mb-5 text-normal text-2xs gap-1">
+							{#if gitSyncSettings.repositories.filter((settings) => settings.git_repo_resource_path === gitSyncRepository.git_repo_resource_path).length > 1}
+								<span class="text-red-700">Using the same resource twice is not allowed.</span>
+							{/if}
+							{#if gitSyncTestJobs[idx].status !== undefined}
+								{#if gitSyncTestJobs[idx].status === 'running'}
+									<RotateCw size={14} />
+								{:else if gitSyncTestJobs[idx].status === 'success'}
+									<CheckCircle2 size={14} class="text-green-600" />
+								{:else}
+									<XCircle size={14} class="text-red-700" />
+								{/if}
+								Git sync resource checked via Windmill job
+								<a
+									target="_blank"
+									href={`/run/${gitSyncTestJobs[idx].jobId}?workspace=${$workspaceStore}`}
+								>
+									{gitSyncTestJobs[idx].jobId}
+								</a>WARNING: Only read permissions are verified.
+							{/if}
+						</div>
+
+						<div class="flex flex-col mt-5 mb-1 gap-4">
+							{#if gitSyncSettings && gitSyncRepository}
+								{#if gitSyncRepository.script_path != latestGitSyncHubScript}
+									<Alert type="warning" title="Script version mismatch">
+										The git sync version for this repository is not latest. Current: <a
+											target="_blank"
+											href="https://hub.windmill.dev/scripts/windmill/6943/sync-script-to-git-repo-windmill/5813/versions"
+											>{gitSyncRepository.script_path}</a
+										>, latest:
+										<a
+											target="_blank"
+											href="https://hub.windmill.dev/scripts/windmill/6943/sync-script-to-git-repo-windmill/5813/versions"
+											>{latestGitSyncHubScript}</a
+										>
+										<div class="flex mt-2">
+											<Button
+												size="xs"
+												color="dark"
+												on:click={() => {
+													gitSyncRepository.script_path = latestGitSyncHubScript
+												}}>Update git sync script (require save git settings to be applied)</Button
+											>
+										</div>
+									</Alert>
+								{/if}
+								<Toggle
+									disabled={emptyString(gitSyncRepository.git_repo_resource_path)}
+									bind:checked={gitSyncRepository.use_individual_branch}
+									options={{
+										right: 'Create one branch per deployed object',
+										rightTooltip:
+											"If set, Windmill will create a unique branch per object being pushed based on its path, prefixed with 'wm_deploy/'."
+									}}
+								/>
+
+								<Toggle
+									disabled={emptyString(gitSyncRepository.git_repo_resource_path) ||
+										!gitSyncRepository.use_individual_branch}
+									bind:checked={gitSyncRepository.group_by_folder}
+									options={{
+										right: 'Group deployed objects by folder',
+										rightTooltip:
+											'Instead of creating a branch per object, Windmill will create a branch per folder containing objects being deployed.'
+									}}
+								/>
+							{/if}
+						</div>
+
+						<div class="flex flex-col mt-5 mb-1 gap-1">
+							{#if gitSyncSettings && Object.keys(gitSyncSettings.include_type).some((k) => gitSyncSettings.include_type[k] === true)}
+								<h6>Exclude specific types for this repository only</h6>
+								{#if gitSyncSettings.include_type.scripts}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.scripts}
+										options={{ right: 'Exclude scripts' }}
+									/>
+								{/if}
+								{#if gitSyncSettings.include_type.flows}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.flows}
+										options={{ right: 'Exclude flows' }}
+									/>
+								{/if}
+								{#if gitSyncSettings.include_type.apps}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.apps}
+										options={{ right: 'Exclude apps' }}
+									/>
+								{/if}
+								{#if gitSyncSettings.include_type.folders}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.folders}
+										options={{ right: 'Exclude folders' }}
+									/>
+								{/if}
+								{#if gitSyncSettings.include_type.resources}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.resources}
+										options={{ right: 'Exclude resources' }}
+									/>
+								{/if}
+								{#if gitSyncSettings.include_type.variables}
+									<div class="flex gap-3">
+										<Toggle
+											color="red"
+											bind:checked={gitSyncRepository.exclude_types_override.variables}
+											on:change={(ev) => {
+												if (ev.detail && gitSyncSettings.include_type.secrets) {
+													gitSyncRepository.exclude_types_override.secrets = true
+												} else if (ev.detail) {
+													gitSyncRepository.exclude_types_override.secrets = false
+												}
+											}}
+											options={{ right: 'Exclude variables ' }}
+										/>
+										{#if gitSyncSettings.include_type.secrets}
+											<span>-</span>
+											<Toggle
+												color="red"
+												disabled={gitSyncRepository.exclude_types_override.variables}
+												bind:checked={gitSyncRepository.exclude_types_override.secrets}
+												options={{ left: 'Exclude secrets' }}
+											/>
+										{/if}
+									</div>
+								{/if}
+								{#if gitSyncSettings.include_type.schedules}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.schedules}
+										options={{ right: 'Exclude schedules' }}
+									/>
+								{/if}
+								{#if gitSyncSettings.include_type.resourceTypes}
+									<Toggle
+										color="red"
+										bind:checked={gitSyncRepository.exclude_types_override.resourceTypes}
+										options={{ right: 'Exclude resource types' }}
+									/>
+								{/if}
+							{/if}
+						</div>
+					{/each}
+				{/if}
+
+				<div class="flex mt-5 mb-5 gap-1">
+					<Button
+						color="none"
+						variant="border"
+						size="xs"
+						btnClasses="mt-1"
+						on:click={() => {
+							gitSyncSettings.repositories = [
+								...gitSyncSettings.repositories,
+								{
+									script_path: latestGitSyncHubScript,
+									git_repo_resource_path: '',
+									use_individual_branch: false,
+									group_by_folder: false,
+									exclude_types_override: {
+										scripts: false,
+										flows: false,
+										apps: false,
+										folders: false,
+										resourceTypes: false,
+										resources: false,
+										variables: false,
+										secrets: false,
+										schedules: false,
+										users: false,
+										groups: false
+									}
+								}
+							]
+							gitSyncTestJobs = [
+								...gitSyncTestJobs,
+								{
+									jobId: undefined,
+									status: undefined
+								}
+							]
+						}}
+						id="git-sync-add-connection"
+						startIcon={{ icon: Plus }}
+					>
+						Add connection
+					</Button>
+				</div>
+
+				<div class="bg-surface-disabled p-4 rounded-md flex flex-col gap-1">
+					<div class="text-primary font-md font-semibold"> Git repository initial setup </div>
+
+					<div class="prose max-w-none text-2xs text-tertiary">
+						Every time a script is deployed, only the updated script will be pushed to the remote
+						Git repository.
+
+						<br />
+
+						For the git repo to be representative of the entire workspace, it is recommended to set
+						it up using the Windmill CLI before turning this option on.
+
+						<br /><br />
+
+						Not familiar with Windmill CLI?
+						<a href="https://www.windmill.dev/docs/advanced/cli" class="text-primary"
+							>Check out the docs</a
+						>
+
+						<br /><br />
+
+						Run the following commands from the git repo folder to push the initial workspace
+						content to the remote:
+
+						<br />
+
+						<pre class="overflow-auto max-h-screen"
+							><code
+								>npm install -g windmill-cli
+wmill workspace add  {$workspaceStore} {$workspaceStore} {`${$page.url.protocol}//${$page.url.hostname}/`}
+wmill init
+# adjust wmill.yaml file configuraton as needed
+wmill sync pull
+git add -A
+git commit -m 'Initial commit'
+git push</code
+							></pre
+						>
+					</div>
+				</div>
+			{:else}
+				<Loader2 class="animate-spin mt-4" size={20} />
+			{/if}
+		{:else if tab == 'default_app'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold">Workspace default app</div>
+					<div class="text-tertiary text-xs">
+						If configured, users who are operators in this workspace will be redirected to this app
+						automatically when logging into this workspace.
+					</div>
+					<div class="text-tertiary text-xs">
+						Make sure the default app is shared with all the operators of this workspace before
+						turning this feature on.
+						<a
+							href="https://www.windmill.dev/docs/apps/default_app"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			{#if !$enterpriseLicense}
+				<Alert type="info" title="Windmill EE only feature">
+					Default app can only be set on Windmill Enterprise Edition.
+				</Alert>
+			{/if}
+			<Alert type="info" title="Default app must be accessible to all operators">
+				Make sure the default app is shared with all the operators of this workspace before turning
+				this feature on.
+			</Alert>
+			<div class="mt-5 flex gap-1">
+				{#key workspaceDefaultAppPath}
+					<ScriptPicker
+						initialPath={workspaceDefaultAppPath}
+						itemKind="app"
+						on:select={(ev) => {
+							editWorkspaceDefaultApp(ev?.detail?.path)
+						}}
+					/>
+				{/key}
+			</div>
+		{:else if tab == 'encryption'}
+			<div class="flex flex-col gap-4 my-8">
+				<div class="flex flex-col gap-1">
+					<div class=" text-primary text-lg font-semibold">Workspace secret encryption</div>
+					<div class="text-tertiary text-xs">
+						When updating the encryption key of a workspace, all secrets will be re-encrypted with
+						the new key and the previous key will be replaced by the new one.
+					</div>
+					<div class="text-tertiary text-xs">
+						If you're manually updating the key to match another workspace key from another Windmill
+						instance, make sure not to use the 'SECRET_SALT' environment variable or, if you're
+						using it, make sure it the salt matches across both instances.
+						<a
+							href="https://www.windmill.dev/docs/core_concepts/workspace_secret_encryption"
+							target="_blank"
+							class="text-blue-500">Learn more</a
+						>.
+					</div>
+				</div>
+			</div>
+			<div class="mt-5 flex gap-1 mb-10">
+				<Button
+					color="blue"
+					disabled={editedWorkspaceEncryptionKey === workspaceEncryptionKey ||
+						!encryptionKeyRegex.test(editedWorkspaceEncryptionKey ?? '')}
+					startIcon={{
+						icon: workspaceReencryptionInProgress ? RotateCw : Save,
+						classes: workspaceReencryptionInProgress ? 'animate-spin' : ''
+					}}
+					on:click={() => {
+						setWorkspaceEncryptionKey()
+					}}>Save & Re-encrypt workspace</Button
 				>
 			</div>
+			<h6> Workspace encryption key </h6>
+			<div class="flex gap-2 mt-1">
+				<input
+					class="justify-start"
+					type="text"
+					placeholder={'*'.repeat(64)}
+					bind:value={editedWorkspaceEncryptionKey}
+				/>
+				<Button
+					color="light"
+					on:click={() => {
+						loadWorkspaceEncryptionKey()
+					}}>Load current key</Button
+				>
+			</div>
+			{#if !emptyString(editedWorkspaceEncryptionKey) && !encryptionKeyRegex.test(editedWorkspaceEncryptionKey ?? '')}
+				<div class="text-xs text-red-600">
+					Key invalid - it should be 64 characters long and only contain letters and numbers.
+				</div>
+			{/if}
 		{/if}
 	{:else}
 		<div class="bg-red-100 border-l-4 border-red-600 text-orange-700 p-4 m-4" role="alert">

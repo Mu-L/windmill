@@ -21,7 +21,6 @@ import {
 	Underline
 } from 'lucide-svelte'
 import type { components } from '../component'
-import type { SvelteComponent } from 'svelte'
 
 export const STYLE_STORE_KEY = 'style_store' as const
 
@@ -100,7 +99,7 @@ export type TopColors = [] | [string] | [string, string] | [string, string, stri
 
 export type StylePropertyOption = {
 	text: string
-	icon: string | typeof SvelteComponent
+	icon: string | any
 }
 
 export type BaseStylePropertyValue<T extends StylePropertyType> = {
@@ -560,6 +559,7 @@ export const quickStyleProperties: Record<
 		container: containerDefaultProps,
 		button: buttonDefaultProps
 	},
+	customcomponent: {},
 	htmlcomponent: {
 		container: [
 			layoutGrouping,
@@ -569,6 +569,9 @@ export const quickStyleProperties: Record<
 			typographyGrouping,
 			backgroundGrouping
 		]
+	},
+	mardowncomponent: {
+		container: containerDefaultProps
 	},
 	iconcomponent: {
 		container: containerDefaultProps,
@@ -606,8 +609,12 @@ export const quickStyleProperties: Record<
 		container: containerDefaultProps
 	},
 	aggridcomponent: {},
+	aggridcomponentee: {},
+	aggridinfinitecomponent: {},
+	aggridinfinitecomponentee: {},
 	buttoncomponent: {
-		button: buttonDefaultProps
+		button: buttonDefaultProps,
+		container: containerDefaultProps
 	},
 	downloadcomponent: {
 		button: buttonDefaultProps
@@ -619,10 +626,17 @@ export const quickStyleProperties: Record<
 		container: containerDefaultProps
 	},
 	plotlycomponent: {},
+	plotlycomponentv2: {},
 	selectcomponent: {
 		input: inputDefaultProps
 	},
 	slidercomponent: {
+		handles: sliderDefaultProps,
+		bar: sliderDefaultProps,
+		limits: [typographyGrouping],
+		values: [typographyGrouping]
+	},
+	dateslidercomponent: {
 		handles: sliderDefaultProps,
 		bar: sliderDefaultProps,
 		limits: [typographyGrouping],
@@ -636,7 +650,18 @@ export const quickStyleProperties: Record<
 		header: [...containerDefaultProps, typographyGrouping],
 		container: containerDefaultProps
 	},
+	jobidlogcomponent: {
+		header: [...containerDefaultProps, typographyGrouping],
+		container: containerDefaultProps
+	},
+	carousellistcomponent: {
+		container: containerDefaultProps
+	},
 	flowstatuscomponent: {
+		header: [...containerDefaultProps, typographyGrouping],
+		container: containerDefaultProps
+	},
+	jobidflowstatuscomponent: {
 		header: [...containerDefaultProps, typographyGrouping],
 		container: containerDefaultProps
 	},
@@ -652,20 +677,44 @@ export const quickStyleProperties: Record<
 	piechartcomponent: {
 		container: containerDefaultProps
 	},
+	agchartscomponent: {
+		container: containerDefaultProps
+	},
+	agchartscomponentee: {
+		container: containerDefaultProps
+	},
 	chartjscomponent: {
+		container: containerDefaultProps
+	},
+	chartjscomponentv2: {
 		container: containerDefaultProps
 	},
 	vegalitecomponent: {},
 	containercomponent: {
 		container: containerDefaultProps
 	},
+	listcomponent: {
+		container: containerDefaultProps
+	},
 	dateinputcomponent: {
 		input: inputDefaultProps
+	},
+	timeinputcomponent: {
+		input: inputDefaultProps
+	},
+	datetimeinputcomponent: {
+		container: inputDefaultProps
 	},
 	fileinputcomponent: {
 		container: containerDefaultProps
 	},
+	s3fileinputcomponent: {
+		container: containerDefaultProps
+	},
 	textinputcomponent: {
+		input: inputDefaultProps
+	},
+	quillcomponent: {
 		input: inputDefaultProps
 	},
 	textareainputcomponent: {
@@ -684,6 +733,9 @@ export const quickStyleProperties: Record<
 	multiselectcomponent: {
 		input: inputDefaultProps
 	},
+	multiselectcomponentv2: {
+		input: inputDefaultProps
+	},
 	numberinputcomponent: {
 		input: inputDefaultProps
 	},
@@ -694,6 +746,9 @@ export const quickStyleProperties: Record<
 		input: inputDefaultProps
 	},
 	resourceselectcomponent: {
+		input: inputDefaultProps
+	},
+	userresourcecomponent: {
 		input: inputDefaultProps
 	},
 	verticaldividercomponent: {
@@ -719,5 +774,33 @@ export const quickStyleProperties: Record<
 		allTabs: [typographyGrouping, sizeGrouping],
 		selectedTab: [typographyGrouping, sizeGrouping]
 	},
-	selectstepcomponent: {}
+	selectstepcomponent: {},
+	statcomponent: {},
+	menucomponent: {
+		button: buttonDefaultProps
+	},
+	decisiontreecomponent: {
+		container: containerDefaultProps
+	},
+	dbexplorercomponent: {},
+	alertcomponent: {
+		container: containerDefaultProps,
+		background: containerDefaultProps,
+		icon: containerDefaultProps,
+		title: containerDefaultProps,
+		description: containerDefaultProps
+	},
+	navbarcomponent: {
+		container: containerDefaultProps
+	},
+	dateselectcomponent: {
+		input: inputDefaultProps
+	},
+	jobiddisplaycomponent: {
+		header: [...containerDefaultProps, typographyGrouping],
+		container: containerDefaultProps
+	},
+	recomputeallcomponent: {
+		container: containerDefaultProps
+	}
 }

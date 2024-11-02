@@ -6,26 +6,27 @@
  * LICENSE-AGPL for a copy of the license.
  */
 use crate::{
-    db::{UserDB, DB},
-    users::{require_owner_of_path, Authed},
+    db::{ApiAuthed, DB},
+    users::require_owner_of_path,
     webhook_util::{WebhookMessage, WebhookShared},
 };
 use axum::{
-    body,
+    body::Body,
     extract::{Extension, Json, Path, Query},
     response::Response,
     routing::{delete, get, post},
     Router,
 };
-use bytes::Bytes;
 use hyper::{header, StatusCode};
 use serde::{Deserialize, Serialize};
 use sql_builder::{bind::Bind, SqlBuilder};
 use sqlx::FromRow;
 use std::str;
-use windmill_audit::{audit_log, ActionKind};
+use windmill_audit::audit_ee::audit_log;
+use windmill_audit::ActionKind;
 use windmill_common::{
     apps::ListAppQuery,
+    db::UserDB,
     error::{Error, JsonResult, Result},
     utils::{not_found_if_none, paginate, Pagination, StripPath},
 };
@@ -66,7 +67,7 @@ pub struct EditApp {
 }
 
 async fn list_apps(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
@@ -101,10 +102,18 @@ async fn list_apps(
         sqlb.and_where_is_not_null("favorite.path");
     }
 
+    if let Some(path_start) = &lq.path_start {
+        sqlb.and_where_like_left("app.path", path_start);
+    }
+
+    if let Some(path_exact) = &lq.path_exact {
+        sqlb.and_where_eq("app.path", "?".bind(path_exact));
+    }
+
     let sql = sqlb.sql().map_err(|e| Error::InternalErr(e.to_string()))?;
     let mut tx = user_db.begin(&authed).await?;
     let rows = sqlx::query_as::<_, ListableApp>(&sql)
-        .fetch_all(&mut tx)
+        .fetch_all(&mut *tx)
         .await?;
 
     tx.commit().await?;
@@ -113,7 +122,7 @@ async fn list_apps(
 }
 
 async fn get_data(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, _version, path)): Path<(String, u16, StripPath)>,
 ) -> Result<Response> {
@@ -126,20 +135,18 @@ async fn get_data(
         path.to_owned(),
         &w_id
     )
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
 
     let app = not_found_if_none(app_o, "App", path)?;
     let res = Response::builder().header(header::CONTENT_TYPE, "text/javascript");
 
-    Ok(res
-        .body(body::boxed(body::Full::from(Bytes::from(app))))
-        .unwrap())
+    Ok(res.body(Body::from(app)).unwrap())
 }
 
 async fn create_app(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
     Path(w_id): Path<String>,
@@ -151,11 +158,11 @@ async fn create_app(
     }
 
     let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM app WHERE path = $1 AND workspace_id = $2)",
+        "SELECT EXISTS(SELECT 1 FROM raw_app WHERE path = $1 AND workspace_id = $2)",
         app.path,
         w_id
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(false);
 
@@ -175,12 +182,12 @@ async fn create_app(
         app.summary,
         app.value,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "apps.create",
         ActionKind::Create,
         &w_id,
@@ -199,7 +206,7 @@ async fn create_app(
 }
 
 async fn delete_app(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
     Path((w_id, path)): Path<(String, StripPath)>,
@@ -212,11 +219,11 @@ async fn delete_app(
         path,
         w_id
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "apps.delete",
         ActionKind::Delete,
         &w_id,
@@ -234,7 +241,7 @@ async fn delete_app(
 }
 
 async fn update_app(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Extension(webhook): Extension<WebhookShared>,
     Path((w_id, path)): Path<(String, StripPath)>,
@@ -245,13 +252,13 @@ async fn update_app(
     let path = path.to_path();
 
     let mut tx = user_db.begin(&authed).await?;
-    let npath = &app.path;
-    let npath = if npath.is_some() || app.summary.is_some() {
-        let mut sqlb = SqlBuilder::update_table("raw_app");
-        sqlb.and_where_eq("path", "?".bind(&path));
-        sqlb.and_where_eq("workspace_id", "?".bind(&w_id));
+    let mut sqlb = SqlBuilder::update_table("raw_app");
+    sqlb.and_where_eq("path", "?".bind(&path));
+    sqlb.and_where_eq("workspace_id", "?".bind(&w_id));
 
-        if let Some(npath) = &app.path {
+    let npath = &app.path;
+    if npath.is_some() || app.summary.is_some() {
+        if let Some(npath) = npath {
             if npath != path {
                 require_owner_of_path(&authed, path)?;
 
@@ -260,7 +267,7 @@ async fn update_app(
                     npath,
                     w_id
                 )
-                .fetch_one(&mut tx)
+                .fetch_one(&mut *tx)
                 .await?
                 .unwrap_or(false);
 
@@ -277,28 +284,27 @@ async fn update_app(
         if let Some(nsummary) = &app.summary {
             sqlb.set_str("summary", nsummary);
         }
+    }
 
-        if let Some(value) = &app.value {
-            sqlb.set_str("data", value);
-            sqlb.set("version", "version + 1");
-        }
+    if let Some(value) = &app.value {
+        sqlb.set_str("data", value);
+        sqlb.set("version", "version + 1");
+    }
 
-        sqlb.returning("path");
+    sqlb.returning("path");
 
-        let sql = sqlb.sql().map_err(|e| Error::InternalErr(e.to_string()))?;
-        let npath_o: Option<String> = sqlx::query_scalar(&sql).fetch_optional(&mut tx).await?;
-        not_found_if_none(npath_o, "Raw App", path)?
-    } else {
-        "".to_string()
-    };
+    let sql = sqlb.sql().map_err(|e| Error::InternalErr(e.to_string()))?;
+    let npath_o: Option<String> = sqlx::query_scalar(&sql).fetch_optional(&mut *tx).await?;
+    not_found_if_none(npath_o, "Raw App", path)?;
 
+    let npath = app.path.clone().unwrap_or_else(|| path.to_owned());
     audit_log(
-        &mut tx,
-        &authed.username,
+        &mut *tx,
+        &authed,
         "apps.update",
         ActionKind::Update,
         &w_id,
-        Some(&npath),
+        Some(&path),
         None,
     )
     .await?;

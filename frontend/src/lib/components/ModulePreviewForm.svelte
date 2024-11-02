@@ -11,8 +11,9 @@
 	import type { FlowModule } from '$lib/gen'
 	import type { PickableProperties } from './flows/previousResults'
 	import type SimpleEditor from './SimpleEditor.svelte'
+	import { getResourceTypes } from './resourceTypesStore'
 
-	export let schema: Schema
+	export let schema: Schema | { properties?: Record<string, any>; required?: string[] }
 	export let args: Record<string, any> = {}
 	export let mod: FlowModule
 	export let pickableProperties: PickableProperties | undefined
@@ -49,7 +50,9 @@
 	}
 
 	function plugIt(argName: string) {
-		args[argName] = evalValue(argName, mod, testStepStore, pickableProperties, true)
+		args[argName] = structuredClone(
+			evalValue(argName, mod, testStepStore, pickableProperties, true)
+		)
 		try {
 			editor?.[argName]?.setCode(JSON.stringify(args[argName], null, 4))
 		} catch {
@@ -58,22 +61,32 @@
 	}
 
 	let editor: Record<string, SimpleEditor | undefined> = {}
+
+	let resourceTypes: string[] | undefined = undefined
+
+	async function loadResourceTypes() {
+		resourceTypes = await getResourceTypes()
+	}
+
+	loadResourceTypes()
 </script>
 
 <div class="w-full pt-2">
 	{#if keys.length > 0}
 		{#each keys as argName, i (argName)}
 			{#if Object.keys(schema.properties ?? {}).includes(argName)}
-				<div class="flex gap-2 items-center">
-					{#if typeof args == 'object' && schema?.properties[argName]}
+				<div class="flex gap-2">
+					{#if typeof args == 'object' && schema?.properties?.[argName]}
 						<ArgInput
+							{resourceTypes}
 							minW={false}
 							autofocus={i == 0 && autofocus}
 							label={argName}
 							description={schema.properties[argName].description}
 							bind:value={args[argName]}
 							type={schema.properties[argName].type}
-							required={schema.required.includes(argName)}
+							oneOf={schema.properties[argName].oneOf}
+							required={schema?.required?.includes(argName)}
 							pattern={schema.properties[argName].pattern}
 							bind:editor={editor[argName]}
 							bind:valid={inputCheck[argName]}
@@ -82,11 +95,15 @@
 							format={schema.properties[argName].format}
 							contentEncoding={schema.properties[argName].contentEncoding}
 							properties={schema.properties[argName].properties}
+							nestedRequired={schema.properties[argName].required}
 							itemsType={schema.properties[argName].items}
 							extra={schema.properties[argName]}
+							nullable={schema.properties[argName].nullable}
+							title={schema.properties[argName].title}
+							placeholder={schema.properties[argName].placeholder}
 						/>
 					{/if}
-					<div>
+					<div class="pt-6 mt-0.5">
 						<Button
 							on:click={() => plugIt(argName)}
 							size="sm"

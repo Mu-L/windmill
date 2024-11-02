@@ -1,11 +1,14 @@
 // deno-lint-ignore-file no-explicit-any
-import { colors, Command, Folder, FolderService, log, Table } from "./deps.ts";
+import { colors, Command, log, SEP, Table } from "./deps.ts";
+import * as wmill from "./gen/services.gen.ts";
+
 import { requireLogin, resolveWorkspace, validatePath } from "./context.ts";
 import { GlobalOptions, isSuperset, parseFromFile } from "./types.ts";
+import { Folder } from "./gen/types.gen.ts";
 
 export interface FolderFile {
   owners: Array<string> | undefined;
-  extra_perms: Map<string, boolean> | undefined;
+  extra_perms: { [record: string]: boolean } | undefined;
   display_name: string | undefined;
 }
 
@@ -13,7 +16,7 @@ async function list(opts: GlobalOptions) {
   const workspace = await resolveWorkspace(opts);
   await requireLogin(opts);
 
-  const folders = await FolderService.listFolders({
+  const folders = await wmill.listFolders({
     workspace: workspace.workspaceId,
   });
 
@@ -35,27 +38,24 @@ export async function pushFolder(
   workspace: string,
   name: string,
   folder: Folder | FolderFile | undefined,
-  localFolder: FolderFile,
-  raw: boolean
+  localFolder: FolderFile
 ): Promise<void> {
-  if (name.startsWith("/")) {
+  if (name.startsWith(SEP)) {
     name = name.substring(1);
   }
-  if (name.startsWith("f/")) {
+  if (name.startsWith("f" + SEP)) {
     name = name.substring(2);
   }
-  name = name.split("/")[0];
+  name = name.split(SEP)[0];
   log.debug(`Processing local folder ${name}`);
 
-  if (raw) {
-    // deleting old app if it exists in raw mode
-    try {
-      folder = await FolderService.getFolder({ workspace, name });
-      log.debug(`Folder ${name} exists on remote`);
-    } catch {
-      log.debug(`Folder ${name} does not exist on remote`);
-      //ignore
-    }
+  // deleting old app if it exists in raw mode
+  try {
+    folder = await wmill.getFolder({ workspace, name });
+    log.debug(`Folder ${name} exists on remote`);
+  } catch {
+    log.debug(`Folder ${name} does not exist on remote`);
+    //ignore
   }
 
   if (folder) {
@@ -64,22 +64,33 @@ export async function pushFolder(
       return;
     }
     log.debug(`Folder ${name} is not up-to-date, updating...`);
-    await FolderService.updateFolder({
-      workspace: workspace,
-      name: name,
-      requestBody: {
-        ...localFolder,
-      },
-    });
+    try {
+      await wmill.updateFolder({
+        workspace: workspace,
+        name: name,
+        requestBody: {
+          ...localFolder,
+        },
+      });
+    } catch (e) {
+      //@ts-ignore
+      console.error(e.body);
+      throw e;
+    }
   } else {
     console.log(colors.bold.yellow("Creating new folder: " + name));
-    await FolderService.createFolder({
-      workspace: workspace,
-      requestBody: {
-        name: name,
-        ...localFolder,
-      },
-    });
+    try {
+      await wmill.createFolder({
+        workspace: workspace,
+        requestBody: {
+          name: name,
+          ...localFolder,
+        },
+      });
+    } catch (e) {
+      //@ts-ignore
+      throw Error(`Failed to create folder ${name}: ${e.body ?? e.message}`);
+    }
   }
 }
 
@@ -102,8 +113,7 @@ async function push(opts: GlobalOptions, filePath: string, remotePath: string) {
     workspace.workspaceId,
     remotePath,
     undefined,
-    parseFromFile(filePath),
-    false
+    parseFromFile(filePath)
   );
   console.log(colors.bold.underline.green("Folder pushed"));
 }

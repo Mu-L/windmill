@@ -1,16 +1,20 @@
 <script lang="ts">
-	import type { HiddenRunnable } from '../../types'
+	import type { AppViewerContext, HiddenRunnable } from '../../types'
 	import InlineScriptEditor from './InlineScriptEditor.svelte'
 	import EmptyInlineScript from './EmptyInlineScript.svelte'
 	import InlineScriptRunnableByPath from './InlineScriptRunnableByPath.svelte'
 	import type { Runnable, StaticAppInput } from '../../inputType'
+	import { createEventDispatcher, getContext } from 'svelte'
 
 	export let runnable: HiddenRunnable
 	export let id: string
+	export let transformer: boolean
 
+	const { runnableComponents } = getContext<AppViewerContext>('AppViewerContext')
 	async function fork(nrunnable: Runnable) {
 		runnable = { ...runnable, ...nrunnable, autoRefresh: true, recomputeOnInputChanged: true }
 	}
+
 	function onPick(o: { runnable: Runnable; fields: Record<string, StaticAppInput> }) {
 		runnable = {
 			...runnable,
@@ -20,10 +24,32 @@
 			recomputeOnInputChanged: true
 		}
 	}
+	const dispatch = createEventDispatcher()
 </script>
 
-{#if runnable?.type === 'runnableByName' && runnable.inlineScript}
+{#if transformer}
+	{#if runnable.transformer}
+		<InlineScriptEditor
+			transformer
+			defaultUserInput={false}
+			{id}
+			componentType={undefined}
+			bind:inlineScript={runnable.transformer}
+			name="Transformer"
+			on:delete={() => {
+				delete $runnableComponents[id]
+				runnable.transformer = undefined
+				runnable = runnable
+			}}
+		/>
+	{:else}
+		<div class="px-2 pt-4 text-tertiary">
+			Selected editor component is a transformer but component has no transformer
+		</div>
+	{/if}
+{:else if runnable?.type === 'runnableByName' && runnable.inlineScript}
 	<InlineScriptEditor
+		on:createScriptFromInlineScript={() => dispatch('createScriptFromInlineScript', runnable)}
 		{id}
 		bind:inlineScript={runnable.inlineScript}
 		bind:name={runnable.name}

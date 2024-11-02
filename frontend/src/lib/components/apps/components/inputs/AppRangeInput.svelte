@@ -1,13 +1,21 @@
 <script lang="ts">
-	import { getContext } from 'svelte'
+	import { getContext, onDestroy } from 'svelte'
 	import RangeSlider from 'svelte-range-slider-pips'
 	import { twMerge } from 'tailwind-merge'
-	import { initOutput } from '../../editor/appUtils'
-	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import { concatCustomCss } from '../../utils'
+	import { initConfig, initOutput } from '../../editor/appUtils'
+	import type {
+		AppViewerContext,
+		ComponentCustomCSS,
+		ListContext,
+		ListInputs,
+		RichConfigurations
+	} from '../../types'
+	import { initCss } from '../../utils'
 	import AlignWrapper from '../helpers/AlignWrapper.svelte'
-	import InputValue from '../helpers/InputValue.svelte'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
+	import ResolveConfig from '../helpers/ResolveConfig.svelte'
+	import { components } from '../../editor/component'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
 
 	export let id: string
 	export let configuration: RichConfigurations
@@ -16,12 +24,24 @@
 	export let render: boolean
 
 	const { app, worldStore, componentControl } = getContext<AppViewerContext>('AppViewerContext')
-	let min = 0
-	let max = 42
-	let step = 1
-	let slider: HTMLElement
+	const iterContext = getContext<ListContext>('ListWrapperContext')
+	const listInputs: ListInputs | undefined = getContext<ListInputs>('ListInputs')
 
-	let values: [number, number] = [0, 0]
+	let resolvedConfig = initConfig(
+		components['rangecomponent'].initialData.configuration,
+		configuration
+	)
+
+	let values: [number, number] = [0, 1]
+
+	$: (resolvedConfig.defaultLow != undefined || resolvedConfig.defaultHigh != undefined) &&
+		handleDefault()
+
+	function handleDefault() {
+		values = [resolvedConfig?.defaultLow ?? 0, resolvedConfig?.defaultHigh ?? 1]
+	}
+
+	let slider: HTMLElement
 
 	let outputs = initOutput($worldStore, id, {
 		result: null as [number, number] | null
@@ -33,9 +53,18 @@
 		}
 	}
 
-	$: outputs?.result.set(values)
+	onDestroy(() => {
+		listInputs?.remove(id)
+	})
 
-	$: css = concatCustomCss($app.css?.rangecomponent, customCss)
+	$: {
+		outputs?.result.set(values)
+		if (iterContext && listInputs) {
+			listInputs.set(id, values)
+		}
+	}
+
+	let css = initCss($app.css?.rangecomponent, customCss)
 
 	let lastStyle: string | undefined = undefined
 	$: if (css && slider && lastStyle !== css?.handles?.style) {
@@ -45,61 +74,87 @@
 			handles.forEach((handle) => (handle.style.cssText = css?.handles?.style ?? ''))
 		}
 	}
+
+	const format = (v, i, p) => {
+		return `${v}`
+	}
 </script>
 
-<InputValue {id} input={configuration.step} bind:value={step} />
-<InputValue {id} input={configuration.min} bind:value={min} />
-<InputValue {id} input={configuration.max} bind:value={max} />
-<InputValue {id} input={configuration.defaultLow} bind:value={values[0]} />
-<InputValue {id} input={configuration.defaultHigh} bind:value={values[1]} />
+{#each Object.keys(components['rangecomponent'].initialData.configuration) as key (key)}
+	<ResolveConfig
+		{id}
+		{key}
+		bind:resolvedConfig={resolvedConfig[key]}
+		configuration={configuration[key]}
+	/>
+{/each}
+
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.rangecomponent}
+	/>
+{/each}
 
 <InitializeComponent {id} />
 
 <AlignWrapper {render} {verticalAlignment}>
 	<div class="flex flex-col w-full">
-		<div class="flex items-center w-full gap-1 px-1">
-			<span class={css?.limits?.class ?? ''} style={css?.limits?.style ?? ''}>
-				{+min}
-			</span>
+		<div class="flex items-center w-full gap-1">
 			<div
-				class="grow"
+				class={twMerge('grow', 'wm-slider-bar')}
 				style="--range-handle-focus: {'#7e9abd'}; --range-handle: {'#7e9abd'}; {css?.bar?.style ??
 					''}"
 				on:pointerdown|stopPropagation
 			>
 				<RangeSlider
+					id="range-slider"
+					springValues={{ stiffness: 1, damping: 1 }}
 					bind:slider
 					bind:values
-					{step}
-					min={!min ? 0 : +min}
-					max={!max ? 1 : +max}
+					min={resolvedConfig.min == undefined ? 0 : +resolvedConfig.min}
+					max={resolvedConfig.max == undefined ? 1 : +resolvedConfig.max}
 					range
+					disabled={resolvedConfig.disabled}
+					pips
+					float
+					first="label"
+					last="label"
+					step={resolvedConfig.step ?? 1}
+					pipstep={(resolvedConfig.axisStep ?? 1) / (resolvedConfig.step ?? 1)}
+					formatter={format}
 				/>
-				<!-- <RangeSlider {step} range min={min ?? 0} max={max ?? 1} bind:values /> -->
 			</div>
-			<span class={css?.limits?.class ?? ''} style={css?.limits?.style ?? ''}>
-				{+max}
-			</span>
-		</div>
-		<div class="flex justify-between px-1">
-			<span
-				class={twMerge(
-					'text-center text-sm font-medium bg-blue-100 text-blue-800 rounded px-2.5 py-0.5',
-					css?.values?.class ?? ''
-				)}
-				style={css?.values?.style ?? ''}
-			>
-				{values[0]}
-			</span>
-			<span
-				class={twMerge(
-					'text-center text-sm font-medium bg-blue-100 text-blue-800 rounded px-2.5 py-0.5',
-					css?.values?.class ?? ''
-				)}
-				style={css?.values?.style ?? ''}
-			>
-				{values[1]}
-			</span>
 		</div>
 	</div>
 </AlignWrapper>
+
+<style>
+	:global(#range-slider.rangeSlider) {
+		font-size: 12px;
+		text-transform: uppercase;
+	}
+
+	:global(.dark #range-slider.rangeSlider) {
+		background-color: #3b4252;
+	}
+
+	:global(#range-slider.rangeSlider .rangeHandle) {
+		width: 2em;
+		height: 2em;
+	}
+
+	:global(#range-slider.rangeSlider .rangeFloat) {
+		opacity: 1;
+		background: transparent;
+		top: 50%;
+		transform: translate(-50%, -50%);
+	}
+
+	:global(.dark #range-slider.rangeSlider > .rangePips > .pip) {
+		color: #eeeeee;
+	}
+</style>

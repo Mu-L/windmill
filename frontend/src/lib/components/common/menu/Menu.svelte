@@ -4,7 +4,7 @@
 
 <script lang="ts">
 	import { classNames } from '$lib/utils'
-	import { onMount } from 'svelte'
+	import { createEventDispatcher, onMount } from 'svelte'
 	import { fade } from 'svelte/transition'
 
 	export let noMinW = false
@@ -12,6 +12,7 @@
 	export let wrapperClasses = ''
 	export let popupClasses = ''
 	export let transitionDuration = 25
+	export let pointerDown = false
 	let menu: HTMLDivElement
 
 	type Alignment = 'start' | 'end' | 'center'
@@ -53,19 +54,38 @@
 		'bottom-start': 'origin-top-left left-0',
 		'bottom-end': 'origin-top-right right-0',
 		'top-start': 'origin-bottom-left left-0 bottom-0',
-		'top-end': 'origin-bottom-right right-0 bottom-0'
+		'top-end': 'origin-bottom-right right-0 bottom-0',
+		'top-center': 'origin-top-left -top-full left-1/2  transform -translate-x-1/2 -translate-y-full'
 	}
+	const dispatch = createEventDispatcher()
 </script>
 
 <div class="relative {wrapperClasses}" bind:this={menu}>
 	<!-- svelte-ignore a11y-click-events-have-key-events -->
+	<!-- svelte-ignore a11y-no-static-element-interactions -->
 	<div
-		on:click|stopPropagation={() => {
-			if (!show) {
-				current && current()
-				current = close
+		on:click={() => {
+			if (!pointerDown) {
+				if (!show) {
+					current && current()
+					current = close
+				}
+				show = !show
+				if (show) {
+					dispatch('dropdownOpen')
+				} else {
+					dispatch('dropdownClose')
+				}
 			}
-			show = !show
+		}}
+		on:pointerdown={() => {
+			if (pointerDown) {
+				if (!show) {
+					current && current()
+					current = close
+				}
+				show = !show
+			}
 		}}
 		class="relative"
 	>
@@ -75,7 +95,7 @@
 		<div
 			transition:fade|local={{ duration: transitionDuration }}
 			class={classNames(
-				'z-50 absolute mt-2 rounded-md shadow-lg bg-white ring-1 ring-black ring-opacity-5 focus:outline-none',
+				'z-50 absolute mt-2 rounded-md shadow-lg bg-surface ring-1 ring-black ring-opacity-5 focus:outline-none',
 				placementsClasses[placement],
 				noMinW ? 'min-w-0' : 'w-60',
 				popupClasses

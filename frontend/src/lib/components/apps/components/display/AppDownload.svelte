@@ -4,13 +4,14 @@
 	import { initConfig, initOutput } from '../../editor/appUtils'
 	import { components } from '../../editor/component'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import { concatCustomCss, transformBareBase64IfNecessary } from '../../utils'
+	import { initCss, transformBareBase64IfNecessary } from '../../utils'
 	import ResolveConfig from '../helpers/ResolveConfig.svelte'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
-	import { AlignWrapper } from '../helpers'
 	import { Button } from '$lib/components/common'
 	import { loadIcon } from '../icon'
 	import ComponentErrorHandler from '../helpers/ComponentErrorHandler.svelte'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
+	import AlignWrapper from '../helpers/AlignWrapper.svelte'
 
 	export let id: string
 	export let configuration: RichConfigurations
@@ -33,22 +34,34 @@
 	let beforeIconComponent: any
 	let afterIconComponent: any
 
-	$: resolvedConfig.beforeIcon && handleBeforeIcon()
-	$: resolvedConfig.afterIcon && handleAfterIcon()
+	$: resolvedConfig.beforeIcon && beforeIconComponent && handleBeforeIcon()
+	$: resolvedConfig.afterIcon && afterIconComponent && handleAfterIcon()
 
 	async function handleBeforeIcon() {
 		if (resolvedConfig.beforeIcon) {
-			beforeIconComponent = await loadIcon(resolvedConfig.beforeIcon)
+			beforeIconComponent = await loadIcon(
+				resolvedConfig.beforeIcon,
+				beforeIconComponent,
+				14,
+				undefined,
+				undefined
+			)
 		}
 	}
 
 	async function handleAfterIcon() {
 		if (resolvedConfig.afterIcon) {
-			afterIconComponent = await loadIcon(resolvedConfig.afterIcon)
+			afterIconComponent = await loadIcon(
+				resolvedConfig.afterIcon,
+				afterIconComponent,
+				14,
+				undefined,
+				undefined
+			)
 		}
 	}
 
-	$: css = concatCustomCss($app.css?.downloadcomponent, customCss)
+	let css = initCss($app.css?.downloadcomponent, customCss)
 </script>
 
 <InitializeComponent {id} />
@@ -62,6 +75,16 @@
 	/>
 {/each}
 
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.downloadcomponent}
+	/>
+{/each}
+
 {#if render}
 	<AlignWrapper {noWFull} {horizontalAlignment} {verticalAlignment}>
 		<ComponentErrorHandler
@@ -71,27 +94,38 @@
 				on:pointerdown={(e) => e.stopPropagation()}
 				btnClasses={twMerge(
 					css?.button?.class,
+					'wm-button',
+					'wm-download-button',
 					resolvedConfig.fillContainer ? 'w-full h-full' : ''
 				)}
-				wrapperClasses={resolvedConfig.fillContainer ? 'w-full h-full' : ''}
+				wrapperClasses={twMerge(
+					'wm-button-container',
+					'wm-download-button-container',
+					resolvedConfig.fillContainer ? 'w-full h-full' : ''
+				)}
 				style={css?.button?.style}
 				disabled={resolvedConfig.source == undefined}
 				size={resolvedConfig.size}
 				color={resolvedConfig.color}
 				download={resolvedConfig.filename}
 				href={transformBareBase64IfNecessary(resolvedConfig.source)}
-				target="_self"
+				target="_blank"
+				ref="external"
 				nonCaptureEvent
 			>
 				<span class="truncate inline-flex gap-2 items-center">
-					{#if resolvedConfig.beforeIcon && beforeIconComponent}
-						<svelte:component this={beforeIconComponent} size={14} />
+					{#if resolvedConfig.beforeIcon}
+						{#key resolvedConfig.beforeIcon}
+							<div class="min-w-4" bind:this={beforeIconComponent} />
+						{/key}
 					{/if}
 					{#if resolvedConfig.label && resolvedConfig.label?.length > 0}
 						<div>{resolvedConfig.label}</div>
 					{/if}
-					{#if resolvedConfig.afterIcon && afterIconComponent}
-						<svelte:component this={afterIconComponent} size={14} />
+					{#if resolvedConfig.afterIcon}
+						{#key resolvedConfig.afterIcon}
+							<div class="min-w-4" bind:this={afterIconComponent} />
+						{/key}
 					{/if}
 				</span>
 			</Button>

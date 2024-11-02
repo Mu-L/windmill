@@ -7,21 +7,23 @@
  */
 
 use crate::{
-    db::{UserDB, DB},
-    users::{maybe_refresh_folders, require_owner_of_path, Authed},
+    db::{ApiAuthed, DB},
+    users::{maybe_refresh_folders, require_owner_of_path},
 };
 
 use axum::{
     extract::{Extension, Path},
-    routing::post,
+    routing::{delete, post},
     Json, Router,
 };
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
-use windmill_common::error::Result;
+use windmill_common::{db::UserDB, error::Result, utils::StripPath};
 
 pub fn workspaced_service() -> Router {
-    Router::new().route("/create", post(create_draft))
+    Router::new()
+        .route("/create", post(create_draft))
+        .route("/delete/:kind/*path", delete(delete_draft))
 }
 
 #[derive(sqlx::Type, Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -36,12 +38,32 @@ pub enum DraftType {
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Draft {
     pub path: String,
-    pub value: serde_json::Value,
+    pub value: sqlx::types::Json<Box<serde_json::value::Value>>,
     pub typ: DraftType,
 }
 
+pub async fn require_writer_of_path(
+    authed: &ApiAuthed,
+    path: &str,
+    w_id: &str,
+    db: DB,
+    kind: &DraftType,
+) -> Result<()> {
+    if authed.is_admin {
+        return Ok(());
+    } else if require_owner_of_path(authed, path).is_ok() {
+        return Ok(());
+    } else {
+        match kind {
+            DraftType::Script => crate::scripts::require_is_writer(authed, path, w_id, db).await,
+            DraftType::Flow => crate::flows::require_is_writer(authed, path, w_id, db).await,
+            DraftType::App => crate::apps::require_is_writer(authed, path, w_id, db).await,
+        }
+    }
+}
+
 async fn create_draft(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
@@ -51,7 +73,7 @@ async fn create_draft(
 
     let mut tx = user_db.begin(&authed).await?;
 
-    require_owner_of_path(&authed, &draft.path)?;
+    require_writer_of_path(&authed, &draft.path, &w_id, db, &draft.typ).await?;
 
     sqlx::query!(
         "INSERT INTO draft
@@ -62,9 +84,9 @@ async fn create_draft(
         draft.path,
         //to preserve key orders
         serde_json::to_string(&draft.value).unwrap(),
-        draft.typ: DraftType,
+        draft.typ as DraftType,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -72,8 +94,28 @@ async fn create_draft(
     Ok((StatusCode::CREATED, format!("draft {} created", draft.path)))
 }
 
+async fn delete_draft(
+    authed: ApiAuthed,
+    Extension(user_db): Extension<UserDB>,
+    Path((w_id, kind, path)): Path<(String, DraftType, StripPath)>,
+) -> Result<String> {
+    let mut tx = user_db.begin(&authed).await?;
+
+    sqlx::query!(
+        "DELETE FROM draft WHERE path = $1 AND typ = $2 AND workspace_id = $3",
+        path.to_path(),
+        kind as DraftType,
+        w_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(format!("deleted draft"))
+}
+
 // async fn get_draft(
-//     authed: Authed,
+//     authed: ApiAuthed,
 //     Extension(user_db): Extension<UserDB>,
 //     Path((w_id, path)): Path<(String, StripPath)>,
 // ) -> JsonResult<Draft> {

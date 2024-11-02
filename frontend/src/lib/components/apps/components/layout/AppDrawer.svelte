@@ -2,15 +2,17 @@
 	import { getContext } from 'svelte'
 	import SubGridEditor from '../../editor/SubGridEditor.svelte'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import Portal from 'svelte-portal'
-	import { concatCustomCss } from '../../utils'
+	import Portal from '$lib/components/Portal.svelte'
+
+	import { initCss } from '../../utils'
 	import { Button, Drawer, DrawerContent } from '$lib/components/common'
 	import { twMerge } from 'tailwind-merge'
-	import { AlignWrapper } from '../helpers'
 	import { initConfig, initOutput } from '../../editor/appUtils'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
 	import { components } from '../../editor/component'
 	import ResolveConfig from '../helpers/ResolveConfig.svelte'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
+	import AlignWrapper from '../helpers/AlignWrapper.svelte'
 
 	export let customCss: ComponentCustomCSS<'drawercomponent'> | undefined = undefined
 	export let id: string
@@ -19,19 +21,40 @@
 	export let verticalAlignment: 'top' | 'center' | 'bottom' | undefined = undefined
 	export let noWFull = false
 	export let render: boolean
+	export let onOpenRecomputeIds: string[] | undefined = undefined
+	export let onCloseRecomputeIds: string[] | undefined = undefined
 
-	const { app, focusedGrid, selectedComponent, worldStore, connectingInput, mode } =
-		getContext<AppViewerContext>('AppViewerContext')
+	const {
+		app,
+		focusedGrid,
+		selectedComponent,
+		worldStore,
+		connectingInput,
+		mode,
+		componentControl,
+		runnableComponents
+	} = getContext<AppViewerContext>('AppViewerContext')
 
 	const resolvedConfig = initConfig(
 		components['drawercomponent'].initialData.configuration,
 		configuration
 	)
-	initOutput($worldStore, id, {})
+	const outputs = initOutput($worldStore, id, {
+		open: false
+	})
 
 	let appDrawer: Drawer
 
-	$: css = concatCustomCss($app.css?.drawercomponent, customCss)
+	$componentControl[id] = {
+		open: () => {
+			appDrawer?.openDrawer()
+		},
+		close: () => {
+			appDrawer?.closeDrawer()
+		}
+	}
+
+	let css = initCss($app.css?.drawercomponent, customCss)
 </script>
 
 {#each Object.keys(components['drawercomponent'].initialData.configuration) as key (key)}
@@ -43,13 +66,29 @@
 	/>
 {/each}
 
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.drawercomponent}
+	/>
+{/each}
+
+<InitializeComponent {id} />
+
 <div class="h-full w-full">
 	<AlignWrapper {noWFull} {horizontalAlignment} {verticalAlignment}>
 		<Button
-			btnClasses={css?.button?.class}
+			btnClasses={twMerge(css?.button?.class, 'wm-drawer-button')}
 			wrapperClasses={twMerge(
 				css?.container?.class,
-				resolvedConfig?.fillContainer ? 'w-full h-full' : ''
+				'wm-drawer-button-container',
+				resolvedConfig?.fillContainer ? 'w-full h-full' : '',
+				resolvedConfig?.hideButtonOnView && $mode == 'preview'
+					? 'invisible h-0 overflow-hidden'
+					: ''
 			)}
 			wrapperStyle={css?.container?.style}
 			disabled={resolvedConfig?.disabled}
@@ -74,15 +113,22 @@
 	</AlignWrapper>
 </div>
 
-<InitializeComponent {id} />
-
-<Portal target="#app-editor-top-level-drawer">
+<Portal target="#app-editor-top-level-drawer" name="app-drawer">
 	<Drawer
 		let:open
 		bind:this={appDrawer}
 		size="800px"
 		alwaysOpen
 		positionClass={$mode == 'dnd' ? '!absolute' : '!fixed'}
+		shouldUsePortal={false}
+		on:open={() => {
+			outputs?.open.set(true)
+			onOpenRecomputeIds?.forEach((id) => $runnableComponents?.[id]?.cb?.map((cb) => cb?.()))
+		}}
+		on:close={() => {
+			outputs?.open.set(false)
+			onCloseRecomputeIds?.forEach((id) => $runnableComponents?.[id]?.cb?.map((cb) => cb?.()))
+		}}
 	>
 		<DrawerContent
 			title={resolvedConfig.drawerTitle}
@@ -90,9 +136,11 @@
 				appDrawer?.toggleDrawer()
 				$focusedGrid = undefined
 			}}
+			fullScreen={$mode !== 'dnd'}
 		>
 			<div
-				class="h-full"
+				class={twMerge('h-full', css?.drawer?.class, 'wm-drawer')}
+				style={css?.drawer?.style}
 				on:pointerdown={(e) => {
 					e?.stopPropagation()
 					if (!$connectingInput.opened) {
@@ -109,7 +157,6 @@
 						visible={open && render}
 						{id}
 						subGridId={`${id}-0`}
-						containerHeight={1200}
 						on:focus={() => {
 							if (!$connectingInput.opened) {
 								$selectedComponent = [id]

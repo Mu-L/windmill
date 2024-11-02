@@ -1,6 +1,10 @@
 // Modified from: https://raw.githubusercontent.com/epoberezkin/fast-deep-equal/master/src/index.jst
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-nocheck This file is copied from a JS project, so it's not type-safe.
+
+import { log, encodeHex, SEP } from "./deps.ts";
+import crypto from "node:crypto";
+
 export function deepEqual<T>(a: T, b: T): boolean {
   if (a === b) return true;
 
@@ -51,7 +55,10 @@ export function deepEqual<T>(a: T, b: T): boolean {
     if (a.valueOf !== Object.prototype.valueOf) {
       return a.valueOf() === b.valueOf();
     }
-    if (a.toString !== Object.prototype.toString) {
+    if (
+      a.toString !== Object.prototype.toString &&
+      typeof a.toString == "function"
+    ) {
       return a.toString() === b.toString();
     }
 
@@ -73,4 +80,65 @@ export function deepEqual<T>(a: T, b: T): boolean {
 
   // true if both NaN, false otherwise
   return a !== a && b !== b;
+}
+
+export function getHeaders(): Record<string, string> | undefined {
+  const headers = Deno.env.get("HEADERS");
+  if (headers) {
+    const parsedHeaders = Object.fromEntries(
+      headers.split(",").map((h) => h.split(":").map((s) => s.trim()))
+    );
+    log.debug(
+      "Headers from env keys: " + JSON.stringify(Object.keys(parsedHeaders))
+    );
+    return parsedHeaders;
+  } else {
+    return undefined;
+  }
+}
+
+export async function digestDir(path: string, conf: string) {
+  const hashes: string = [];
+  for await (const e of Deno.readDir(path)) {
+    const npath = path + "/" + e.name;
+    if (e.isFile) {
+      hashes.push(await generateHashFromBuffer(await Deno.readFile(npath)));
+    } else if (e.isDirectory && !e.isSymlink) {
+      hashes.push(await digestDir(npath, ""));
+    }
+  }
+  return await generateHash(hashes.join("") + conf);
+}
+
+export async function generateHash(content: string): Promise<string> {
+  const messageBuffer = new TextEncoder().encode(content);
+  return await generateHashFromBuffer(messageBuffer);
+}
+
+export async function generateHashFromBuffer(
+  content: BufferSource
+): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", content);
+  return encodeHex(hashBuffer);
+}
+
+// export async function readInlinePath(path: string): Promise<string> {
+//   return await Deno.readTextFile(path.replaceAll("/", SEP));
+// }
+
+export function readInlinePathSync(path: string): string {
+  return Deno.readTextFileSync(path.replaceAll("/", SEP));
+}
+
+export function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isFileResource(path: string): boolean {
+  const splitPath = path.split(".");
+  return (
+    splitPath.length >= 4 &&
+    splitPath[1] == "resource" &&
+    splitPath[2] == "file"
+  );
 }

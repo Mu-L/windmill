@@ -6,7 +6,7 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-use crate::{db::UserDB, jobs::CompletedJob, users::Authed};
+use crate::db::ApiAuthed;
 use axum::{
     extract::{Path, Query},
     routing::{get, post},
@@ -15,16 +15,17 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::types::Uuid;
+use sqlx::{types::Uuid, FromRow};
 use std::{
     fmt::{Display, Formatter},
     vec,
 };
 use windmill_common::{
+    db::UserDB,
     error::JsonResult,
     jobs::JobKind,
     scripts::to_i64,
-    utils::{paginate, Pagination},
+    utils::{not_found_if_none, paginate, Pagination},
 };
 pub fn workspaced_service() -> Router {
     Router::new()
@@ -33,6 +34,10 @@ pub fn workspaced_service() -> Router {
         .route("/create", post(create_input))
         .route("/update", post(update_input))
         .route("/delete/:id", post(delete_input))
+        .route(
+            "/:job_or_input_id/args",
+            get(get_args_from_history_or_saved_input),
+        )
 }
 
 #[derive(Debug, sqlx::FromRow, Serialize, Deserialize)]
@@ -42,7 +47,7 @@ pub struct InputRow {
     pub runnable_id: String,
     pub runnable_type: RunnableType,
     pub name: String,
-    pub args: Value,
+    pub args: sqlx::types::Json<Box<serde_json::value::RawValue>>,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
     pub is_public: bool,
@@ -90,18 +95,28 @@ pub struct RunnableParams {
     pub runnable_type: RunnableType,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Input {
     id: Uuid,
     name: String,
     created_at: chrono::DateTime<chrono::Utc>,
-    args: serde_json::Value,
+    args: sqlx::types::Json<Box<serde_json::value::RawValue>>,
     created_by: String,
     is_public: bool,
+    success: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, FromRow)]
+pub struct CompletedJobMini {
+    id: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
+    args: Option<sqlx::types::Json<Box<serde_json::value::RawValue>>>,
+    created_by: String,
+    success: bool,
 }
 
 async fn get_input_history(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
@@ -112,13 +127,13 @@ async fn get_input_history(
     let mut tx = user_db.begin(&authed).await?;
 
     let sql = &format!(
-        "select * from (select distinct on (args) * from completed_job \
+        "select id, created_at, created_by, 'null'::jsonb as args, success from completed_job \
         where {} = $1 and job_kind = $2 and workspace_id = $3 \
-        order by args, started_at desc) t ORDER BY started_at desc limit $4 offset $5",
+        order by created_at desc limit $4 offset $5",
         r.runnable_type.column_name()
     );
 
-    let query = sqlx::query_as::<_, CompletedJob>(sql);
+    let query = sqlx::query_as::<_, CompletedJobMini>(sql);
 
     let query = match r.runnable_type {
         RunnableType::ScriptHash => query.bind(to_i64(&r.runnable_id)?),
@@ -130,7 +145,7 @@ async fn get_input_history(
         .bind(&w_id)
         .bind(per_page as i32)
         .bind(offset as i32)
-        .fetch_all(&mut tx)
+        .fetch_all(&mut *tx)
         .await?;
 
     tx.commit().await?;
@@ -146,17 +161,70 @@ async fn get_input_history(
                 row.created_by
             ),
             created_at: row.created_at,
-            args: row.args.unwrap_or(serde_json::json!({})),
+            args: row.args.unwrap_or(sqlx::types::Json(
+                serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+            )),
             created_by: row.created_by,
             is_public: true,
+            success: row.success,
         });
     }
 
     Ok(Json(inputs))
 }
 
+#[derive(Deserialize)]
+struct GetArgs {
+    input: Option<bool>,
+    allow_large: Option<bool>,
+}
+async fn get_args_from_history_or_saved_input(
+    authed: ApiAuthed,
+    Extension(user_db): Extension<UserDB>,
+    Query(g): Query<GetArgs>,
+    Path((w_id, job_or_input_id)): Path<(String, Uuid)>,
+) -> JsonResult<Option<Value>> {
+    let mut tx = user_db.begin(&authed).await?;
+    let result_o = if let Some(input) = g.input {
+        if input {
+            sqlx::query_scalar!(
+                    "SELECT CASE WHEN pg_column_size(args) < 40000 OR $3 THEN args ELSE '\"WINDMILL_TOO_BIG\"'::jsonb END as args FROM input WHERE id = $1 AND workspace_id = $2",
+                    job_or_input_id,
+                    w_id,
+                    g.allow_large.unwrap_or(true)
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            sqlx::query_scalar!(
+                "SELECT CASE WHEN pg_column_size(args) < 40000 OR $3 THEN args ELSE '\"WINDMILL_TOO_BIG\"'::jsonb END as args FROM completed_job WHERE id = $1 AND workspace_id = $2",
+                job_or_input_id,
+                w_id,
+                g.allow_large.unwrap_or(true)
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+    } else {
+        sqlx::query_scalar!(
+        "SELECT CASE WHEN pg_column_size(args) < 40000 OR $3 THEN args ELSE '\"WINDMILL_TOO_BIG\"'::jsonb END as args FROM completed_job WHERE id = $1 AND workspace_id = $2 UNION ALL SELECT CASE WHEN pg_column_size(args) < 40000 OR $3 THEN args ELSE '\"WINDMILL_TOO_BIG\"'::jsonb END as args FROM input WHERE id = $1 AND workspace_id = $2",
+        job_or_input_id,
+        w_id,
+        g.allow_large.unwrap_or(true)
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    };
+
+    tx.commit().await?;
+
+    let result = not_found_if_none(result_o, "Input args", job_or_input_id.to_string())?;
+
+    Ok(Json(result))
+}
+
 async fn list_saved_inputs(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
@@ -167,7 +235,7 @@ async fn list_saved_inputs(
     let mut tx = user_db.begin(&authed).await?;
 
     let rows = sqlx::query_as::<_, InputRow>(
-        "select * from input \
+        "select id, workspace_id, runnable_id, runnable_type, name, 'null'::jsonb as args, created_at, created_by, is_public from input \
          where runnable_id = $1 and runnable_type = $2 and workspace_id = $3 \
          and (is_public IS true OR created_by = $4) \
          order by created_at desc limit $5 offset $6",
@@ -178,7 +246,7 @@ async fn list_saved_inputs(
     .bind(&authed.username)
     .bind(per_page as i32)
     .bind(offset as i32)
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -193,6 +261,7 @@ async fn list_saved_inputs(
             created_by: row.created_by,
             created_at: row.created_at,
             is_public: row.is_public,
+            success: true,
         })
     }
 
@@ -202,11 +271,11 @@ async fn list_saved_inputs(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateInput {
     name: String,
-    args: serde_json::Value,
+    args: Box<serde_json::value::RawValue>,
 }
 
 async fn create_input(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(r): Query<RunnableParams>,
@@ -224,9 +293,9 @@ async fn create_input(
     .bind(&r.runnable_id)
     .bind(&r.runnable_type)
     .bind(&input.name)
-    .bind(&input.args)
+    .bind(sqlx::types::Json(&input.args))
     .bind(&authed.username)
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -242,7 +311,7 @@ pub struct UpdateInput {
 }
 
 async fn update_input(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Json(input): Json<UpdateInput>,
@@ -254,7 +323,7 @@ async fn update_input(
         .bind(&input.is_public)
         .bind(&input.id)
         .bind(&w_id)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
 
     tx.commit().await?;
@@ -263,7 +332,7 @@ async fn update_input(
 }
 
 async fn delete_input(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, i_id)): Path<(String, Uuid)>,
 ) -> JsonResult<String> {
@@ -272,7 +341,7 @@ async fn delete_input(
     sqlx::query("DELETE FROM input WHERE id = $1 and workspace_id = $2")
         .bind(&i_id)
         .bind(&w_id)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
 
     tx.commit().await?;

@@ -1,30 +1,46 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
+	import { afterNavigate, replaceState } from '$app/navigation'
 	import { page } from '$app/stores'
-	import { dirtyStore } from '$lib/components/common/confirmationModal/dirtyStore'
-	import UnsavedConfirmationModal from '$lib/components/common/confirmationModal/UnsavedConfirmationModal.svelte'
 
 	import FlowBuilder from '$lib/components/FlowBuilder.svelte'
+	import UnsavedConfirmationModal from '$lib/components/common/confirmationModal/UnsavedConfirmationModal.svelte'
 	import type { FlowState } from '$lib/components/flows/flowState'
 	import { importFlowStore, initFlow } from '$lib/components/flows/flowStore'
 	import { FlowService, type Flow } from '$lib/gen'
-	import { userStore, workspaceStore } from '$lib/stores'
+	import { initialArgsStore, userStore, workspaceStore } from '$lib/stores'
 	import { sendUserToast } from '$lib/toast'
 	import { decodeState, emptySchema } from '$lib/utils'
+	import { tick } from 'svelte'
 	import { writable } from 'svelte/store'
+	import type { ScheduleTrigger } from '$lib/components/triggers'
 
 	let nodraft = $page.url.searchParams.get('nodraft')
 
-	if (nodraft) {
-		goto('?', { replaceState: true })
-	}
+	afterNavigate(() => {
+		if (nodraft) {
+			let url = new URL($page.url.href)
+			url.search = ''
+			replaceState(url.toString(), $page.state)
+		}
+	})
 
 	const hubId = $page.url.searchParams.get('hub')
 	const templatePath = $page.url.searchParams.get('template')
+	const templateId = $page.url.searchParams.get('template_id')
 	const initialState = hubId || templatePath || nodraft ? undefined : localStorage.getItem('flow')
 
 	let selectedId: string = 'settings-metadata'
 	let loading = false
+
+	let initialPath: string | undefined = undefined
+	let pathStoreInit: string | undefined = undefined
+
+	let initialArgs = {}
+	if ($initialArgsStore) {
+		initialArgs = $initialArgsStore
+		$initialArgsStore = undefined
+	}
 
 	export const flowStore = writable<Flow>({
 		summary: '',
@@ -38,6 +54,7 @@
 	})
 	const flowStateStore = writable<FlowState>({})
 
+	let savedPrimarySchedule: ScheduleTrigger | undefined = undefined
 	async function loadFlow() {
 		loading = true
 		let flow: Flow = {
@@ -52,10 +69,15 @@
 		}
 
 		let state = initialState ? decodeState(initialState) : undefined
+		const initialStateQuery = $page.url.hash != '' ? $page.url.hash.slice(1) : undefined
+
+		if (initialStateQuery) {
+			state = decodeState(initialStateQuery)
+		}
 		if ($importFlowStore) {
 			flow = $importFlowStore
 			$importFlowStore = undefined
-			sendUserToast('Flow loaded from JSON')
+			sendUserToast('Flow loaded from YAML/JSON')
 		} else if (!templatePath && !hubId && state) {
 			sendUserToast('Flow restored from draft', false, [
 				{
@@ -76,27 +98,42 @@
 			])
 
 			flow = state.flow
+			pathStoreInit = state.path
+			savedPrimarySchedule = state.primarySchedule
 			state?.selectedId && (selectedId = state?.selectedId)
 		} else {
 			if (templatePath) {
-				const template = await FlowService.getFlowByPath({
-					workspace: $workspaceStore!,
-					path: templatePath
-				})
+				let template: Flow
+				if (templateId) {
+					template = await FlowService.getFlowVersion({
+						workspace: $workspaceStore!,
+						path: templatePath,
+						version: parseInt(templateId)
+					})
+				} else {
+					template = await FlowService.getFlowByPath({
+						workspace: $workspaceStore!,
+						path: templatePath
+					})
+				}
 				Object.assign(flow, template)
-				const oldPath = flow.path.split('/')
-				flow.path = `u/${$userStore?.username.split('@')[0]}/${oldPath[oldPath.length - 1]}_fork`
+				const oldPath = templatePath.split('/')
+				initialPath = `u/${$userStore?.username.split('@')[0]}/${oldPath[oldPath.length - 1]}_fork`
 				flow = flow
 				goto('?', { replaceState: true })
 				selectedId = 'settings-metadata'
 			} else if (hubId) {
 				const hub = await FlowService.getHubFlowById({ id: Number(hubId) })
 				delete hub['comments']
-				flow.path = `u/${$userStore?.username}/flow_${hubId}`
+				initialPath = `u/${$userStore?.username}/flow_${hubId}`
 				Object.assign(flow, hub.flow)
 				flow = flow
 				goto('?', { replaceState: true })
-				selectedId = 'settings-metadata'
+				selectedId = 'constants'
+			} else {
+				tick().then(() => {
+					flowBuilder?.triggerTutorial()
+				})
 			}
 		}
 		await initFlow(flow, flowStore, flowStateStore)
@@ -105,27 +142,40 @@
 
 	loadFlow()
 
-	$dirtyStore = true
-
 	let getSelectedId: (() => string) | undefined = undefined
+	let flowBuilder: FlowBuilder | undefined = undefined
+
+	let savedFlow:
+		| (Flow & {
+				draft?: Flow | undefined
+		  })
+		| undefined = undefined
 </script>
 
-<div id="monaco-widgets-root" class="monaco-editor" style="z-index: 1200;" />
-<UnsavedConfirmationModal />
+<!-- <div id="monaco-widgets-root" class="monaco-editor" style="z-index: 1200;" /> -->
 
 <FlowBuilder
-	on:saveInitial={() => {
-		goto(`/flows/edit/${$flowStore.path}?selected=${getSelectedId?.()}`)
+	on:saveInitial={(e) => {
+		goto(`/flows/edit/${e.detail}?selected=${getSelectedId?.()}`)
 	}}
-	on:deploy={() => {
-		goto(`/flows/get/${$flowStore.path}?workspace=${$workspaceStore}`)
+	on:deploy={(e) => {
+		goto(`/flows/get/${e.detail}?workspace=${$workspaceStore}`)
 	}}
-	on:details={() => {
-		goto(`/flows/get/${$flowStore.path}?workspace=${$workspaceStore}`)
+	on:details={(e) => {
+		goto(`/flows/get/${e.detail}?workspace=${$workspaceStore}`)
 	}}
+	{initialPath}
+	{pathStoreInit}
 	bind:getSelectedId
+	bind:this={flowBuilder}
+	newFlow
+	bind:savedFlow
+	{initialArgs}
 	{flowStore}
 	{flowStateStore}
 	{selectedId}
 	{loading}
-/>
+	{savedPrimarySchedule}
+>
+	<UnsavedConfirmationModal savedValue={savedFlow} modifiedValue={$flowStore} /></FlowBuilder
+>

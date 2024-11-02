@@ -1,31 +1,53 @@
 <script lang="ts">
 	import ConfirmationModal from './ConfirmationModal.svelte'
-	import { beforeNavigate, goto } from '$app/navigation'
-	import { onDestroy } from 'svelte/internal'
-	import { dirtyStore } from './dirtyStore'
+	import { beforeNavigate } from '$app/navigation'
+	import { goto as gotoUrl } from '$app/navigation'
+	import Button from '../button/Button.svelte'
+	import type DiffDrawer from '$lib/components/DiffDrawer.svelte'
+	import { cleanValueProperties, orderedJsonStringify, type Value } from '$lib/utils'
+	import { tick } from 'svelte'
+	import { page } from '$app/stores'
 
-	let navigationState: { from: URL | undefined; to: URL | null; cancel: () => void } | undefined =
-		undefined
-	$: open = Boolean(navigationState)
+	export let savedValue: Value | undefined = undefined
+	export let modifiedValue: Value | undefined = undefined
+	export let diffDrawer: DiffDrawer | undefined = undefined
 
-	beforeNavigate((newNavigationState) => {
+	let bypassBeforeNavigate = false
+	let open = false
+	let goingTo: URL | undefined = undefined
+
+	beforeNavigate(async (newNavigationState) => {
+		// console.log('beforeNavigate', newNavigationState, bypassBeforeNavigate)
 		if (
-			!navigationState &&
-			$dirtyStore &&
+			!bypassBeforeNavigate &&
 			newNavigationState.to &&
+			newNavigationState.to.url != $page.url &&
 			newNavigationState.to.url.pathname !== newNavigationState.from?.url.pathname
 		) {
-			navigationState = {
-				to: newNavigationState.to.url,
-				from: newNavigationState.from?.url,
-				cancel: newNavigationState.cancel
-			}
+			// console.log('going to', newNavigationState.to.url)
+			goingTo = newNavigationState.to.url
 			newNavigationState.cancel()
+			if (newNavigationState.type != 'popstate') {
+				await tick() // make sure saved value is updated when clicking on save draft or deploy
+			}
+			if (savedValue && modifiedValue) {
+				const draftOrDeployed = cleanValueProperties({
+					...((savedValue.draft || savedValue) ?? {}),
+					path: undefined
+				})
+				const current = cleanValueProperties({ ...(modifiedValue ?? {}), path: undefined })
+				if (orderedJsonStringify(draftOrDeployed) === orderedJsonStringify(current)) {
+					bypassBeforeNavigate = true
+					gotoUrl(goingTo)
+				} else {
+					open = true
+				}
+			} else {
+				open = true
+			}
+		} else if (bypassBeforeNavigate) {
+			bypassBeforeNavigate = false
 		}
-	})
-
-	onDestroy(() => {
-		$dirtyStore = false
 	})
 </script>
 
@@ -34,20 +56,48 @@
 	title="Unsaved changes detected"
 	confirmationText="Discard changes"
 	on:canceled={() => {
-		if (navigationState) {
-			navigationState.cancel()
-		}
-		navigationState = undefined
+		open = false
 	}}
 	on:confirmed={() => {
-		if (navigationState?.to) {
-			goto(navigationState.to)
+		if (goingTo) {
+			bypassBeforeNavigate = true
+			gotoUrl(goingTo)
 		}
-		$dirtyStore = false
-		navigationState = undefined
 	}}
 >
 	<div class="flex flex-col w-full space-y-4">
 		<span>Are you sure you want to discard the changes you have made? </span>
+		{#if savedValue && modifiedValue && diffDrawer}
+			<Button
+				wrapperClasses="self-start"
+				color="light"
+				variant="border"
+				size="xs"
+				on:click={() => {
+					if (!savedValue || !modifiedValue) {
+						return
+					}
+					open = false
+					diffDrawer?.openDrawer()
+					diffDrawer?.setDiff({
+						mode: 'normal',
+						deployed: savedValue,
+						draft: savedValue.draft,
+						current: modifiedValue,
+						defaultDiffType: 'draft',
+						button: {
+							text: 'Leave anyway',
+							onClick: () => {
+								if (goingTo) {
+									bypassBeforeNavigate = true
+									gotoUrl(goingTo)
+								}
+							}
+						}
+					})
+				}}
+				>Show diff
+			</Button>
+		{/if}
 	</div>
 </ConfirmationModal>

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AppService, FlowService, type OpenFlow } from '$lib/gen'
+	import { AppService, FlowService, type OpenFlow, type Script } from '$lib/gen'
 	import { userStore, workspaceStore } from '$lib/stores'
 	import { Alert, Button, Drawer, DrawerContent, Tab, Tabs } from '$lib/components/common'
 	import PageHeader from '$lib/components/PageHeader.svelte'
@@ -7,28 +7,31 @@
 	import CreateActionsScript from '$lib/components/scripts/CreateActionsScript.svelte'
 	import { getScriptByPath } from '$lib/scripts'
 	import type { HubItem } from '$lib/components/flows/pickers/model'
-	import { faCodeFork } from '@fortawesome/free-solid-svg-icons'
 	import PickHubScript from '$lib/components/flows/pickers/PickHubScript.svelte'
 	import PickHubFlow from '$lib/components/flows/pickers/PickHubFlow.svelte'
-	import FlowViewer from '$lib/components/FlowViewer.svelte'
 	import HighlightCode from '$lib/components/HighlightCode.svelte'
-	import { Building, Globe2 } from 'lucide-svelte'
+	import { Building, ExternalLink, GitFork, Globe2, Loader2 } from 'lucide-svelte'
+	import { hubBaseUrlStore } from '$lib/stores'
+	import { base } from '$lib/base'
 
 	import ItemsList from '$lib/components/home/ItemsList.svelte'
 	import CreateActionsApp from '$lib/components/flows/CreateActionsApp.svelte'
 	import PickHubApp from '$lib/components/flows/pickers/PickHubApp.svelte'
-	import AppPreview from '$lib/components/apps/editor/AppPreview.svelte'
 	import { writable } from 'svelte/store'
 	import type { EditorBreakpoint } from '$lib/components/apps/types'
 	import { HOME_SHOW_HUB, HOME_SHOW_CREATE_FLOW, HOME_SHOW_CREATE_APP } from '$lib/consts'
+	import { setQuery } from '$lib/navigation'
+	import { page } from '$app/stores'
+	import { goto, replaceState } from '$app/navigation'
 
 	type Tab = 'hub' | 'workspace'
 
-	let tab: Tab = window.location.hash?.includes('#')
-		? (window.location.hash?.replace('#', '') as Tab)
-		: 'workspace'
+	let tab: Tab =
+		window.location.hash == '#workspace' || window.location.hash == '#hub'
+			? (window.location.hash?.replace('#', '') as Tab)
+			: 'workspace'
 
-	let subtab: 'flows' | 'scripts' | 'apps' = 'apps'
+	let subtab: 'flow' | 'script' | 'app' = 'script'
 
 	let filter: string = ''
 
@@ -40,30 +43,38 @@
 
 	let codeViewer: Drawer
 	let codeViewerContent: string = ''
-	let codeViewerLanguage: 'deno' | 'python3' | 'go' | 'bash' = 'deno'
+	let codeViewerLanguage: Script['language'] = 'deno'
 	let codeViewerObj: HubItem | undefined = undefined
 
 	const breakpoint = writable<EditorBreakpoint>('lg')
 
 	async function viewCode(obj: HubItem) {
-		const { content, language } = await getScriptByPath(obj.path)
-		codeViewerContent = content
-		codeViewerLanguage = language
-		codeViewerObj = obj
+		codeViewerContent = ''
+		codeViewerObj = undefined
+		getScriptByPath(obj.path).then(({ content, language }) => {
+			codeViewerContent = content
+			codeViewerLanguage = language
+			codeViewerObj = obj
+		})
+
 		codeViewer.openDrawer?.()
 	}
 
 	async function viewFlow(obj: { flow_id: number }): Promise<void> {
-		const hub = await FlowService.getHubFlowById({ id: obj.flow_id })
-		delete hub['comments']
-		flowViewerFlow = hub
+		flowViewerFlow = undefined
+		FlowService.getHubFlowById({ id: obj.flow_id }).then((hub) => {
+			delete hub['comments']
+			flowViewerFlow = hub
+		})
 		flowViewer.openDrawer?.()
 	}
 
 	async function viewApp(obj: { app_id: number }): Promise<void> {
-		const hub = await AppService.getHubAppById({ id: obj.app_id })
-		delete hub['comments']
-		appViewerApp = hub
+		appViewerApp = undefined
+		AppService.getHubAppById({ id: obj.app_id }).then((hub) => {
+			delete hub['comments']
+			appViewerApp = hub
+		})
 		appViewer.openDrawer?.()
 	}
 </script>
@@ -72,12 +83,12 @@
 	<DrawerContent title={codeViewerObj?.summary ?? ''} on:close={codeViewer.closeDrawer}>
 		<svelte:fragment slot="actions">
 			<Button
-				href="https://hub.windmill.dev/scripts/{codeViewerObj?.app ?? ''}/{codeViewerObj?.ask_id ??
-					0}"
+				href="{$hubBaseUrlStore}/scripts/{codeViewerObj?.app ?? ''}/{codeViewerObj?.ask_id ?? 0}"
 				variant="contained"
 				color="light"
 				size="xs"
 				target="_blank"
+				disabled={codeViewerObj == undefined}
 			>
 				<div class="flex gap-2 items-center">
 					<Globe2 size={18} />
@@ -85,16 +96,22 @@
 				</div>
 			</Button>
 			<Button
-				href="/scripts/add?hub={encodeURIComponent(codeViewerObj?.path ?? '')}"
-				startIcon={{ icon: faCodeFork }}
+				href="{base}/scripts/add?hub={encodeURIComponent(codeViewerObj?.path ?? '')}"
+				startIcon={{ icon: GitFork }}
 				color="dark"
 				size="xs"
+				disabled={codeViewerObj == undefined}
 			>
 				Fork
 			</Button>
 		</svelte:fragment>
-
-		<HighlightCode language={codeViewerLanguage} code={codeViewerContent} />
+		{#if codeViewerObj != undefined && codeViewerLanguage != undefined}
+			<HighlightCode language={codeViewerLanguage} code={codeViewerContent} />
+		{:else}
+			<div class="p-2">
+				<Loader2 class="animate-spin" />
+			</div>
+		{/if}
 	</DrawerContent>
 </Drawer>
 
@@ -102,11 +119,12 @@
 	<DrawerContent title="Hub flow" on:close={flowViewer.closeDrawer}>
 		<svelte:fragment slot="actions">
 			<Button
-				href="https://hub.windmill.dev/flows/{flowViewerFlow?.flow?.id}"
+				href="{$hubBaseUrlStore}/flows/{flowViewerFlow?.flow?.id}"
 				variant="contained"
 				color="light"
 				size="xs"
 				target="_blank"
+				disabled={flowViewerFlow == undefined}
 			>
 				<div class="flex gap-2 items-center">
 					<Globe2 size={18} />
@@ -115,17 +133,26 @@
 			</Button>
 
 			<Button
-				href="/flows/add?hub={flowViewerFlow?.flow?.id}"
-				startIcon={{ icon: faCodeFork }}
+				href="{base}/flows/add?hub={flowViewerFlow?.flow?.id}"
+				startIcon={{ icon: GitFork }}
 				color="dark"
 				size="xs"
+				disabled={flowViewerFlow == undefined}
 			>
 				Fork
 			</Button>
 		</svelte:fragment>
 
 		{#if flowViewerFlow?.flow}
-			<FlowViewer flow={flowViewerFlow.flow} />
+			{#await import('$lib/components/FlowViewer.svelte')}
+				<Loader2 class="animate-spin" />
+			{:then Module}
+				<Module.default flow={flowViewerFlow.flow} />
+			{/await}
+		{:else}
+			<div class="p-2">
+				<Loader2 class="animate-spin" />
+			</div>
 		{/if}
 	</DrawerContent>
 </Drawer>
@@ -134,11 +161,12 @@
 	<DrawerContent title="Hub app" on:close={appViewer.closeDrawer}>
 		<svelte:fragment slot="actions">
 			<Button
-				href="https://hub.windmill.dev/apps/{appViewerApp?.app?.id}"
+				href="{$hubBaseUrlStore}/apps/{appViewerApp?.app?.id}"
 				variant="contained"
 				color="light"
 				size="xs"
 				target="_blank"
+				disabled={appViewerApp == undefined}
 			>
 				<div class="flex gap-2 items-center">
 					<Globe2 size={18} />
@@ -147,9 +175,10 @@
 			</Button>
 
 			<Button
-				href="/apps/add?hub={appViewerApp?.app?.id}"
-				startIcon={{ icon: faCodeFork }}
+				href="{base}/apps/add?hub={appViewerApp?.app?.id}"
+				startIcon={{ icon: GitFork }}
 				color="dark"
+				disabled={appViewerApp == undefined}
 				size="xs"
 			>
 				Fork
@@ -158,27 +187,34 @@
 
 		{#if appViewerApp?.app}
 			<div class="p-4">
-				<AppPreview
-					app={appViewerApp?.app?.value}
-					appPath="''"
-					{breakpoint}
-					policy={{}}
-					workspace="hub"
-					isEditor={false}
-					context={{
-						username: $userStore?.username ?? 'anonymous',
-						email: $userStore?.email ?? 'anonymous'
-					}}
-					summary={appViewerApp?.app.summary ?? ''}
-					noBackend
-				/>
+				{#await import('$lib/components/apps/editor/AppPreview.svelte')}
+					<Loader2 class="animate-spin" />
+				{:then Module}
+					<Module.default
+						app={appViewerApp?.app?.value}
+						appPath="''"
+						{breakpoint}
+						policy={{}}
+						workspace="hub"
+						isEditor={false}
+						context={{
+							username: $userStore?.username ?? 'anonymous',
+							email: $userStore?.email ?? 'anonymous',
+							groups: $userStore?.groups ?? []
+						}}
+						summary={appViewerApp?.app.summary ?? ''}
+						noBackend
+						replaceStateFn={(path) => replaceState(path, $page.state)}
+						gotoFn={(path, opt) => goto(path, opt)}
+					/>
+				{/await}
 			</div>
 		{/if}
 	</DrawerContent>
 </Drawer>
 
 <div>
-	<div class="max-w-6xl mx-auto px-4 sm:px-6 md:px-8 h-fit-content">
+	<div class="max-w-7xl mx-auto px-4 sm:px-6 md:px-8 h-fit-content">
 		{#if $workspaceStore == 'admins'}
 			<div class="my-4" />
 
@@ -190,7 +226,7 @@
 		<PageHeader title="Home">
 			<div class="flex flex-row gap-4 flex-wrap justify-end items-center">
 				{#if !$userStore?.operator}
-					<span class="text-sm text-gray-500">Create a new:</span>
+					<span class="text-sm text-secondary">Create a</span>
 					<CreateActionsScript />
 					{#if HOME_SHOW_CREATE_FLOW}<CreateActionsFlow />{/if}
 					{#if HOME_SHOW_CREATE_APP}<CreateActionsApp />{/if}
@@ -200,7 +236,7 @@
 
 		{#if !$userStore?.operator}
 			<div class="w-full overflow-auto scrollbar-hidden">
-				<Tabs dflt="workspace" hashNavigation bind:selected={tab}>
+				<Tabs values={['hub', 'workspace']} hashNavigation bind:selected={tab}>
 					<Tab size="md" value="workspace">
 						<div class="flex gap-2 items-center my-1">
 							<Building size={18} />
@@ -222,46 +258,57 @@
 		<div class="flex flex-col gap-y-16">
 			<div class="flex flex-col">
 				{#if tab == 'hub'}
-					<Tabs bind:selected={subtab}>
-						<Tab size="md" value="scripts">
+					<Tabs
+						bind:selected={subtab}
+						on:selected={() => {
+							setQuery($page.url, 'kind', subtab, window.location.hash)
+						}}
+					>
+						<Tab size="md" value="script">
 							<div class="flex gap-2 items-center my-1"> Scripts </div>
 						</Tab>
-						<Tab size="md" value="flows">
+						<Tab size="md" value="flow">
 							<div class="flex gap-2 items-center my-1"> Flows </div>
 						</Tab>
-						<Tab size="md" value="apps">
+						<Tab size="md" value="app">
 							<div class="flex gap-2 items-center my-1"> Apps </div>
 						</Tab>
 					</Tabs>
 					<div class="my-2" />
 
-					{#if subtab == 'scripts'}
-						<PickHubScript bind:filter on:pick={(e) => viewCode(e.detail)}
-							><Button
+					{#if subtab == 'script'}
+						<PickHubScript syncQuery bind:filter on:pick={(e) => viewCode(e.detail)}>
+							<Button
+								startIcon={{ icon: ExternalLink }}
 								target="_blank"
-								href="https://hub.windmill.dev"
+								href={$hubBaseUrlStore}
 								variant="border"
-								color="light">Go to Hub</Button
-							></PickHubScript
-						>
-					{:else if subtab == 'flows'}
-						<PickHubFlow bind:filter on:pick={(e) => viewFlow(e.detail)}
-							><Button
+								color="light"
+							>
+								Hub
+							</Button>
+						</PickHubScript>
+					{:else if subtab == 'flow'}
+						<PickHubFlow syncQuery bind:filter on:pick={(e) => viewFlow(e.detail)}>
+							<Button
+								startIcon={{ icon: ExternalLink }}
 								target="_blank"
-								href="https://hub.windmill.dev"
+								href={$hubBaseUrlStore}
 								variant="border"
-								color="light">Go to Hub</Button
-							></PickHubFlow
-						>
-					{:else if subtab == 'apps'}
-						<PickHubApp bind:filter on:pick={(e) => viewApp(e.detail)}
-							><Button
+								color="light"
+								>Hub
+							</Button>
+						</PickHubFlow>
+					{:else if subtab == 'app'}
+						<PickHubApp syncQuery bind:filter on:pick={(e) => viewApp(e.detail)}>
+							<Button
+								startIcon={{ icon: ExternalLink }}
 								target="_blank"
-								href="https://hub.windmill.dev"
+								href={$hubBaseUrlStore}
 								variant="border"
-								color="light">Go to Hub</Button
-							></PickHubApp
-						>
+								color="light">Hub</Button
+							>
+						</PickHubApp>
 					{/if}
 				{/if}
 			</div>
@@ -270,5 +317,5 @@
 </div>
 
 {#if tab == 'workspace'}
-	<ItemsList bind:filter />
+	<ItemsList bind:filter bind:subtab />
 {/if}

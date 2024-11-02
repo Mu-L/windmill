@@ -4,10 +4,7 @@ mode: ONCE
 hostname: "bash"
 log_level: ERROR
 
-rlimit_as: 4096
-rlimit_cpu: 1000
-rlimit_fsize: 1000
-rlimit_nofile: 10000
+disable_rl: true
 
 cwd: "/tmp"
 
@@ -16,10 +13,17 @@ clone_newuser: {CLONE_NEWUSER}
 
 keep_caps: false
 keep_env: true
+mount_proc: true
 
 mount {
     src: "/bin"
     dst: "/bin"
+	is_bind: true
+}
+
+mount {
+    src: "/opt/microsoft"
+    dst: "/opt/microsoft"
 	is_bind: true
 }
 
@@ -34,6 +38,7 @@ mount {
     src: "/lib64"
     dst: "/lib64"
 	is_bind: true
+    mandatory: false
 }
 
 
@@ -50,6 +55,9 @@ mount {
 	rw: true
 }
 
+
+
+
 mount {
 	dst: "/tmp"
 	fstype: "tmpfs"
@@ -60,6 +68,13 @@ mount {
 mount {
     src: "{JOB_DIR}/main.sh"
     dst: "/tmp/main.sh"
+    is_bind: true
+    mandatory: false
+}
+
+mount {
+    src: "{JOB_DIR}/wrapper.sh"
+    dst: "/tmp/wrapper.sh"
     is_bind: true
     mandatory: false
 }
@@ -79,6 +94,27 @@ mount {
 mount {
     src: "/dev/urandom"
     dst: "/dev/urandom"
+    is_bind: true
+}
+
+mount {
+    src: "{JOB_DIR}/result.json"
+    dst: "/tmp/result.json"
+    rw: true
+    is_bind: true
+}
+
+mount {
+    src: "{JOB_DIR}/result.out"
+    dst: "/tmp/result.out"
+    rw: true
+    is_bind: true
+}
+
+mount {
+    src: "{JOB_DIR}/result2.out"
+    dst: "/tmp/result2.out"
+    rw: true
     is_bind: true
 }
 

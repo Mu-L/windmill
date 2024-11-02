@@ -1,12 +1,18 @@
 <script lang="ts">
 	import { Badge, Button } from '$lib/components/common'
 	import { Plus } from 'lucide-svelte'
-	import { getContext } from 'svelte'
+	import { createEventDispatcher, getContext } from 'svelte'
 	import Tooltip from '../../../Tooltip.svelte'
 	import type { AppEditorContext, AppViewerContext } from '../../types'
 	import { BG_PREFIX, getAllScriptNames } from '../../utils'
 	import PanelSection from '../settingsPanel/common/PanelSection.svelte'
 	import { getAppScripts } from './utils'
+	import AppTutorials from '$lib/components/AppTutorials.svelte'
+	import { tutorialsToDo } from '$lib/stores'
+	import { ignoredTutorials } from '$lib/components/tutorials/ignoredTutorials'
+	import { tutorialInProgress } from '$lib/tutorialUtils'
+	import DocLink from '../settingsPanel/DocLink.svelte'
+	import HideButton from '../settingsPanel/HideButton.svelte'
 
 	const PREFIX = 'script-selector-' as const
 
@@ -35,6 +41,10 @@
 	}
 
 	function createBackgroundScript() {
+		if ($tutorialsToDo.includes(5) && !$ignoredTutorials?.includes(5) && !tutorialInProgress()) {
+			appTutorials?.runTutorialById('backgroundrunnables', { skipStepsCount: 2 })
+		}
+
 		for (const [index, script] of $app.hiddenInlineScripts.entries()) {
 			if (script.hidden) {
 				delete script.hidden
@@ -68,9 +78,25 @@
 		$app.hiddenInlineScripts = $app.hiddenInlineScripts
 		selectScript(`${BG_PREFIX}${$app.hiddenInlineScripts.length - 1}`)
 	}
+
+	let appTutorials: AppTutorials | undefined = undefined
+	const dispatch = createEventDispatcher()
 </script>
 
-<PanelSection title="Runnables">
+<PanelSection title="Runnables" id="app-editor-runnable-panel">
+	<svelte:fragment slot="action">
+		<div class="flex flex-row gap-1">
+			<HideButton
+				direction="bottom"
+				on:click={() => {
+					dispatch('hidePanel')
+				}}
+			/>
+			<DocLink
+				docLink="https://www.windmill.dev/docs/apps/app-runnable-panel#creating-a-runnable"
+			/>
+		</div>
+	</svelte:fragment>
 	<div class="w-full flex flex-col gap-6 py-1">
 		<div>
 			<div class="flex flex-col gap-2 w-full">
@@ -80,7 +106,9 @@
 							<button
 								id={PREFIX + id}
 								class="panel-item
-				{$selectedComponentInEditor === id ? 'border-blue-500 bg-blue-100' : 'hover:bg-blue-50'}"
+				{$selectedComponentInEditor === id
+									? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+									: 'hover:bg-blue-50 dark:hover:bg-frost-900/50'}"
 								on:click={() => selectScript(id)}
 							>
 								<span class="text-2xs truncate">{name}</span>
@@ -94,8 +122,8 @@
 										id={PREFIX + id + '_transformer'}
 										class="border flex gap-1 truncate font-normal justify-between w-full items-center px-2 py-0.5 rounded-sm duration-200;
 			{$selectedComponentInEditor === id + '_transformer'
-											? 'border-blue-500 bg-blue-100'
-											: 'hover:bg-blue-50'}"
+											? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+											: 'hover:bg-blue-50 dark:hover:bg-frost-900/50'}"
 										on:click={() => selectScript(id + '_transformer')}
 									>
 										<span class="text-2xs truncate">Transformer</span>
@@ -109,7 +137,9 @@
 					<button
 						id={PREFIX + id}
 						class="panel-item
-						{$selectedComponentInEditor === id ? 'border-blue-500 bg-blue-100' : 'hover:bg-blue-50'}"
+						{$selectedComponentInEditor === id
+							? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+							: 'hover:bg-blue-50'}"
 						on:click={() => selectScript(id)}
 					>
 						<span class="text-2xs truncate">{name}</span>
@@ -121,8 +151,8 @@
 								id={PREFIX + id + '_transformer'}
 								class="border flex gap-1 truncate font-normal justify-between w-full items-center px-2 py-0.5 rounded-sm duration-200;
 {$selectedComponentInEditor === id + '_transformer'
-									? 'border-blue-500 bg-blue-100'
-									: 'hover:bg-blue-50'}"
+									? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+									: 'hover:bg-blue-50 dark:hover:bg-frost-900/50'}"
 								on:click={() => selectScript(id + '_transformer')}
 							>
 								<span class="text-2xs truncate">Transformer</span>
@@ -138,7 +168,9 @@
 							<button
 								id={PREFIX + id}
 								class="panel-item
-								{$selectedComponentInEditor === id ? 'border-blue-500 bg-blue-100' : 'hover:bg-blue-50'}"
+								{$selectedComponentInEditor === id
+									? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+									: 'hover:bg-blue-50 dark:hover:bg-frost-900/50'}"
 								on:click={() => selectScript(id)}
 							>
 								<span class="text-2xs truncate">{unusedInlineScript.name}</span>
@@ -148,18 +180,17 @@
 					</div>
 				{/if}
 				{#if runnables.inline.length == 0 && $app.unusedInlineScripts?.length == 0 && runnables.imported.length == 0}
-					<div class="text-xs text-gray-500">No scripts/flows</div>
+					<div class="text-xs text-tertiary">No scripts/flows</div>
 				{/if}
 			</div>
 		</div>
 
 		<div>
 			<div class="w-full flex justify-between items-center mb-1">
-				<div class="text-xs text-gray-600 font-semibold truncate">
+				<div class="text-xs text-secondary font-semibold truncate">
 					Background runnables
 					<Tooltip
-						class="mb-0.5"
-						documentationLink="https://docs.windmill.dev/docs/apps/app-runnable#background-runnable"
+						documentationLink="https://www.windmill.dev/docs/apps/app-runnable-panel#background-runnables"
 					>
 						Background runnables can be triggered on app refresh or when their input changes. The
 						result can be shared among many components.
@@ -173,33 +204,52 @@
 					title="Create a new background runnable"
 					aria-label="Create a new background runnable"
 					on:click={createBackgroundScript}
+					id="create-background-runnable"
 				>
-					<Plus size={14} class="text-gray-500" />
+					<Plus size={14} class="!text-primary" />
 				</Button>
 			</div>
 			<div class="flex flex-col gap-1 w-full">
 				{#if $app.hiddenInlineScripts?.length > 0}
-					{#each $app.hiddenInlineScripts as { name, hidden }, index (index)}
+					{#each $app.hiddenInlineScripts as { name, hidden, transformer }, index (index)}
 						{#if !hidden}
 							{@const id = BG_PREFIX + index}
 							<button
 								id={PREFIX + id}
 								class="panel-item
-								{$selectedComponentInEditor === id ? 'border-blue-500 bg-blue-100' : 'hover:bg-blue-50'}"
+								{$selectedComponentInEditor === id
+									? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+									: 'hover:bg-blue-50 dark:hover:bg-frost-900/50'}"
 								on:click={() => selectScript(id)}
 							>
 								<span class="text-2xs truncate">{name}</span>
 								<Badge color="indigo">{id}</Badge>
 							</button>
+							{#if transformer}
+								<div class="w-full pl-4">
+									<button
+										id={PREFIX + id + '_transformer'}
+										class="border flex gap-1 truncate font-normal justify-between w-full items-center px-2 py-0.5 rounded-sm duration-200;
+		{$selectedComponentInEditor === id + '_transformer'
+											? 'border-blue-500 bg-blue-100 dark:bg-frost-900/50'
+											: 'hover:bg-blue-50 dark:hover:bg-frost-900/50'}"
+										on:click={() => selectScript(id + '_transformer')}
+									>
+										<span class="text-2xs truncate">Transformer</span>
+									</button>
+								</div>
+							{/if}
 						{/if}
 					{/each}
 				{:else}
-					<div class="text-xs text-gray-500">No background runnable</div>
+					<div class="text-xs text-tertiary">No background runnable</div>
 				{/if}
 			</div>
 		</div>
 	</div>
 </PanelSection>
+
+<AppTutorials bind:this={appTutorials} on:reload />
 
 <style lang="postcss">
 	.panel-item {

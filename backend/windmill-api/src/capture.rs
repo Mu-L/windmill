@@ -7,22 +7,20 @@
  */
 
 use axum::{
-    extract::{Extension, Path, Query},
+    extract::{Extension, Path},
     routing::{get, post, put},
-    Json, Router,
+    Router,
 };
-use hyper::{HeaderMap, StatusCode};
-use serde::Deserialize;
+use hyper::StatusCode;
+use sqlx::types::Json;
 use windmill_common::{
+    db::UserDB,
     error::{JsonResult, Result},
     utils::{not_found_if_none, StripPath},
 };
+use windmill_queue::{PushArgs, PushArgsOwned};
 
-use crate::{
-    db::{UserDB, DB},
-    jobs::add_include_headers,
-    users::Authed,
-};
+use crate::db::{ApiAuthed, DB};
 
 const KEEP_LAST: i64 = 8;
 
@@ -37,7 +35,7 @@ pub fn global_service() -> Router {
 }
 
 pub async fn new_payload(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, path)): Path<(String, StripPath)>,
 ) -> Result<StatusCode> {
@@ -55,7 +53,7 @@ pub async fn new_payload(
         &path.to_path(),
         &authed.username,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     /* Retain only KEEP_LAST most recent captures by this user in this workspace. */
@@ -77,7 +75,7 @@ pub async fn new_payload(
         &authed.username,
         KEEP_LAST,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -85,21 +83,13 @@ pub async fn new_payload(
     Ok(StatusCode::CREATED)
 }
 
-#[derive(Deserialize, Clone)]
-pub struct IncludeHeaderQuery {
-    include_header: Option<String>,
-}
-
 pub async fn update_payload(
     Extension(db): Extension<DB>,
     Path((w_id, path)): Path<(String, StripPath)>,
-    Query(run_query): Query<IncludeHeaderQuery>,
-    headers: HeaderMap,
-    Json(args): Json<Option<serde_json::Map<String, serde_json::Value>>>,
+    args: PushArgsOwned,
 ) -> Result<StatusCode> {
     let mut tx = db.begin().await?;
 
-    let args = add_include_headers(&run_query.include_header, headers, args.unwrap_or_default());
     sqlx::query!(
         "
        UPDATE capture
@@ -109,9 +99,9 @@ pub async fn update_payload(
         ",
         &w_id,
         &path.to_path(),
-        serde_json::json!(args),
+        Json(PushArgs { args: &args.args, extra: args.extra }) as Json<PushArgs>,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
@@ -119,27 +109,31 @@ pub async fn update_payload(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(sqlx::FromRow)]
+struct Payload {
+    payload: sqlx::types::Json<Box<serde_json::value::RawValue>>,
+}
 pub async fn get_payload(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path((w_id, path)): Path<(String, StripPath)>,
-) -> JsonResult<serde_json::Value> {
+) -> JsonResult<Box<serde_json::value::RawValue>> {
     let mut tx = user_db.begin(&authed).await?;
 
-    let payload = sqlx::query_scalar!(
+    let payload = sqlx::query_as::<_, Payload>(
         "
        SELECT payload
          FROM capture
         WHERE workspace_id = $1
           AND path = $2
         ",
-        &w_id,
-        &path.to_path(),
     )
-    .fetch_optional(&mut tx)
+    .bind(&w_id)
+    .bind(&path.to_path())
+    .fetch_optional(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
-    not_found_if_none(payload, "capture", path.to_path()).map(axum::Json)
+    not_found_if_none(payload.map(|x| x.payload.0), "capture", path.to_path()).map(axum::Json)
 }

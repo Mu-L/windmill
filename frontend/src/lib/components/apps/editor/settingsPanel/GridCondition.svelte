@@ -1,10 +1,9 @@
 <script lang="ts">
 	import type { AppInputSpec } from '../../inputType'
 	import Button from '$lib/components/common/button/Button.svelte'
-	import { faPlus } from '@fortawesome/free-solid-svg-icons'
 	import PanelSection from './common/PanelSection.svelte'
-	import { dndzone } from 'svelte-dnd-action'
-	import { GripVertical, X } from 'lucide-svelte'
+	import { dragHandle, dragHandleZone } from '@windmill-labs/svelte-dnd-action'
+	import { GripVertical, Plus, X } from 'lucide-svelte'
 	import InputsSpecEditor from './InputsSpecEditor.svelte'
 	import { generateRandomString } from '$lib/utils'
 	import Alert from '$lib/components/common/alert/Alert.svelte'
@@ -16,13 +15,21 @@
 
 	export let conditions: RichConfiguration[] = []
 	export let component: AppComponent
-	let dragDisabled = true
 
-	let items = conditions.map((condition, index) => {
+	let items = conditions.slice(0, -1).map((condition, index) => {
 		return { value: condition, id: generateRandomString(), originalIndex: index }
 	})
 
-	$: conditions = items.map((item) => item.value)
+	$: conditions = items
+		.map((item) => item.value)
+		.concat([
+			{
+				type: 'evalv2',
+				expr: 'true',
+				fieldType: 'boolean',
+				connections: []
+			}
+		])
 
 	const { app, runnableComponents, componentControl } =
 		getContext<AppViewerContext>('AppViewerContext')
@@ -61,69 +68,61 @@
 				$componentControl[component.id]?.setTab?.(targetIndex)
 			})
 		}
-
-		dragDisabled = true
-	}
-
-	function startDrag(event) {
-		event.preventDefault()
-		dragDisabled = false
-	}
-
-	function handleKeyDown(event: KeyboardEvent): void {
-		if ((event.key === 'Enter' || event.key === ' ') && dragDisabled) {
-			dragDisabled = false
-		}
 	}
 
 	function deleteSubgrid(index: number) {
 		let subgrid = `${component.id}-${index}`
 		for (const item of $app!.subgrids![subgrid]) {
-			const components = deleteGridItem($app, item.data, subgrid, false)
+			const components = deleteGridItem($app, item.data, subgrid)
 			for (const key in components) {
 				delete $runnableComponents[key]
 			}
 		}
+
 		$runnableComponents = $runnableComponents
-		for (let i = index; i < items.length - 1; i++) {
+		for (let i = index; i < items.length; i++) {
 			$app!.subgrids![`${component.id}-${i}`] = $app!.subgrids![`${component.id}-${i + 1}`]
 		}
 
-		items.splice(index, 1)
+		// Remove the corresponding item from the items array
+		const nitems = items.filter((item) => item.originalIndex !== index)
 
-		items = [...items]
+		component.numberOfSubgrids = nitems.length + 1
+		// Update the originalIndex of the remaining items
+		nitems.forEach((item, i) => {
+			item.originalIndex = i
+		})
+		items = nitems
 
-		component.numberOfSubgrids = items.length
+		delete $app!.subgrids![`${component.id}-${items.length + 1}`]
+		$app = $app
 	}
 
 	function addCondition(): void {
-		const numberOfConditions = items.length
+		const numberOfConditions = conditions.length
 
 		if (!$app.subgrids) {
 			$app.subgrids = {}
 		}
 
-		const lastSubgrid = JSON.parse(
-			JSON.stringify($app.subgrids[`${component.id}-${numberOfConditions - 1}`])
-		)
+		$app.subgrids[`${component.id}-${numberOfConditions}`] =
+			$app.subgrids[`${component.id}-${numberOfConditions - 1}`]
 
 		$app.subgrids[`${component.id}-${numberOfConditions - 1}`] = []
-		$app.subgrids[`${component.id}-${numberOfConditions}`] = lastSubgrid
-		component.numberOfSubgrids = items.length
 
 		const newCondition: AppInputSpec<'boolean', boolean> = {
-			type: 'eval',
+			type: 'evalv2',
 			expr: 'false',
-			fieldType: 'boolean'
+			fieldType: 'boolean',
+			connections: []
 		}
 
 		items.splice(conditions.length - 1, 0, {
 			value: newCondition,
 			id: generateRandomString(),
-			originalIndex: items.length - 1
+			originalIndex: items.length
 		})
-
-		component.numberOfSubgrids = items.length
+		component.numberOfSubgrids = items.length + 1
 	}
 </script>
 
@@ -133,11 +132,11 @@
 		subgrid.
 	</Alert>
 	{#if items.length == 0}
-		<span class="text-xs text-gray-500">No Tabs</span>
+		<span class="text-xs text-tertiary">No Tabs</span>
 	{/if}
 	<div class="w-full flex flex-col mt-2">
 		<section
-			use:dndzone={{
+			use:dragHandleZone={{
 				items: items,
 				flipDurationMs: 200,
 				dropTargetStyle: {}
@@ -146,51 +145,42 @@
 			on:finalize={handleFinalize}
 		>
 			{#each items as item, index (item.id)}
-				{#if index < items.length - 1}
-					{@const condition = item.value}
-					<div class="w-full flex flex-row gap-2 items-center relative">
-						<div class={twMerge('grow border p-3 my-2 rounded-md border-gray-200 bg-white')}>
-							<InputsSpecEditor
-								key={`Condition ${index + 1}`}
-								bind:componentInput={item.value}
-								id={component.id}
-								userInputEnabled={false}
-								shouldCapitalize={true}
-								resourceOnly={false}
-								hasRows={false}
-								fieldType={condition?.['fieldType']}
-								subFieldType={condition?.['subFieldType']}
-								format={condition?.['format']}
-								selectOptions={condition?.['selectOptions']}
-								tooltip={condition?.['tooltip']}
-								onlyStatic={condition?.['onlyStatic']}
-								fileUpload={condition?.['fileUpload']}
-								placeholder={condition?.['placeholder']}
-								customTitle={condition?.['customTitle']}
-								displayType={false}
-								noVariablePicker={true}
-							/>
+				{@const condition = item.value}
+				<div class="w-full flex flex-row gap-2 items-center relative">
+					<div class={twMerge('grow border p-3 my-2 rounded-md bg-surface relative')}>
+						<InputsSpecEditor
+							key={`condition${index + 1}`}
+							bind:componentInput={item.value}
+							id={component.id}
+							userInputEnabled={false}
+							shouldCapitalize={true}
+							resourceOnly={false}
+							fieldType={condition?.['fieldType']}
+							subFieldType={condition?.['subFieldType']}
+							format={condition?.['format']}
+							selectOptions={condition?.['selectOptions']}
+							tooltip={condition?.['tooltip']}
+							fileUpload={condition?.['fileUpload']}
+							placeholder={condition?.['placeholder']}
+							customTitle={condition?.['customTitle']}
+							displayType={false}
+						/>
+					</div>
+
+					<div class="flex flex-col justify-center gap-2">
+						<!-- svelte-ignore a11y-click-events-have-key-events -->
+						<!-- svelte-ignore a11y-no-static-element-interactions -->
+						<div on:click={() => deleteSubgrid(index)}>
+							<X size={16} />
 						</div>
 
-						<div class="flex flex-col justify-center gap-2">
-							<!-- svelte-ignore a11y-click-events-have-key-events -->
-							<div on:click={() => deleteSubgrid(index)}>
-								<X size={16} />
-							</div>
-
-							<!-- svelte-ignore a11y-no-noninteractive-tabindex -->
-							<div
-								tabindex={dragDisabled ? 0 : -1}
-								class="w-4 h-4"
-								on:mousedown={startDrag}
-								on:touchstart={startDrag}
-								on:keydown={handleKeyDown}
-							>
-								<GripVertical size={16} />
-							</div>
+						<!-- svelte-ignore a11y-no-noninteractive-tabindex -->
+						<!-- svelte-ignore a11y-no-static-element-interactions -->
+						<div use:dragHandle class="w-4 h-4 handle" aria-label="drag-handle">
+							<GripVertical size={16} />
 						</div>
 					</div>
-				{/if}
+				</div>
 			{/each}
 		</section>
 		<div class="border rounded-md p-3 mb-2">
@@ -205,7 +195,7 @@
 			size="xs"
 			color="light"
 			variant="border"
-			startIcon={{ icon: faPlus }}
+			startIcon={{ icon: Plus }}
 			on:click={addCondition}
 			iconOnly
 		/>

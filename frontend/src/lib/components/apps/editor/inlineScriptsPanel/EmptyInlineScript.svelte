@@ -4,14 +4,12 @@
 	import FlowScriptPicker from '$lib/components/flows/pickers/FlowScriptPicker.svelte'
 	import PickHubScript from '$lib/components/flows/pickers/PickHubScript.svelte'
 	import Tooltip from '$lib/components/Tooltip.svelte'
-	import { Script, type Preview } from '$lib/gen'
 	import { inferArgs } from '$lib/infer'
 	import { initialCode } from '$lib/script_helpers'
-	import { capitalize, emptySchema } from '$lib/utils'
-	import { getScriptByPath } from '$lib/scripts'
+	import { emptySchema } from '$lib/utils'
+	import { defaultScriptLanguages, getScriptByPath, processLangs } from '$lib/scripts'
 
-	import { faCodeBranch } from '@fortawesome/free-solid-svg-icons'
-	import { Building, Globe2 } from 'lucide-svelte'
+	import { Building, GitFork, Globe2 } from 'lucide-svelte'
 	import { createEventDispatcher, getContext } from 'svelte'
 	import { fly } from 'svelte/transition'
 	import type { AppViewerContext } from '../../types'
@@ -19,6 +17,9 @@
 	import InlineScriptList from '../settingsPanel/mainInput/InlineScriptList.svelte'
 	import WorkspaceScriptList from '../settingsPanel/mainInput/WorkspaceScriptList.svelte'
 	import RunnableSelector from '../settingsPanel/mainInput/RunnableSelector.svelte'
+	import { defaultScripts } from '$lib/stores'
+	import DefaultScripts from '$lib/components/DefaultScripts.svelte'
+	import type { Preview } from '$lib/gen'
 
 	export let name: string
 	export let componentType: string | undefined = undefined
@@ -32,7 +33,7 @@
 	const dispatch = createEventDispatcher()
 
 	async function inferInlineScriptSchema(
-		language: Preview.language,
+		language: Preview['language'],
 		content: string,
 		schema: Schema
 	): Promise<Schema> {
@@ -46,18 +47,18 @@
 	}
 
 	async function createInlineScriptByLanguage(
-		language: Preview.language,
+		language: Preview['language'],
 		path: string,
 		subkind: 'pgsql' | 'mysql' | 'fetch' | undefined = undefined
 	) {
 		const content =
-			defaultCode(componentType ?? '', subkind || language) ??
-			initialCode(language, Script.kind.SCRIPT, subkind ?? 'flow')
+			defaultCode(componentType ?? '', (subkind || language) ?? '') ??
+			initialCode(language, 'script', subkind ?? 'flow')
 
 		return newInlineScript(content, language, path)
 	}
 
-	async function newInlineScript(content: string, language: Preview.language, path: string) {
+	async function newInlineScript(content: string, language: Preview['language'], path: string) {
 		const fullPath = `${appPath}/${path}`
 
 		let schema: Schema = emptySchema()
@@ -93,7 +94,13 @@
 		dispatch('new', unusedInlineScript.inlineScript)
 	}
 
-	const langs = ['deno', 'python3', 'go', 'bash'] as Script.language[]
+	$: langs = processLangs(undefined, $defaultScripts?.order ?? Object.keys(defaultScriptLanguages))
+		.map((l) => [defaultScriptLanguages[l], l])
+		.filter(
+			(x) =>
+				x[1] != 'docker' &&
+				($defaultScripts?.hidden == undefined || !$defaultScripts.hidden.includes(x[1]))
+		) as [string, Preview['language']][]
 </script>
 
 <Drawer bind:this={picker} size="1000px">
@@ -143,8 +150,12 @@
 	</DrawerContent>
 </Drawer>
 
-<div class="flex flex-col px-4 gap-2 text-sm" in:fly={{ duration: 50 }}>
-	<div class="mt-2 flex justify-between gap-4">
+<div
+	class="flex flex-col px-4 gap-2 text-sm"
+	in:fly={{ duration: 50 }}
+	id="app-editor-empty-runnable"
+>
+	<div class="mt-2 flex justify-between gap-4" id="app-editor-runnable-header">
 		<div class="font-bold items-baseline truncate">Choose a language</div>
 		<div class="flex gap-2">
 			{#if showScriptPicker}
@@ -154,11 +165,11 @@
 				on:click={() => picker?.openDrawer()}
 				size="xs"
 				variant="border"
-				color="blue"
-				startIcon={{ icon: faCodeBranch }}
+				color="light"
+				startIcon={{ icon: GitFork }}
 				btnClasses="truncate"
 			>
-				Fork a script
+				Fork other script
 			</Button>
 
 			<Button
@@ -173,49 +184,30 @@
 		</div>
 	</div>
 
-	<div class="flex flex-row w-full justify-between">
-		<div class="">
-			<div class="mb-1 text-sm font-semibold">Backend</div>
+	<div class="flex flex-row w-full gap-8">
+		<div id="app-editor-backend-runnables">
+			<div class="mb-1 text-sm font-semibold flex gap-4">Backend <DefaultScripts /> </div>
 
-			<div class="flex gap-2 flex-row flex-wrap">
-				{#each langs as lang}
+			<div class="flex flex-row flex-wrap gap-2">
+				{#each langs as [label, lang] (lang)}
 					<FlowScriptPicker
-						label={lang === 'deno' ? 'Typescript' : capitalize(lang)}
+						{label}
 						{lang}
 						on:click={() => {
 							createInlineScriptByLanguage(lang, name)
 						}}
+						id={`create-${lang}-script`}
 					/>
 				{/each}
 			</div>
-
-			<div class="mt-2 mb-2 text-sm">Typescript templates</div>
-
-			<div class="flex gap-2 flex-row flex-wrap mb-4">
-				<FlowScriptPicker
-					label={`PostgreSQL`}
-					lang="pgsql"
-					on:click={() => {
-						createInlineScriptByLanguage(Script.language.DENO, name, 'pgsql')
-					}}
-				/>
-
-				<FlowScriptPicker
-					label={`HTTP`}
-					lang="fetch"
-					on:click={() => {
-						createInlineScriptByLanguage(Script.language.DENO, name, 'fetch')
-					}}
-				/>
-			</div>
 		</div>
-		<div class="">
+		<div id="app-editor-frontend-runnables">
 			<div class="mb-1 text-sm font-semibold">
 				Frontend
 				<Tooltip
-					documentationLink="https://docs.windmill.dev/docs/apps/app-runnable#frontend-script"
+					documentationLink="https://www.windmill.dev/docs/apps/app-runnable-panel#frontend-scripts"
 				>
-					Frontend scripts are executed in the browser and can manipulate the app context directly
+					Frontend scripts are executed in the browser and can manipulate the app context directly.
 				</Tooltip>
 			</div>
 
@@ -237,7 +229,10 @@ state.foo += 1
 // you may also just reassign as next statement 'state.foo = state.foo'
 
 // you can also navigate (goto), recompute a script (recompute), or set a tab (setTab)
-// Inputs and display components support settings their value directly (setValue)
+// Inputs and display components support settings their value directly
+// setValue('a', "Bar") 
+// Tables support setting their selected index (setSelectedIndex)
+// all helpers can be found at https://www.windmill.dev/docs/apps/app-runnable-panel#frontend-scripts-helpers
 
 return state.foo`,
 							language: 'frontend',

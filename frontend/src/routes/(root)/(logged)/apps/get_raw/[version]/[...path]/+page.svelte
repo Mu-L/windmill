@@ -3,7 +3,7 @@
 	import { Skeleton } from '$lib/components/common'
 	import { userStore, workspaceStore } from '$lib/stores'
 	import { sendUserToast } from '$lib/toast'
-	import { onMount } from 'svelte'
+	import { onDestroy, onMount } from 'svelte'
 
 	let loaded = false
 
@@ -18,6 +18,7 @@
 		// await import('http://localhost:3000/app.iife.js')
 		/* @vite-ignore */
 		await import(
+			/* webpackIgnore: true */
 			`/api/w/${$workspaceStore}/raw_apps/get_data/${$page.params.version}/${$page.params.path}`
 		)
 		try {
@@ -27,6 +28,10 @@
 			console.error(e)
 		}
 		loaded = true
+	})
+
+	onDestroy(() => {
+		globalThis.windmill = undefined
 	})
 </script>
 

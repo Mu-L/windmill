@@ -29,6 +29,17 @@
 					{/each}
 				</div>
 			</div>
+		{:else if gridItem?.data?.type === 'aggridcomponent' || gridItem?.data?.type === 'aggridcomponentee' || gridItem?.data?.type === 'dbexplorercomponent' || gridItem?.data?.type === 'aggridinfinitecomponent' || gridItem?.data?.type === 'aggridinfinitecomponentee'}
+			<div>
+				<AppComponentInput bind:component={gridItem.data} {resourceOnly} />
+				<div class="ml-4 mt-4">
+					{#if Array.isArray(gridItem.data.actions)}
+						{#each gridItem.data.actions as actionButton (actionButton.id)}
+							<AppComponentInput bind:component={actionButton.data} {resourceOnly} />
+						{/each}
+					{/if}
+				</div>
+			</div>
 		{:else}
 			<AppComponentInput bind:component={gridItem.data} {resourceOnly} />
 		{/if}
@@ -47,7 +58,7 @@
 						const field = fields[fieldKey]
 						return field.fieldType === 'object' && field.format?.startsWith('resource-')
 					}).length === 0}
-					<span class="text-sm text-gray-600">No resource input</span>
+					<span class="text-sm text-secondary">No resource input</span>
 				{:else}
 					<InputsSpecsEditor
 						id={BG_PREFIX + index}

@@ -8,6 +8,7 @@
 	import IdEditor from './IdEditor.svelte'
 	import type { AppComponent } from '../../component'
 	import type { Runnable } from '$lib/components/apps/inputType'
+	import DocLink from '../../settingsPanel/DocLink.svelte'
 
 	export let id: string
 	export let name: string
@@ -20,7 +21,7 @@
 
 	const { manuallyOpened, search, hasResult } = getContext<ContextPanelContext>('ContextPanel')
 
-	const { selectedComponent, app, hoverStore, allIdsInPath, connectingInput } =
+	const { selectedComponent, app, hoverStore, allIdsInPath, connectingInput, worldStore } =
 		getContext<AppViewerContext>('AppViewerContext')
 
 	$: subids = $search != '' ? allsubIds($app, id) : []
@@ -32,18 +33,19 @@
 		$allIdsInPath.includes(id) || id == $selectedComponent?.[0] || $manuallyOpened[id] || inSearch
 
 	const hoverColor = {
-		blue: 'hover:bg-blue-100 hover:text-blue-500',
-		indigo: 'hover:bg-indigo-100 hover:text-indigo-500'
+		blue: 'hover:bg-blue-100 hover:text-blue-500 dark:hover:bg-frost-900 dark:hover:text-frost-100',
+		indigo:
+			'hover:bg-indigo-100 hover:text-indigo-500 dark:hover:bg-frost-900 dark:hover:text-indigo-300'
 	}
 
 	const openBackground = {
-		blue: 'bg-blue-50',
-		indigo: 'bg-indigo-50'
+		blue: 'bg-blue-50 dark:bg-frost-800',
+		indigo: 'bg-indigo-50 dark:bg-indigo-700/50'
 	}
 
 	const manuallyOpenColor = {
-		blue: 'text-gray-900 bg-gray-300 rounded-sm',
-		indigo: 'text-gray-900 bg-gray-300 rounded-sm'
+		blue: 'text-primary dark:text-gray-50 bg-gray-300 rounded-sm dark:bg-gray-600',
+		indigo: 'text-primary bg-gray-300 dark:text-gray-50 rounded-sm dark:bg-gray-600'
 	}
 
 	const idClass = {
@@ -76,7 +78,7 @@
 				renameComponent(from, to, item.data)
 			})
 
-			$app.hiddenInlineScripts.forEach((x) => {
+			$app.hiddenInlineScripts?.forEach((x) => {
 				processRunnable(from, to, x)
 			})
 		}
@@ -89,8 +91,32 @@
 			}
 		}
 
+		if (
+			item?.data.type == 'aggridcomponent' ||
+			item?.data.type == 'aggridcomponentee' ||
+			item?.data.type == 'dbexplorercomponent' ||
+			item?.data.type == 'aggridinfinitecomponent' ||
+			item?.data.type == 'aggridinfinitecomponentee'
+		) {
+			for (let c of item.data.actions ?? []) {
+				let old = c.id
+				c.id = c.id.replace(id + '_', newId + '_')
+				propagateRename(old, c.id)
+			}
+		}
+
+		if (item?.data.type === 'menucomponent') {
+			for (let c of item.data.menuItems) {
+				let old = c.id
+				c.id = c.id.replace(id + '_', newId + '_')
+				propagateRename(old, c.id)
+			}
+		}
+
 		$app = $app
 		$selectedComponent = [newId]
+
+		delete $worldStore.outputsById[id]
 	}
 
 	function renameComponent(from: string, to: string, data: AppComponent) {
@@ -99,6 +125,26 @@
 				renameComponent(from, to, c)
 			}
 		}
+
+		if (
+			(data.type == 'aggridcomponent' ||
+				data.type == 'aggridcomponentee' ||
+				data.type == 'dbexplorercomponent' ||
+				data.type == 'aggridinfinitecomponent' ||
+				data.type == 'aggridinfinitecomponentee') &&
+			Array.isArray(data.actions)
+		) {
+			for (let c of data.actions) {
+				renameComponent(from, to, c)
+			}
+		}
+
+		if (data.type === 'menucomponent') {
+			for (let c of data.menuItems) {
+				renameComponent(from, to, c)
+			}
+		}
+
 		let componentInput = data.componentInput
 		if (componentInput?.type == 'connected') {
 			if (componentInput.connection?.componentId === from) {
@@ -106,6 +152,13 @@
 			}
 		} else if (componentInput?.type == 'runnable') {
 			processRunnable(from, to, componentInput.runnable)
+			Object.values(componentInput.fields).forEach((field) => {
+				if (field.type == 'connected') {
+					if (field.connection?.componentId === from) {
+						field.connection.componentId = to
+					}
+				}
+			})
 		}
 
 		Object.values(data.configuration ?? {}).forEach((config) => {
@@ -148,6 +201,7 @@
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <div class={$search == '' || inSearch ? '' : 'invisible h-0 overflow-hidden'}>
 	<!-- svelte-ignore a11y-mouse-events-have-key-events -->
+	<!-- svelte-ignore a11y-no-static-element-interactions -->
 	<div
 		on:mouseenter|stopPropagation={() => {
 			if (id !== $hoverStore) {
@@ -166,7 +220,7 @@
 				? openBackground[color]
 				: $connectingInput.hoveredComponent === id
 				? 'bg-orange-300 '
-				: 'bg-white',
+				: 'bg-surface-secondary',
 			first ? 'border-t' : '',
 			nested ? 'border-l' : '',
 			'transition-all'
@@ -176,13 +230,14 @@
 				$manuallyOpened[id] = $manuallyOpened[id] != undefined ? !$manuallyOpened[id] : true
 			}
 		}}
+		id={`output-${id}`}
 	>
 		<div class="flex">
 			<button
 				disabled={!(selectable && !$selectedComponent?.includes(id)) || $connectingInput?.opened}
 				title="Select component"
 				on:click|stopPropagation={() => ($selectedComponent = [id])}
-				class="flex items-center ml-0.5 rounded-sm bg-gray-100 hover:text-black text-gray-600"
+				class="flex items-center ml-0.5 rounded-sm bg-surface-selected hover:text-primary text-tertiary"
 			>
 				<div
 					class={classNames(
@@ -198,17 +253,29 @@
 					</div>
 				{/if}
 			</button>
-			{#if selectable && renamable && ($selectedComponent?.includes(id) || $hoverStore === id)}
-				<IdEditor
-					{id}
-					on:selected={() => ($selectedComponent = [id])}
-					on:change={({ detail }) => renameId(detail)}
-				/>
+			{#if selectable && renamable && $selectedComponent?.includes(id)}
+				<div class="h-3">
+					<IdEditor
+						{id}
+						on:selected={() => ($selectedComponent = [id])}
+						on:save={({ detail }) => renameId(detail)}
+					/></div
+				>
 			{/if}
 		</div>
 		<div class="text-2xs font-bold flex flex-row gap-2 items-center truncate">
+			{#if ['ctx', 'state'].includes(id)}
+				<DocLink
+					docLink={id === 'state'
+						? 'https://www.windmill.dev/docs/apps/outputs#state'
+						: id === 'ctx'
+						? 'https://www.windmill.dev/docs/apps/outputs#app-context'
+						: ''}
+					size="xs2"
+				/>
+			{/if}
 			{name}
-			<div class={classNames('bg-gray-200 rounded-sm')}>
+			<div class={classNames('bg-surface-secondary rounded-sm')}>
 				{#if !open}
 					<ChevronDown size={14} color="gray" />
 				{:else if $manuallyOpened[id]}
@@ -220,8 +287,10 @@
 		</div>
 	</div>
 	<div
-		class="border-b {open ? 'h-full' : 'h-0 overflow-hidden'} {$connectingInput.hoveredComponent ===
-			id && !$selectedComponent?.includes(id)
+		class="border-b {open
+			? 'h-full'
+			: 'h-0 overflow-hidden invisible'} {$connectingInput.hoveredComponent === id &&
+		!$selectedComponent?.includes(id)
 			? '  bg-orange-100/40'
 			: ''}"
 	>

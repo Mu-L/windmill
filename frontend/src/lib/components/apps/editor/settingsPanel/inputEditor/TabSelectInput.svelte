@@ -10,7 +10,9 @@
 
 	const tabComponents = allItems($app.grid, $app.subgrids).filter(
 		(component) =>
-			component.data.type === 'tabscomponent' || component.data.type === 'conditionalwrapper'
+			component.data.type === 'tabscomponent' ||
+			component.data.type === 'conditionalwrapper' ||
+			component.data.type === 'decisiontreecomponent'
 	)
 </script>
 
@@ -20,11 +22,7 @@
 			<div class="flex flex-col">
 				<label for="tabId" class="text-xs font-semibold">Tab ID</label>
 
-				<select
-					id="tabId"
-					bind:value={componentInput.value.id}
-					class="border border-gray-300 rounded-md p-1 !w-16"
-				>
+				<select id="tabId" bind:value={componentInput.value.id} class="border rounded-md p-1 !w-16">
 					{#each tabComponents as tabComponent}
 						<option value={tabComponent.data.id}>
 							{tabComponent.data.id}
@@ -37,7 +35,7 @@
 				<select
 					id="tabIndex"
 					bind:value={componentInput.value.index}
-					class="border border-gray-300 rounded-md p-1 !w-16"
+					class="border rounded-md p-1 !w-16"
 				>
 					{#each tabComponents as tabComponent}
 						{#if tabComponent.data.id === componentInput.value.id}
@@ -51,5 +49,5 @@
 		</div>
 	</div>
 {:else}
-	<div class="text-xs text-gray-500"> No tab component found in the app </div>
+	<div class="text-xs text-tertiary"> No tab component found in the app </div>
 {/if}

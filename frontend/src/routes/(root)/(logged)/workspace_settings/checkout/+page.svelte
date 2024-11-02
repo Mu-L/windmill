@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { page } from '$app/stores'
 	import CenteredModal from '$lib/components/CenteredModal.svelte'
 	import { Alert } from '$lib/components/common'
@@ -38,11 +38,11 @@
 				The checkout failed, your subscription has not been updated.
 			</Alert>
 		</div>
-		<p class="text-sm my-6 text-gray-600">
+		<p class="text-sm my-6 text-tertiary">
 			You will be redirected to the workspace settings page in 5 seconds...
 		</p>
 	{:else}
-		<p class="text-sm my-6 text-gray-600 w-full text-center">
+		<p class="text-sm my-6 text-tertiary w-full text-center">
 			Waiting for your upgrade to be processed...
 		</p>
 	{/if}

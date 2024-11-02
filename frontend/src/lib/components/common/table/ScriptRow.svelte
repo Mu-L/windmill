@@ -1,53 +1,57 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
-	import Dropdown from '$lib/components/Dropdown.svelte'
+	import { goto } from '$lib/navigation'
+	import { base } from '$lib/base'
+	import Dropdown from '$lib/components/DropdownV2.svelte'
 	import type MoveDrawer from '$lib/components/MoveDrawer.svelte'
 	import ScheduleEditor from '$lib/components/ScheduleEditor.svelte'
 	import SharedBadge from '$lib/components/SharedBadge.svelte'
 	import type ShareModal from '$lib/components/ShareModal.svelte'
 
-	import { ScriptService, type Script } from '$lib/gen'
+	import { ScriptService, type Script, DraftService } from '$lib/gen'
 	import { userStore, workspaceStore } from '$lib/stores'
-	import {
-		faArchive,
-		faCalendarAlt,
-		faCodeFork,
-		faEdit,
-		faEye,
-		faFileExport,
-		faList,
-		faPlay,
-		faShare,
-		faTrashAlt
-	} from '@fortawesome/free-solid-svg-icons'
+
 	import { createEventDispatcher } from 'svelte'
 	import Badge from '../badge/Badge.svelte'
 	import Button from '../button/Button.svelte'
-	import LanguageBadge from './LanguageBadge.svelte'
 	import Row from './Row.svelte'
 	import DraftBadge from '$lib/components/DraftBadge.svelte'
 	import { sendUserToast } from '$lib/toast'
-	import { isOwner } from '$lib/utils'
+	import { copyToClipboard, DELETE, isOwner } from '$lib/utils'
+	import { isDeployable } from '$lib/utils_deployable'
 
-	export let script: Script & { canWrite: boolean }
+	import type DeployWorkspaceDrawer from '$lib/components/DeployWorkspaceDrawer.svelte'
+	import { LanguageIcon } from '../languageIcons'
+	import {
+		Archive,
+		Calendar,
+		Code,
+		Copy,
+		Eye,
+		FileUp,
+		GitFork,
+		List,
+		Pen,
+		Share,
+		Trash,
+		History
+	} from 'lucide-svelte'
+	import ScriptVersionHistory from '$lib/components/ScriptVersionHistory.svelte'
+	import { Drawer, DrawerContent } from '..'
+	import NoMainFuncBadge from '$lib/components/NoMainFuncBadge.svelte'
+	import Tooltip from '$lib/components/Tooltip.svelte'
+	import { getDeployUiSettings } from '$lib/components/home/deploy_ui'
+
+	export let script: Script & { canWrite: boolean; use_codebase: boolean }
 	export let marked: string | undefined
 	export let starred: boolean
 	export let shareModal: ShareModal
 	export let moveDrawer: MoveDrawer
+	export let deploymentDrawer: DeployWorkspaceDrawer
 	export let deleteConfirmedCallback: (() => void) | undefined
-
-	let {
-		summary,
-		path,
-		hash,
-		language,
-		extra_perms,
-		canWrite,
-		lock_error_logs,
-		archived,
-		has_draft,
-		draft_only
-	} = script
+	export let errorHandlerMuted: boolean
+	export let showCode: (path: string, summary: string) => void
+	export let depth: number = 0
+	export let menuOpen: boolean = false
 
 	const dispatch = createEventDispatcher()
 
@@ -64,7 +68,7 @@
 			requestBody: {
 				...r,
 				parent_hash: r.hash,
-				lock: r.lock?.split('\n')
+				lock: r.lock
 			}
 		})
 		dispatch('change')
@@ -79,187 +83,267 @@
 	let scheduleEditor: ScheduleEditor
 
 	const dlt: 'delete' = 'delete'
+	let versionsDrawerOpen: boolean = false
 </script>
 
-<ScheduleEditor on:update={() => goto('/schedules')} bind:this={scheduleEditor} />
+{#if menuOpen}
+	<ScheduleEditor on:update={() => goto('/schedules')} bind:this={scheduleEditor} />
+{/if}
 
 <Row
-	href={`/scripts/run/${hash}`}
+	href={script.draft_only
+		? `${base}/scripts/edit/${script.path}`
+		: `${base}/scripts/get/${script.hash}?workspace=${$workspaceStore}`}
 	kind="script"
 	{marked}
-	{path}
-	{summary}
+	path={script.path}
+	summary={script.summary}
 	{starred}
+	{errorHandlerMuted}
 	workspaceId={$workspaceStore ?? ''}
 	on:change
-	canFavorite={!draft_only}
+	canFavorite={!script.draft_only}
+	{depth}
 >
 	<svelte:fragment slot="badges">
-		<SharedBadge {canWrite} extraPerms={extra_perms} />
-		<DraftBadge {has_draft} {draft_only} />
-		{#if lock_error_logs}
+		{#if script.lock_error_logs}
 			<Badge color="red" baseClass="border border-red-200">Deployment failed</Badge>
 		{/if}
 
-		{#if archived}
+		{#if script.archived}
 			<Badge color="red" baseClass="border">archived</Badge>
 		{/if}
 
-		<LanguageBadge {language} />
+		{#if script.no_main_func}
+			<NoMainFuncBadge />
+		{/if}
+		<SharedBadge canWrite={script.canWrite} extraPerms={script.extra_perms} />
+		<DraftBadge has_draft={script.has_draft} draft_only={script.draft_only} />
+		<div class="w-8 center-center">
+			<LanguageIcon lang={script.language} width={12} height={12} />
+		</div>
 	</svelte:fragment>
 
 	<svelte:fragment slot="actions">
 		<span class="hidden md:inline-flex gap-x-1">
 			{#if !$userStore?.operator}
-				{#if canWrite && !archived}
+				{#if script.use_codebase}
+					<Badge
+						>bundle<Tooltip
+							>This script is deployed as a bundle and can only be deployed from the CLI for now</Tooltip
+						></Badge
+					>
+				{:else if script.canWrite && !script.archived}
 					<div>
 						<Button
 							color="light"
 							size="xs"
 							variant="border"
-							startIcon={{ icon: faEdit }}
-							href="/scripts/edit/{path}"
+							startIcon={{ icon: Pen }}
+							href="{base}/scripts/edit/{script.path}"
 						>
 							Edit
 						</Button>
 					</div>
-				{:else if !draft_only}
+				{:else if !script.draft_only}
 					<div>
 						<Button
 							color="light"
 							size="xs"
 							variant="border"
-							startIcon={{ icon: faCodeFork }}
-							href="/scripts/add?template={path}"
+							startIcon={{ icon: GitFork }}
+							href="{base}/scripts/add?template={script.path}"
 						>
 							Fork
 						</Button>
 					</div>
 				{/if}
 			{/if}
-
-			{#if !draft_only}
-				<Button
-					href="/scripts/get/{hash}?workspace={$workspaceStore}"
-					color="light"
-					variant="border"
-					size="xs"
-					spacingSize="md"
-					startIcon={{ icon: faEye }}
-				>
-					Detail
-				</Button>
-				<Button
-					href="/scripts/run/{hash}"
-					color="dark"
-					size="xs"
-					spacingSize="md"
-					endIcon={{ icon: faPlay }}
-				>
-					Run
-				</Button>
-			{/if}
 		</span>
 		<Dropdown
-			placement="bottom-end"
-			dropdownItems={() => {
-				let owner = isOwner(path, $userStore, $workspaceStore)
-				if (draft_only) {
+			items={async () => {
+				let owner = isOwner(script.path, $userStore, $workspaceStore)
+				if (script.draft_only) {
 					return [
 						{
+							displayName: 'View code',
+							icon: Code,
+							action: () => {
+								showCode(script.path, script.summary)
+							}
+						},
+						{
 							displayName: 'Delete',
-							icon: faTrashAlt,
+							icon: Trash,
 							action: (event) => {
+								// TODO
+								// @ts-ignore
 								if (event?.shiftKey) {
-									deleteScript(path)
+									deleteScript(script.path)
 								} else {
 									deleteConfirmedCallback = () => {
-										deleteScript(path)
+										deleteScript(script.path)
 									}
 								}
 							},
 							type: dlt,
-							disabled: !canWrite
+							disabled: !script.canWrite
 						}
 					]
 				}
 				return [
 					{
-						displayName: 'View script',
-						icon: faEye,
-						href: `/scripts/get/${hash}?workspace=${$workspaceStore}`
-					},
-
-					{
-						displayName: 'Edit',
-						icon: faEdit,
-						href: `/scripts/edit/${path}`,
-						disabled: !canWrite || archived
+						displayName: 'View code',
+						icon: Code,
+						action: () => {
+							showCode(script.path, script.summary)
+						}
 					},
 					{
 						displayName: 'Duplicate/Fork',
-						icon: faCodeFork,
-						href: `/scripts/add?template=${path}`
+						icon: GitFork,
+						href: `${base}/scripts/add?template=${script.path}`,
+						hide: $userStore?.operator
 					},
 					{
 						displayName: 'Move/Rename',
-						icon: faFileExport,
+						icon: FileUp,
 						action: () => {
-							moveDrawer.openDrawer(path, summary, 'script')
+							moveDrawer.openDrawer(script.path, script.summary, 'script')
 						},
-						disabled: !owner || archived
+						disabled: !owner || script.archived,
+						hide: $userStore?.operator
 					},
+					...(isDeployable('script', script.path, await getDeployUiSettings())
+						? [
+								{
+									displayName: 'Deploy to staging/prod',
+									icon: FileUp,
+									action: () => {
+										deploymentDrawer.openDrawer(script.path, 'script')
+									},
+									disabled: script.archived,
+									hide: $userStore?.operator
+								}
+						  ]
+						: []),
 					{
 						displayName: 'View runs',
-						icon: faList,
-						href: `/runs/${path}`
+						icon: List,
+						href: `${base}/runs/${script.path}`
+					},
+					{
+						displayName: 'Versions',
+						icon: History,
+						action: () => {
+							versionsDrawerOpen = true
+						}
+					},
+					{
+						displayName: 'Audit logs',
+						icon: Eye,
+						href: `${base}/audit_logs?resource=${script.path}`,
+						hide: $userStore?.operator
 					},
 					{
 						displayName: 'Schedule',
-						icon: faCalendarAlt,
+						icon: Calendar,
 						action: () => {
-							scheduleEditor.openNew(false, path)
+							scheduleEditor.openNew(false, script.path)
 						},
-						disabled: archived
+						disabled: script.archived,
+						hide: $userStore?.operator
 					},
 					{
 						displayName: owner ? 'Share' : 'See Permissions',
-						icon: faShare,
+						icon: Share,
 						action: () => {
-							shareModal.openDrawer && shareModal.openDrawer(path, 'script')
+							shareModal.openDrawer && shareModal.openDrawer(script.path, 'script')
 						},
-						disabled: archived
+						disabled: script.archived,
+						hide: $userStore?.operator
 					},
 					{
-						displayName: archived ? 'Unarchive' : 'Archive',
-						icon: faArchive,
+						displayName: 'Copy path',
+						icon: Copy,
 						action: () => {
-							archived ? path && unarchiveScript(path) : path && archiveScript(path)
+							copyToClipboard(script.path)
+						}
+					},
+					{
+						displayName: script.archived ? 'Unarchive' : 'Archive',
+						icon: Archive,
+						action: () => {
+							script.archived
+								? script.path && unarchiveScript(script.path)
+								: script.path && archiveScript(script.path)
 						},
 						type: 'delete',
-						disabled: !owner
+						disabled: !owner,
+						hide: $userStore?.operator
 					},
+
+					...(script.has_draft
+						? [
+								{
+									displayName: 'Delete Draft',
+									icon: Trash,
+									action: async () => {
+										await DraftService.deleteDraft({
+											workspace: $workspaceStore ?? '',
+											path: script.path,
+											kind: 'script'
+										})
+										dispatch('change')
+									},
+									type: DELETE,
+									disabled: !owner,
+									hide: $userStore?.operator
+								}
+						  ]
+						: []),
 					...($userStore?.is_admin || $userStore?.is_super_admin
 						? [
 								{
 									displayName: 'Delete',
-									icon: faTrashAlt,
+									icon: Trash,
 									action: (event) => {
 										if (event?.shiftKey) {
-											deleteScript(path)
+											deleteScript(script.path)
 										} else {
 											deleteConfirmedCallback = () => {
-												deleteScript(path)
+												deleteScript(script.path)
 											}
 										}
 									},
 									type: dlt,
-									disabled: !canWrite
+									disabled: !script.canWrite,
+									hide: $userStore?.operator
 								}
 						  ]
 						: [])
 				]
 			}}
+			on:open={() => {
+				menuOpen = true
+			}}
 		/>
 	</svelte:fragment>
 </Row>
+
+{#if script}
+	<Drawer bind:open={versionsDrawerOpen} size="1200px">
+		<DrawerContent title="Versions History" on:close={() => (versionsDrawerOpen = false)}>
+			<ScriptVersionHistory
+				scriptPath={script.path}
+				openDetails
+				on:openDetails={(e) => {
+					if (script) {
+						goto(`/scripts/get/${e.detail.version}?workspace=${$workspaceStore}`)
+					}
+					versionsDrawerOpen = false
+				}}
+			/>
+		</DrawerContent>
+	</Drawer>
+{/if}

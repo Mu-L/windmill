@@ -1,15 +1,26 @@
 <script lang="ts">
-	import { getContext } from 'svelte'
-	import Select from 'svelte-select'
+	import { getContext, onDestroy } from 'svelte'
+	import Select from '../../svelte-select/lib/index'
 
-	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import { concatCustomCss } from '../../utils'
+	import type {
+		AppViewerContext,
+		ComponentCustomCSS,
+		ListContext,
+		ListInputs,
+		RichConfigurations
+	} from '../../types'
+	import { initCss } from '../../utils'
 	import AlignWrapper from '../helpers/AlignWrapper.svelte'
 	import { SELECT_INPUT_DEFAULT_STYLE } from '../../../../defaults'
 	import { initConfig, initOutput } from '../../editor/appUtils'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
 	import ResolveConfig from '../helpers/ResolveConfig.svelte'
 	import { components } from '../../editor/component'
+	import { Alert } from '$lib/components/common'
+	import { classNames } from '$lib/utils'
+	import { Bug } from 'lucide-svelte'
+	import Popover from '$lib/components/Popover.svelte'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
 
 	export let id: string
 	export let configuration: RichConfigurations
@@ -19,8 +30,11 @@
 	export let extraKey: string | undefined = undefined
 	export let preclickAction: (() => Promise<void>) | undefined = undefined
 	export let recomputeIds: string[] | undefined = undefined
+	export let noInitialize = false
 	export let controls: { left: () => boolean; right: () => boolean | string } | undefined =
 		undefined
+	export let noDefault = false
+	export let onSelect: string[] | undefined = undefined
 
 	const {
 		app,
@@ -28,8 +42,14 @@
 		connectingInput,
 		selectedComponent,
 		runnableComponents,
-		componentControl
+		componentControl,
+		darkMode
 	} = getContext<AppViewerContext>('AppViewerContext')
+
+	const iterContext = getContext<ListContext>('ListWrapperContext')
+	const listInputs: ListInputs | undefined = getContext<ListInputs>('ListInputs')
+	const rowContext = getContext<ListContext>('RowWrapperContext')
+	const rowInputs: ListInputs | undefined = getContext<ListInputs>('RowInputs')
 
 	$componentControl[id] = {
 		setValue(nvalue: string) {
@@ -50,32 +70,62 @@
 		result: undefined as string | undefined
 	})
 
-	let value: string | undefined = outputs?.result.peak()
+	// The library expects double quotes around the value
+	let value: string | undefined = noDefault
+		? undefined
+		: outputs?.result.peak()
+		? JSON.stringify(outputs?.result.peak())
+		: undefined
 
 	$: resolvedConfig.items && handleItems()
 
 	let listItems: { label: string; value: string; created?: boolean }[] = []
 
+	function setContextValue(value: any) {
+		if (iterContext && listInputs) {
+			listInputs.set(id, value)
+		}
+		if (rowContext && rowInputs) {
+			rowInputs.set(id, value)
+		}
+	}
 	function handleItems() {
 		listItems = Array.isArray(resolvedConfig.items)
 			? resolvedConfig.items.map((item) => {
+					if (!item || typeof item !== 'object') {
+						console.error('Select component items should be an array of objects')
+						return {
+							label: 'not object',
+							value: 'not object'
+						}
+					}
 					return {
-						label: item.label,
-						value: JSON.stringify(item.value)
+						label: item?.label ?? 'undefined',
+						value: item?.value != undefined ? JSON.stringify(item.value) : 'undefined'
 					}
 			  })
 			: []
+
+		if (value != undefined && listItems.some((x) => x.value === value)) {
+			return
+		}
 		let rawValue
 		if (resolvedConfig.defaultValue !== undefined) {
 			rawValue = resolvedConfig.defaultValue
-		} else if (listItems.length > 0) {
+		} else if (listItems.length > 0 && resolvedConfig?.preselectFirst) {
 			rawValue = resolvedConfig.items[0].value
 		}
-		if (rawValue !== undefined) {
+		if (rawValue !== undefined && rawValue !== null) {
 			value = JSON.stringify(rawValue)
 			outputs?.result.set(rawValue)
 		}
+		setContextValue(rawValue)
 	}
+
+	onDestroy(() => {
+		listInputs?.remove(id)
+		rowInputs?.remove(id)
+	})
 
 	function onChange(e: CustomEvent) {
 		e?.stopPropagation()
@@ -88,6 +138,15 @@
 		}
 		preclickAction?.()
 		setValue(e.detail?.['value'])
+		if (onSelect) {
+			onSelect.forEach((id) => $runnableComponents?.[id]?.cb?.forEach((f) => f()))
+		}
+	}
+
+	function onNativeChange(e: Event) {
+		const target = e.target as HTMLSelectElement
+		const value = target.value
+		setValue(value)
 	}
 
 	function setValue(nvalue: any) {
@@ -97,31 +156,49 @@
 		} catch (_) {}
 		value = nvalue
 		outputs?.result.set(result)
+		setContextValue(result)
 		if (recomputeIds) {
-			recomputeIds.forEach((id) => $runnableComponents?.[id]?.cb())
+			recomputeIds.forEach((id) => $runnableComponents?.[id]?.cb?.forEach((f) => f()))
 		}
 	}
 
-	$: css = concatCustomCss($app.css?.selectcomponent, customCss)
+	function onClear() {
+		value = undefined
+		outputs?.result.set(undefined, true)
+		setContextValue(undefined)
+	}
+
+	let css = initCss($app.css?.selectcomponent, customCss)
+
+	let previsousFilter = ''
 
 	function handleFilter(e) {
-		if (resolvedConfig.create) {
-			if (e.detail.length === 0 && filterText.length > 0) {
-				const prev = listItems.filter((i) => !i.created)
-				listItems = [
-					...prev,
-					{ value: JSON.stringify(filterText), label: filterText, created: true }
-				]
+		if (resolvedConfig.create && filterText !== previsousFilter) {
+			previsousFilter = filterText
+			if (filterText.length > 0) {
+				const prev = listItems?.filter((i) => !i.created)
+
+				const exists = listItems?.some(
+					(item) => item.label.toLowerCase() === filterText.toLowerCase()
+				)
+				if (!exists) {
+					listItems = [
+						...prev,
+						{ value: JSON.stringify(filterText), label: filterText, created: true }
+					]
+				}
 			}
 		}
 	}
 
-	$: resolvedConfig.defaultValue && handleDefault()
+	$: resolvedConfig.defaultValue != undefined && handleDefault()
 
 	function handleDefault() {
-		if (resolvedConfig.defaultValue) {
-			value = JSON.stringify(resolvedConfig.defaultValue)
-			outputs?.result.set(resolvedConfig.defaultValue)
+		if (resolvedConfig.defaultValue != undefined) {
+			const nvalue = resolvedConfig.defaultValue
+			value = JSON.stringify(nvalue)
+			outputs?.result.set(nvalue)
+			setContextValue(nvalue)
 		}
 	}
 	let filterText = ''
@@ -136,7 +213,20 @@
 		configuration={configuration[key]}
 	/>
 {/each}
-<InitializeComponent {id} />
+
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.selectcomponent}
+	/>
+{/each}
+
+{#if !noInitialize}
+	<InitializeComponent {id} />
+{/if}
 
 <AlignWrapper {render} {verticalAlignment}>
 	<div
@@ -148,39 +238,67 @@
 			}
 		}}
 	>
-		<Select
-			--border-radius="0"
-			--border-color="#999"
-			bind:filterText
-			on:filter={handleFilter}
-			on:clear={onChange}
-			on:change={onChange}
-			items={listItems}
-			listAutoWidth={resolvedConfig.fullWidth}
-			inputStyles={SELECT_INPUT_DEFAULT_STYLE.inputStyles}
-			containerStyles={'border-color: #999;' +
-				SELECT_INPUT_DEFAULT_STYLE.containerStyles +
-				css?.input?.style}
-			{value}
-			placeholder={resolvedConfig.placeholder}
-			on:focus={() => {
-				if (!$connectingInput.opened) {
-					$selectedComponent = [id]
-				}
-			}}
-		>
-			<div slot="item" let:item
-				>{#if resolvedConfig.create}{item.created ? 'Add new: ' : ''}{/if}{item.label}
-			</div>
-		</Select>
+		{#if Array.isArray(listItems) && listItems.every((x) => x && typeof x == 'object' && typeof x['label'] == 'string' && `value` in x)}
+			{#if resolvedConfig.nativeHtmlSelect}
+				<select class={css?.input?.class} style={css?.input?.style} on:change={onNativeChange}>
+					{#if resolvedConfig.placeholder}
+						<option value="" disabled selected>{resolvedConfig.placeholder}</option>
+					{/if}
+					{#each listItems as item (item.value)}
+						<option value={item.value} selected={item.value === value}>{item.label}</option>
+					{/each}
+				</select>
+			{:else}
+				<Select
+					inAppEditor={true}
+					--border-radius="0.250rem"
+					--clear-icon-color="#6b7280"
+					--border={$darkMode ? '1px solid #6b7280' : '1px solid #d1d5db'}
+					bind:filterText
+					on:filter={handleFilter}
+					on:clear={onClear}
+					on:change={onChange}
+					items={listItems}
+					listAutoWidth={resolvedConfig.fullWidth}
+					inputStyles={SELECT_INPUT_DEFAULT_STYLE.inputStyles}
+					containerStyles={($darkMode
+						? SELECT_INPUT_DEFAULT_STYLE.containerStylesDark
+						: SELECT_INPUT_DEFAULT_STYLE.containerStyles) + css?.input?.style}
+					{value}
+					class={css?.input?.class}
+					placeholder={resolvedConfig.placeholder}
+					disabled={resolvedConfig.disabled}
+					on:focus={() => {
+						if (!$connectingInput.opened) {
+							$selectedComponent = [id]
+						}
+					}}
+				>
+					<svelte:fragment slot="item" let:item
+						>{#if resolvedConfig.create}{item.created ? 'Add new: ' : ''}{/if}{item.label}
+					</svelte:fragment>
+				</Select>
+			{/if}
+		{:else}
+			<Popover notClickable placement="bottom" popupClass="!bg-surface border w-96">
+				<div
+					class={classNames(
+						'bg-red-100 w-full h-full flex items-center justify-center text-red-500'
+					)}
+				>
+					<Bug size={14} />
+				</div>
+				<span slot="text">
+					<div class="bg-surface">
+						<Alert title="Incorrect options" type="error" size="xs" class="h-full w-full ">
+							The selectable items should be an array of {'{"value": any, "label":}'}. Found:
+							<pre class="w-full bg-surface p-2 rounded-md whitespace-pre-wrap"
+								>{JSON.stringify(listItems, null, 4)}</pre
+							>
+						</Alert>
+					</div>
+				</span>
+			</Popover>
+		{/if}
 	</div>
 </AlignWrapper>
-
-<style global>
-	.app-select .value-container {
-		padding: 0 !important;
-	}
-	.svelte-select-list {
-		z-index: 1000 !important;
-	}
-</style>

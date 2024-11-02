@@ -3,13 +3,16 @@
 	import { initOutput } from '../../editor/appUtils'
 	import SubGridEditor from '../../editor/SubGridEditor.svelte'
 	import type { AppViewerContext, ComponentCustomCSS } from '../../types'
-	import { concatCustomCss } from '../../utils'
+	import { initCss } from '../../utils'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
 	import Button from '$lib/components/common/button/Button.svelte'
-	import { RunnableComponent, RunnableWrapper } from '../helpers'
 	import type { AppInput } from '../../inputType'
 	import { ArrowLeftIcon, ArrowRightIcon, Loader2 } from 'lucide-svelte'
 	import Stepper from '$lib/components/common/stepper/Stepper.svelte'
+	import { twMerge } from 'tailwind-merge'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
+	import RunnableComponent from '../helpers/RunnableComponent.svelte'
+	import RunnableWrapper from '../helpers/RunnableWrapper.svelte'
 
 	export let id: string
 	export let componentContainerHeight: number
@@ -19,6 +22,8 @@
 	export let recomputeIds: string[] | undefined = undefined
 	export let extraQueryParams: Record<string, any> = {}
 	export let componentInput: AppInput | undefined
+	export let onNext: string[] | undefined = undefined
+	export let onPrevious: string[] | undefined = undefined
 
 	const {
 		app,
@@ -27,25 +32,28 @@
 		selectedComponent,
 		componentControl,
 		connectingInput,
-		mode
+		mode,
+		runnableComponents
 	} = getContext<AppViewerContext>('AppViewerContext')
 
-	let selected: string = tabs[0]
+	let selected = tabs[0]
 	let tabHeight: number = 0
 	let footerHeight: number = 0
 	let runnableComponent: RunnableComponent
 	let selectedIndex = tabs?.indexOf(selected) ?? -1
 	let maxReachedIndex = -1
 	let statusByStep = [] as Array<'success' | 'error' | 'pending'>
+	let debugMode: boolean = false
 
 	let outputs = initOutput($worldStore, id, {
 		currentStepIndex: 0,
 		result: undefined,
-		loading: false
+		loading: false,
+		lastAction: undefined as 'previous' | 'next' | undefined
 	})
 
 	async function handleTabSelection() {
-		if (runnableComponent) {
+		if (runnableComponent && !debugMode) {
 			await runnableComponent?.runComponent()
 		}
 
@@ -68,7 +76,9 @@
 	async function runStep(targetIndex: number) {
 		statusByStep[selectedIndex] = 'pending'
 
-		if (runnableComponent) {
+		outputs?.lastAction.set(directionClicked === 'left' ? 'previous' : 'next')
+
+		if (runnableComponent && !debugMode) {
 			await runnableComponent?.runComponent()
 		}
 
@@ -100,20 +110,38 @@
 			return false
 		},
 		setTab: (tab: number) => {
-			selected = tabs[tab]
+			debugMode = tab >= 0
+
+			if (debugMode) {
+				selected = tabs[tab]
+			} else {
+				selected = tabs[0]
+			}
+
 			handleTabSelection()
 		}
 	}
 
 	$: selected != undefined && handleTabSelection()
-	$: css = concatCustomCss($app.css?.steppercomponent, customCss)
+	let css = initCss($app.css?.steppercomponent, customCss)
 	$: lastStep = selectedIndex === tabs.length - 1
 
 	let directionClicked: 'left' | 'right' | undefined = undefined
 </script>
 
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.steppercomponent}
+	/>
+{/each}
+
 <InitializeComponent {id} />
 <RunnableWrapper
+	hasChildrens
 	{recomputeIds}
 	{render}
 	bind:runnableComponent
@@ -151,7 +179,7 @@
 						{id}
 						visible={render && i === selectedIndex}
 						subGridId={`${id}-${i}`}
-						class={css?.container?.class}
+						class={twMerge(css?.container?.class, 'wm-stepper')}
 						style={css?.container?.style}
 						containerHeight={componentContainerHeight - tabHeight - footerHeight}
 						on:focus={() => {
@@ -168,7 +196,7 @@
 		<div bind:clientHeight={footerHeight}>
 			<div class="flex justify-between h-10 p-2">
 				<div class="flex items-center gap-2">
-					<span class="text-sm font-medium text-gray-500">
+					<span class="text-sm font-medium text-tertiary">
 						Step {selectedIndex + 1} of {tabs.length}
 					</span>
 				</div>
@@ -178,8 +206,10 @@
 						color="light"
 						variant="contained"
 						disabled={selectedIndex === 0}
-						on:click={() => {
+						on:click={(e) => {
+							e.preventDefault()
 							directionClicked = 'left'
+							onPrevious?.forEach((id) => $runnableComponents?.[id]?.cb?.forEach((cb) => cb?.()))
 							runStep(selectedIndex - 1)
 						}}
 					>
@@ -198,8 +228,10 @@
 						color="dark"
 						variant="contained"
 						disabled={lastStep}
-						on:click={() => {
+						on:click={(e) => {
+							e.preventDefault()
 							directionClicked = 'right'
+							onNext?.forEach((id) => $runnableComponents?.[id]?.cb?.forEach((cb) => cb?.()))
 							runStep(selectedIndex + 1)
 						}}
 					>

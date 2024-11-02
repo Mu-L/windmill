@@ -6,9 +6,14 @@ use gosyn::{
 };
 use itertools::Itertools;
 
+use regex::Regex;
 use windmill_parser::{Arg, MainArgSignature, ObjectProperty, Typ};
 
-pub fn parse_go_sig(code: &str) -> windmill_common::error::Result<MainArgSignature> {
+lazy_static::lazy_static! {
+    pub static ref REQUIRE_PARSE: Regex = Regex::new(r"//require (.*)\n").unwrap();
+}
+
+pub fn parse_go_sig(code: &str) -> anyhow::Result<MainArgSignature> {
     let filtered_code = filter_non_main(code);
     let file = parse_source(&filtered_code).map_err(|x| anyhow::anyhow!(x.to_string()))?;
     if let Some(func) = file.decl.iter().find_map(|x| match x {
@@ -22,18 +27,35 @@ pub fn parse_go_sig(code: &str) -> windmill_common::error::Result<MainArgSignatu
             .iter()
             .map(|param| {
                 let (otyp, typ) = parse_go_typ(&param.typ);
-                Arg { name: get_name(param), otyp, typ, default: None, has_default: false }
+                Arg {
+                    name: get_name(param),
+                    otyp,
+                    typ,
+                    default: None,
+                    has_default: false,
+                    oidx: None,
+                }
             })
             .collect_vec();
-        Ok(MainArgSignature { star_args: false, star_kwargs: false, args })
+        Ok(MainArgSignature {
+            star_args: false,
+            star_kwargs: false,
+            args,
+            no_main_func: Some(false),
+            has_preprocessor: None,
+        })
     } else {
-        Err(windmill_common::error::Error::BadRequest(
-            "no main function found".to_string(),
-        ))
+        Ok(MainArgSignature {
+            star_args: false,
+            star_kwargs: false,
+            args: vec![],
+            no_main_func: Some(true),
+            has_preprocessor: None,
+        })
     }
 }
 
-pub fn parse_go_imports(code: &str) -> windmill_common::error::Result<Vec<String>> {
+pub fn parse_go_imports(code: &str) -> anyhow::Result<Vec<String>> {
     let file =
         parse_source(filter_non_imports(code)).map_err(|x| anyhow::anyhow!(x.to_string()))?;
     let mut imports: Vec<String> = file
@@ -48,7 +70,14 @@ pub fn parse_go_imports(code: &str) -> windmill_common::error::Result<Vec<String
         })
         .collect();
     imports.sort();
-    Ok(imports)
+    Ok([
+        imports,
+        REQUIRE_PARSE
+            .captures_iter(code)
+            .map(|x| x[1].to_string())
+            .collect_vec(),
+    ]
+    .concat())
 }
 
 fn get_name(param: &Field) -> String {
@@ -132,8 +161,6 @@ pub fn otyp_to_string(otyp: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
 
-    use windmill_parser::{Arg, MainArgSignature, ObjectProperty, Typ};
-
     use super::*;
 
     #[test]
@@ -161,28 +188,32 @@ func main(x int, y string, z bool, l []string, o struct { Name string `json:"nam
                         name: "x".to_string(),
                         typ: Typ::Int,
                         has_default: false,
-                        default: None
+                        default: None,
+                        oidx: None
                     },
                     Arg {
                         otyp: Some("string".to_string()),
                         name: "y".to_string(),
                         typ: Typ::Str(None),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: Some("bool".to_string()),
                         name: "z".to_string(),
                         typ: Typ::Bool,
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: Some("[]string".to_string()),
                         name: "l".to_string(),
                         typ: Typ::List(Box::new(Typ::Str(None))),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: Some("struct { Name string `json:\"name\"` }".to_string()),
@@ -192,23 +223,28 @@ func main(x int, y string, z bool, l []string, o struct { Name string `json:"nam
                             typ: Box::new(Typ::Str(None))
                         },]),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: Some("interface{}".to_string()),
                         name: "n".to_string(),
                         typ: Typ::Object(vec![]),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
                     Arg {
                         otyp: Some("map[string]interface{}".to_string()),
                         name: "m".to_string(),
                         typ: Typ::Object(vec![]),
                         default: None,
-                        has_default: false
+                        has_default: false,
+                        oidx: None
                     },
-                ]
+                ],
+                no_main_func: Some(false),
+                has_preprocessor: None
             }
         );
 

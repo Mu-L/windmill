@@ -1,21 +1,23 @@
 import type { Schema } from '$lib/common'
 import {
-	Script,
 	ScriptService,
-	type Flow,
 	type FlowModule,
 	type PathFlow,
 	type PathScript,
-	type RawScript
+	type RawScript,
+	type OpenFlow,
+	type Script
 } from '$lib/gen'
 import { initialCode } from '$lib/script_helpers'
 import { userStore, workspaceStore } from '$lib/stores'
 import { getScriptByPath } from '$lib/scripts'
 import { get, type Writable } from 'svelte/store'
 import type { FlowModuleState, FlowState } from './flowState'
-import { charsToNumber, numberToChars } from './idUtils'
-import { emptyFlowModuleState, findNextAvailablePath, loadSchemaFromModule } from './utils'
+import { emptyFlowModuleState } from './utils'
 import { NEVER_TESTED_THIS_FAR } from './models'
+import { loadSchemaFromModule } from './flowInfers'
+import { nextId } from './flowModuleNextId'
+import { findNextAvailablePath } from '$lib/path'
 
 export async function loadFlowModuleState(flowModule: FlowModule): Promise<FlowModuleState> {
 	try {
@@ -28,24 +30,15 @@ export async function loadFlowModuleState(flowModule: FlowModule): Promise<FlowM
 		) {
 			flowModule.value.input_transforms = input_transforms
 		}
-		return { schema, previewResult: NEVER_TESTED_THIS_FAR }
+
+		return {
+			schema,
+			previewResult: NEVER_TESTED_THIS_FAR
+		}
 	} catch (e) {
-		console.error(e)
+		console.debug(e)
 		return emptyFlowModuleState()
 	}
-}
-
-// Computes the next available id
-export function nextId(flowState: FlowState): string {
-	const max = Object.keys(flowState).reduce((acc, key) => {
-		if (key === 'failure' || key.includes('branch') || key.includes('loop')) {
-			return acc
-		} else {
-			const num = charsToNumber(key)
-			return Math.max(acc, num + 1)
-		}
-	}, 0)
-	return numberToChars(max)
 }
 
 export async function pickScript(
@@ -78,29 +71,48 @@ export async function pickFlow(
 }
 
 export async function createInlineScriptModule(
-	language: RawScript.language,
-	kind: Script.kind,
+	language: RawScript['language'],
+	kind: Script['kind'],
 	subkind: 'pgsql' | 'flow',
-	id: string
+	id: string,
+	summary?: string
 ): Promise<[FlowModule, FlowModuleState]> {
 	const code = initialCode(language, kind, subkind)
 
 	const flowModule: FlowModule = {
 		id,
+		summary,
 		value: { type: 'rawscript', content: code, language, input_transforms: {} }
 	}
 
 	return [flowModule, await loadFlowModuleState(flowModule)]
 }
 
-export async function createLoop(id: string): Promise<[FlowModule, FlowModuleState]> {
+export async function createLoop(
+	id: string,
+	enabledAi: boolean
+): Promise<[FlowModule, FlowModuleState]> {
 	const loopFlowModule: FlowModule = {
 		id,
 		value: {
 			type: 'forloopflow',
 			modules: [],
-			iterator: { type: 'javascript', expr: '["dynamic or static array"]' },
+			iterator: { type: 'javascript', expr: enabledAi ? '' : "['dynamic or static array']" },
 			skip_failures: true
+		}
+	}
+
+	const flowModuleState = await loadFlowModuleState(loopFlowModule)
+	return [loopFlowModule, flowModuleState]
+}
+
+export async function createWhileLoop(id: string): Promise<[FlowModule, FlowModuleState]> {
+	const loopFlowModule: FlowModule = {
+		id,
+		value: {
+			type: 'whileloopflow',
+			modules: [],
+			skip_failures: false
 		}
 	}
 
@@ -129,7 +141,8 @@ export async function createBranchAll(id: string): Promise<[FlowModule, FlowModu
 		id,
 		value: {
 			type: 'branchall',
-			branches: [{ modules: [] }]
+			branches: [{ modules: [] }],
+			parallel: true
 		},
 		summary: ''
 	}
@@ -179,7 +192,7 @@ async function createInlineScriptModuleFromPath(
 		id,
 		value: {
 			type: 'rawscript',
-			language: language as RawScript.language,
+			language: language as RawScript['language'],
 			content: content,
 			path,
 			input_transforms: {}
@@ -187,9 +200,9 @@ async function createInlineScriptModuleFromPath(
 	}
 }
 
-export function emptyModule(flowState: FlowState, flow?: boolean): FlowModule {
+export function emptyModule(flowState: FlowState, fullFlow: OpenFlow, flow?: boolean): FlowModule {
 	return {
-		id: nextId(flowState),
+		id: nextId(flowState, fullFlow),
 		value: { type: 'identity', flow }
 	}
 }
@@ -197,8 +210,8 @@ export function emptyModule(flowState: FlowState, flow?: boolean): FlowModule {
 export async function createScriptFromInlineScript(
 	flowModule: FlowModule,
 	suffix: string,
-	schema: Schema,
-	flow: Flow
+	schema: Schema | undefined,
+	flowPath: string
 ): Promise<[FlowModule & { value: PathScript }, FlowModuleState]> {
 	const user = get(userStore)
 
@@ -214,9 +227,9 @@ export async function createScriptFromInlineScript(
 		suffix = others.join('/')
 	}
 
-	const path = `${flow.path}/${suffix}`
+	const path = `${flowPath}/${suffix}`
 	const forkedDescription = wasForked ? `as a fork of ${originalScriptPath}` : ''
-	const description = `This script was edited in place of flow ${flow.path} ${forkedDescription} by ${user?.username}.`
+	const description = `This script was edited in place of flow ${flowPath} ${forkedDescription} by ${user?.username}.`
 
 	const availablePath = await findNextAvailablePath(path)
 
@@ -242,4 +255,33 @@ export function deleteFlowStateById(id: string, flowStateStore: Writable<FlowSta
 		delete fss[id]
 		return fss
 	})
+}
+
+export function sliceModules(
+	modules: FlowModule[],
+	upTo: number,
+	idOrders: string[]
+): FlowModule[] {
+	return modules
+		.filter((x) => idOrders.indexOf(x.id) <= upTo)
+		.map((m) => {
+			if (idOrders.indexOf(m.id) == upTo) {
+				return m
+			}
+			if (m.value.type === 'forloopflow') {
+				m.value.modules = sliceModules(m.value.modules, upTo, idOrders)
+			} else if (m.value.type === 'branchone') {
+				m.value.branches = m.value.branches.map((b) => {
+					b.modules = sliceModules(b.modules, upTo, idOrders)
+					return b
+				})
+				m.value.default = sliceModules(m.value.default, upTo, idOrders)
+			} else if (m.value.type === 'branchall') {
+				m.value.branches = m.value.branches.map((b) => {
+					b.modules = sliceModules(b.modules, upTo, idOrders)
+					return b
+				})
+			}
+			return m
+		})
 }

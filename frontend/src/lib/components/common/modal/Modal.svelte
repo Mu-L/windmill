@@ -10,6 +10,7 @@
 	let c: string = ''
 	export { c as class }
 	export let style = ''
+	export let cancelText: string | undefined = undefined
 
 	const dispatch = createEventDispatcher()
 
@@ -39,6 +40,7 @@
 
 {#if open}
 	<!-- svelte-ignore a11y-click-events-have-key-events -->
+	<!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
 	<div
 		on:click={() => (open = false)}
 		transition:fadeFast|local
@@ -54,10 +56,11 @@
 
 		<div class="fixed inset-0 z-10 overflow-y-auto">
 			<div class="flex min-h-full items-center justify-center p-4">
+				<!-- svelte-ignore a11y-no-static-element-interactions -->
 				<div
 					on:click|stopPropagation
 					class={twMerge(
-						'relative transform overflow-hidden rounded-lg bg-white px-4 pt-5 pb-4 text-left shadow-xl transition-all sm:my-8 sm:w-full sm:max-w-lg sm:p-6',
+						'relative transform overflow-hidden rounded-lg bg-surface px-4 pt-5 pb-4 text-left shadow-xl transition-all sm:my-8 sm:w-full sm:max-w-lg sm:p-6',
 						c,
 						open
 							? 'ease-out duration-300 opacity-100 translate-y-0 sm:scale-100'
@@ -67,15 +70,16 @@
 				>
 					<div class="flex">
 						<div class="ml-4 text-left flex-1">
-							<h3 class="text-lg font-medium text-gray-900">
+							<h3 class="text-lg font-medium text-primary">
 								{title}
 							</h3>
-							<div class="mt-2 text-sm text-gray-500">
+							<div class="mt-2 text-sm text-tertiary">
 								<slot />
 							</div>
 						</div>
 					</div>
 					<div class="flex items-center space-x-2 flex-row-reverse space-x-reverse mt-4">
+						<slot name="actions" />
 						<Button
 							on:click={() => {
 								dispatch('canceled')
@@ -84,7 +88,9 @@
 							color="light"
 							size="sm"
 						>
-							<span class="inline-flex gap-2">Cancel <Badge color="dark-gray">Escape</Badge></span>
+							<span class="inline-flex gap-2"
+								>{cancelText ?? 'Cancel'}<Badge color="dark-gray">Escape</Badge></span
+							>
 						</Button>
 					</div>
 				</div>

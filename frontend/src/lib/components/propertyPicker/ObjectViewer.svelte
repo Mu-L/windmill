@@ -6,29 +6,30 @@
 	import { computeKey } from './utils'
 	import WarningMessage from './WarningMessage.svelte'
 	import { NEVER_TESTED_THIS_FAR } from '../flows/models'
+	import Portal from '$lib/components/Portal.svelte'
+
+	import { Download, PanelRightOpen } from 'lucide-svelte'
+	import S3FilePicker from '../S3FilePicker.svelte'
+	import { workspaceStore } from '$lib/stores'
 
 	export let json: any
 	export let level = 0
 	export let currentPath: string = ''
 	export let pureViewer = false
-	export let collapsed = level == 3 || Array.isArray(json)
+	export let collapsed = (level != 0 && level % 3 == 0) || Array.isArray(json)
 	export let rawKey = false
 	export let topBrackets = false
 	export let topLevelNode = false
 	export let allowCopy = true
+	export let collapseLevel: number | undefined = undefined
+
+	let s3FileViewer: S3FilePicker
 
 	const collapsedSymbol = '...'
-	let keys: string | any[]
-	let isArray: boolean
-	let openBracket: string
-	let closeBracket: string
-
-	$: {
-		keys = getTypeAsString(json) === 'object' ? Object.keys(json) : []
-		isArray = Array.isArray(json)
-		openBracket = isArray ? '[' : '{'
-		closeBracket = isArray ? ']' : '}'
-	}
+	$: keys = ['object', 's3object'].includes(getTypeAsString(json)) ? Object.keys(json) : []
+	$: isArray = Array.isArray(json)
+	$: openBracket = isArray ? '[' : '{'
+	$: closeBracket = isArray ? ']' : '}'
 
 	export function getTypeAsString(arg: any): string {
 		if (arg === null) {
@@ -36,6 +37,9 @@
 		}
 		if (arg === undefined) {
 			return 'undefined'
+		}
+		if (Object.keys(arg).length === 1 && Object.keys(arg).includes('s3')) {
+			return 's3object'
 		}
 		return typeof arg
 	}
@@ -46,106 +50,141 @@
 
 	const dispatch = createEventDispatcher()
 
-	function selectProp(key: string, value: any) {
+	function selectProp(key: string, value: any | undefined = undefined) {
 		if (pureViewer && allowCopy) {
-			copyToClipboard(computeKey(key, isArray, currentPath))
+			const valueToCopy = value !== undefined ? value : computeKey(key, isArray, currentPath)
+			copyToClipboard(valueToCopy)
 		}
 		dispatch('select', rawKey ? key : computeKey(key, isArray, currentPath))
 	}
 
-	let keyLimit = 100
+	$: keyLimit = isArray ? 1 : 100
+
+	$: fullyCollapsed = keys.length > 1 && collapsed
 </script>
 
-{#if keys.length > 0}
-	<span class:hidden={collapsed}>
-		{#if level != 0}
-			<!-- svelte-ignore a11y-click-events-have-key-events -->
-			<span
-				class="cursor-pointer border border-gray-300 hover:bg-gray-200 px-1 rounded"
-				on:click={collapse}
-			>
-				-
-			</span>
-		{/if}
-		{#if level == 0 && topBrackets}<span class="h-0">{openBracket}</span>{/if}
-		<ul
-			class={`w-full pl-2 ${
-				level === 0 ? 'border-none' : 'border-l border-dotted border-gray-200'
-			}`}
-		>
-			{#each keys.length > keyLimit ? keys.slice(0, keyLimit) : keys as key, index (key)}
-				<li>
-					<button on:click={() => selectProp(key, key)} class="whitespace-nowrap">
-						{#if topLevelNode}
-							<Badge baseClass="border border-blue-600" color="indigo">{key}</Badge>
-						{:else}
-							<span
-								class="key {pureViewer
-									? 'cursor-auto'
-									: 'border border-gray-300'} font-semibold rounded px-1 hover:bg-blue-100 text-2xs text-gray-800"
-							>
-								{!isArray ? key : index}</span
-							>
-						{/if}:
-					</button>
+<Portal name="object-viewer">
+	<S3FilePicker bind:this={s3FileViewer} readOnlyMode={true} />
+</Portal>
 
-					{#if getTypeAsString(json[key]) === 'object'}
-						<svelte:self
-							json={json[key]}
-							level={level + 1}
-							currentPath={computeKey(key, isArray, currentPath)}
-							{pureViewer}
-							on:select
-						/>
-					{:else}
-						<button
-							class="val {pureViewer
-								? 'cursor-auto'
-								: ''} rounded px-1 hover:bg-blue-100 {getTypeAsString(json[key])}"
-							on:click={() => selectProp(key, json[key])}
-						>
-							{#if json[key] === NEVER_TESTED_THIS_FAR}
-								<WarningMessage />
-							{:else if json[key] == undefined}
-								<span class="text-2xs">undefined</span>
-							{:else if json[key] == null}
-								<span class="text-2xs">null</span>
-							{:else if typeof json[key] == 'string'}
-								<span title={json[key]} class="text-2xs">"{truncate(json[key], 200)}"</span>
+{#if keys.length > 0}
+	{#if !fullyCollapsed}
+		<span>
+			{#if level != 0 && keys.length > 1}
+				<!-- svelte-ignore a11y-click-events-have-key-events -->
+				<!-- svelte-ignore a11y-no-static-element-interactions -->
+				<span class="cursor-pointer border hover:bg-surface-hover px-1 rounded" on:click={collapse}>
+					-
+				</span>
+			{/if}
+			{#if level == 0 && topBrackets}<span class="h-0">{openBracket}</span>{/if}
+			<ul class={`w-full pl-2 ${level === 0 ? 'border-none' : 'border-l border-dotted'}`}>
+				{#each keys.length > keyLimit ? keys.slice(0, keyLimit) : keys as key, index (key)}
+					<li>
+						<button on:click={() => selectProp(key)} class="whitespace-nowrap">
+							{#if topLevelNode}
+								<Badge baseClass="border border-blue-600" color="indigo">{key}</Badge>
 							{:else}
-								<span title={JSON.stringify(json[key])} class="text-2xs">
-									{truncate(JSON.stringify(json[key]), 200)}
-								</span>
-							{/if}
+								<span
+									class="key {pureViewer
+										? 'cursor-auto'
+										: 'border '} font-semibold rounded px-1 hover:bg-surface-hover text-2xs text-secondary"
+								>
+									{!isArray ? key : index}</span
+								>
+							{/if}:
+						</button>
+
+						{#if getTypeAsString(json[key]) === 'object'}
+							<svelte:self
+								json={json[key]}
+								level={level + 1}
+								currentPath={computeKey(key, isArray, currentPath)}
+								{pureViewer}
+								{allowCopy}
+								on:select
+								{collapseLevel}
+								collapsed={collapseLevel !== undefined ? level + 1 >= collapseLevel : undefined}
+							/>
+						{:else}
+							<button
+								class="val text-left {pureViewer
+									? 'cursor-auto'
+									: ''} rounded px-1 hover:bg-blue-100 dark:hover:bg-blue-100/10 {getTypeAsString(
+									json[key]
+								)}"
+								on:click={() => selectProp(key, json[key])}
+							>
+								{#if json[key] === NEVER_TESTED_THIS_FAR}
+									<WarningMessage />
+								{:else if json[key] == undefined}
+									<span class="text-2xs">undefined</span>
+								{:else if json[key] == null}
+									<span class="text-2xs">null</span>
+								{:else if typeof json[key] == 'string'}
+									<span title={json[key]} class="text-2xs">"{truncate(json[key], 200)}"</span>
+								{:else}
+									<span title={JSON.stringify(json[key])} class="text-2xs">
+										{truncate(JSON.stringify(json[key]), 200)}
+									</span>
+								{/if}
+							</button>
+						{/if}
+					</li>
+				{/each}
+				{#if keys.length > keyLimit}
+					{@const increment = Math.min(100, keys.length - keyLimit)}
+					<button on:click={() => (keyLimit += increment)} class="text-xs py-2 text-blue-600">
+						{keyLimit}/{keys.length}: Load {increment} more...
+					</button>
+				{/if}
+			</ul>
+			{#if level == 0 && topBrackets}
+				<div class="flex">
+					<span class="h-0">{closeBracket}</span>
+					{#if getTypeAsString(json) === 's3object'}
+						<a
+							class="text-secondary underline font-semibold text-2xs whitespace-nowrap ml-1 w-fit"
+							href={`/api/w/${$workspaceStore}/job_helpers/download_s3_file?file_key=${json?.s3}${
+								json?.storage ? `&storage=${json.storage}` : ''
+							}`}
+							download={json?.s3.split('/').pop() ?? 'unnamed_download.file'}
+						>
+							<span class="flex items-center gap-1"><Download size={12} />download</span>
+						</a>
+						<button
+							class="text-secondary underline text-2xs whitespace-nowrap ml-1"
+							on:click={() => {
+								s3FileViewer?.open?.(json)
+							}}
+							><span class="flex items-center gap-1"><PanelRightOpen size={12} />open preview</span>
 						</button>
 					{/if}
-				</li>
-			{/each}
-			{#if keys.length > keyLimit}
-				<button on:click={() => (keyLimit += 100)} class="text-xs py-2 text-blue-600">
-					{keyLimit}/{keys.length}: Load 100 more...
-				</button>
+				</div>
 			{/if}
-		</ul>
-		{#if level == 0 && topBrackets}<span class="h-0">{closeBracket}</span>{/if}
-	</span>
+		</span>
+	{/if}
+
 	<!-- svelte-ignore a11y-click-events-have-key-events -->
+	<!-- svelte-ignore a11y-no-static-element-interactions -->
 	<span
 		class="border border-blue-600 rounded px-1 cursor-pointer hover:bg-gray-200"
-		class:hidden={!collapsed}
+		class:hidden={!fullyCollapsed}
 		on:click={collapse}
 	>
 		{openBracket}{collapsedSymbol}{closeBracket}
 	</span>
-	{#if collapsed}
-		<span class="text-gray-500 text-xs">
+	{#if fullyCollapsed}
+		<span class="text-tertiary text-xs">
 			{pluralize(Object.keys(json).length, Array.isArray(json) ? 'item' : 'key')}
 		</span>
 	{/if}
 {:else if topBrackets}
-	<span class="text-black">{openBracket}{closeBracket}</span>
+	<span class="text-primary">{openBracket}{closeBracket}</span>
+{:else if json == undefined}
+	<span class="text-tertiary text-2xs ml-2">undefined</span>
 {:else}
-	<span class="text-gray-400 text-xs ml-2">No items ([])</span>
+	<span class="text-tertiary text-2xs ml-2">No items ([])</span>
 {/if}
 
 <style lang="postcss">
@@ -155,18 +194,20 @@
 	}
 
 	.val.undefined {
-		@apply text-gray-600;
+		@apply text-tertiary;
 	}
 	.val.null {
-		@apply text-gray-600;
+		@apply text-tertiary;
 	}
 	.val.string {
-		@apply text-green-600;
+		@apply text-green-600 dark:text-green-400/80;
 	}
+
 	.val.number {
-		@apply text-orange-600;
+		@apply text-orange-600 dark:text-orange-400/90;
+		@apply font-mono;
 	}
 	.val.boolean {
-		@apply text-blue-600;
+		@apply text-blue-600 dark:text-blue-400/90;
 	}
 </style>

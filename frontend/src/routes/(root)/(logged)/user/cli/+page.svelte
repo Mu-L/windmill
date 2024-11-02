@@ -1,8 +1,7 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
-
 	import { UserService } from '$lib/gen'
 	import { page } from '$app/stores'
+	import { base } from '$lib/base'
 	import CenteredModal from '$lib/components/CenteredModal.svelte'
 	import { Button } from '$lib/components/common'
 	import { workspaceStore } from '$lib/stores'
@@ -18,7 +17,8 @@
 			}
 		})
 
-		await goto('http://localhost:' + port + '?token=' + newToken + '&workspace=' + $workspaceStore)
+		const url = 'http://localhost:' + port + '?token=' + newToken + '&workspace=' + $workspaceStore
+		window.location.href = url
 	}
 </script>
 
@@ -27,7 +27,7 @@
 		Token will be posted to your local machine to port {port}
 	</p>
 	<div class="flex flex-row justify-around pt-4 gap-x-1">
-		<Button variant="border" color="dark" size="sm" href="/">Decline</Button>
+		<Button variant="border" color="dark" size="sm" href={base}>Decline</Button>
 		<Button variant="contained" color="blue" size="sm" on:click={authorizeToken}>Authorize</Button>
 	</div>
 </CenteredModal>

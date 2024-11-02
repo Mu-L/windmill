@@ -9,6 +9,7 @@
 	import ObjectViewer from './ObjectViewer.svelte'
 	import { keepByKey } from './utils'
 	import type { PickableProperties } from '../flows/previousResults'
+	import ClearableInput from '../common/clearableInput/ClearableInput.svelte'
 
 	export let pickableProperties: PickableProperties
 	export let displayContext = true
@@ -37,6 +38,10 @@
 		search === EMPTY_STRING
 			? pickableProperties.priorIds
 			: keepByKey(pickableProperties.priorIds, search)
+
+	$: suggestedPropsFiltered = $propPickerConfig
+		? keepByKey(pickableProperties.priorIds, $propPickerConfig.propName)
+		: undefined
 
 	async function loadVariables() {
 		variables = Object.fromEntries(
@@ -75,14 +80,12 @@
 				{/if}
 			</div>
 		{/if}
-		<input
-			type="text"
-			bind:value={search}
-			class="bg-gray-50 mt-2 border border-gray-300 text-gray-900 text-sm rounded-lg block mb-2 w-full"
-			placeholder="Search prop..."
-		/>
+		<ClearableInput bind:value={search} placeholder="Search prop..." wrapperClass="py-2" />
 	</div>
-	<div class="overflow-y-auto px-2 grow" class:bg-gray-100={!$propPickerConfig && !notSelectable}>
+	<div
+		class="overflow-y-auto px-2 pt-2 grow"
+		class:bg-surface-secondary={!$propPickerConfig && !notSelectable}
+	>
 		<div class="flex justify-between items-center space-x-1">
 			<span class="font-bold text-sm">Flow Input</span>
 			<div class="flex space-x-2 items-center" />
@@ -110,12 +113,43 @@
 						error: {
 							message: 'The error message',
 							name: 'The error name',
-							stack: 'The error stack'
+							stack: 'The error stack',
+							step_id: 'The step id'
 						}
 					}}
 					on:select
 				/>
 			</div>
+			{#if Object.keys(pickableProperties.priorIds).length > 0}
+				{#if suggestedPropsFiltered && Object.keys(suggestedPropsFiltered).length > 0}
+					<span class="font-bold text-sm">Suggested Results</span>
+					<div class="overflow-y-auto mb-2">
+						<ObjectViewer
+							allowCopy={false}
+							topLevelNode
+							pureViewer={!$propPickerConfig}
+							collapsed={false}
+							json={suggestedPropsFiltered}
+							on:select={(e) => {
+								dispatch('select', `results.${e.detail}`)
+							}}
+						/>
+					</div>
+				{/if}
+				<span class="font-bold text-sm">All Results</span>
+				<div class="overflow-y-auto mb-2">
+					<ObjectViewer
+						allowCopy={false}
+						topLevelNode
+						pureViewer={!$propPickerConfig}
+						collapsed={true}
+						json={resultByIdFiltered}
+						on:select={(e) => {
+							dispatch('select', `results.${e.detail}`)
+						}}
+					/>
+				</div>
+			{/if}
 		{:else}
 			{#if previousId}
 				<span class="font-bold text-sm">Previous Result</span>
@@ -152,6 +186,21 @@
 				</div>
 			{/if}
 			{#if Object.keys(pickableProperties.priorIds).length > 0}
+				{#if suggestedPropsFiltered && Object.keys(suggestedPropsFiltered).length > 0}
+					<span class="font-bold text-sm">Suggested Results</span>
+					<div class="overflow-y-auto mb-2">
+						<ObjectViewer
+							allowCopy={false}
+							topLevelNode
+							pureViewer={!$propPickerConfig}
+							collapsed={false}
+							json={suggestedPropsFiltered}
+							on:select={(e) => {
+								dispatch('select', `results.${e.detail}`)
+							}}
+						/>
+					</div>
+				{/if}
 				<span class="font-bold text-sm">All Results</span>
 				<div class="overflow-y-auto mb-2">
 					<ObjectViewer

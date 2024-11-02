@@ -7,6 +7,7 @@
 
 	export let componentId: string
 	export let hasContent: boolean = false
+	export let suffix: string = ''
 
 	const { worldStore, connectingInput } = getContext<AppViewerContext>('AppViewerContext')
 	const { search, hasResult } = getContext<ContextPanelContext>('ContextPanel')
@@ -17,15 +18,18 @@
 		if (observableOutputs) {
 			Object.entries(observableOutputs).forEach(([k, output]) => {
 				object[k] = undefined
-				output?.subscribe({
-					id: 'alloutputs' + componentId + '-' + k,
-					next: (value) => {
-						if (!hasContent) {
-							hasContent = true
+				output?.subscribe(
+					{
+						id: 'alloutputs-' + suffix + componentId + '-' + k,
+						next: (value) => {
+							if (!hasContent) {
+								hasContent = true
+							}
+							object[k] = value
 						}
-						object[k] = value
-					}
-				})
+					},
+					object[k]
+				)
 			})
 		}
 	}
@@ -44,8 +48,8 @@
 			pureViewer={!$connectingInput.opened}
 		/>
 	{:else if $search.length > 0}
-		<div class="text-xs pl-2 text-gray-600">No results</div>
+		<div class="text-xs pl-2 text-tertiary">No results</div>
 	{:else}
-		<div class="text-xs pl-2 text-gray-600">No outputs</div>
+		<div class="text-xs pl-2 text-tertiary">No outputs</div>
 	{/if}
 {/if}

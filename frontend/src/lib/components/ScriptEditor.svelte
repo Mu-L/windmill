@@ -1,52 +1,70 @@
 <script lang="ts">
 	import { BROWSER } from 'esm-env'
 
-	import type { Schema } from '$lib/common'
-	import { CompletedJob, Job, JobService, SettingsService } from '$lib/gen'
+	import type { Schema, SupportedLanguage } from '$lib/common'
+	import { type CompletedJob, type Job, JobService, type Preview } from '$lib/gen'
 	import { enterpriseLicense, userStore, workspaceStore } from '$lib/stores'
-	import { copyToClipboard, emptySchema, getModifierKey, sendUserToast } from '$lib/utils'
-	import { faClipboard, faPlay } from '@fortawesome/free-solid-svg-icons'
+	import { copyToClipboard, emptySchema, sendUserToast } from '$lib/utils'
 	import Editor from './Editor.svelte'
 	import { inferArgs } from '$lib/infer'
-	import type { Preview } from '$lib/gen/models/Preview'
 	import { Pane, Splitpanes } from 'svelte-splitpanes'
 	import SchemaForm from './SchemaForm.svelte'
 	import LogPanel from './scriptEditor/LogPanel.svelte'
-	import { faGithub } from '@fortawesome/free-brands-svg-icons'
 	import EditorBar, { EDITOR_BAR_WIDTH_THRESHOLD } from './EditorBar.svelte'
 	import TestJobLoader from './TestJobLoader.svelte'
+	import JobProgressBar from '$lib/components/jobs/JobProgressBar.svelte'
 	import { createEventDispatcher, onDestroy, onMount } from 'svelte'
-	import { Button, Kbd } from './common'
+	import { Button } from './common'
 	import SplitPanesWrapper from './splitPanes/SplitPanesWrapper.svelte'
 	import WindmillIcon from './icons/WindmillIcon.svelte'
 	import * as Y from 'yjs'
 	import { scriptLangToEditorLang } from '$lib/scripts'
 	import { WebsocketProvider } from 'y-websocket'
 	import Modal from './common/modal/Modal.svelte'
-	import { Icon } from 'svelte-awesome'
+	import DiffEditor from './DiffEditor.svelte'
+	import { Clipboard, CornerDownLeft, Github, Play } from 'lucide-svelte'
+	import { setLicense } from '$lib/enterpriseUtils'
+	import type { ScriptEditorWhitelabelCustomUi } from './custom_ui'
+	import Tabs from './common/tabs/Tabs.svelte'
+	import Tab from './common/tabs/Tab.svelte'
+	import { slide } from 'svelte/transition'
 
 	// Exported
 	export let schema: Schema | any = emptySchema()
 	export let code: string
 	export let path: string | undefined
-	export let lang: Preview.language
+	export let lang: Preview['language']
 	export let kind: string | undefined = undefined
+	export let template: 'pgsql' | 'mysql' | 'script' | 'docker' | 'powershell' | 'bunnative' =
+		'script'
 	export let tag: string | undefined
 	export let initialArgs: Record<string, any> = {}
 	export let fixedOverflowWidgets = true
 	export let noSyncFromGithub = false
 	export let editor: Editor | undefined = undefined
+	export let diffEditor: DiffEditor | undefined = undefined
 	export let collabMode = false
 	export let edit = true
+	export let noHistory = false
+	export let saveToWorkspace = false
+	export let watchChanges = false
+	export let customUi: ScriptEditorWhitelabelCustomUi = {}
+
+	let jobProgressReset: () => void
 
 	let websocketAlive = {
 		pyright: false,
-		black: false,
 		deno: false,
 		go: false,
 		ruff: false,
 		shellcheck: false
 	}
+
+	const dispatch = createEventDispatcher()
+
+	$: watchChanges &&
+		(code != undefined || schema != undefined) &&
+		dispatch('change', { code, schema })
 
 	let width = 1200
 
@@ -54,7 +72,9 @@
 
 	// Test args input
 	let args: Record<string, any> = initialArgs
+
 	let isValid: boolean = true
+	let scriptProgress = undefined
 
 	// Test
 	let testIsLoading = false
@@ -85,7 +105,16 @@
 	}
 
 	function runTest() {
-		testJobLoader.runPreview(path, code, lang, args, tag)
+		// Not defined if JobProgressBar not loaded
+		if (jobProgressReset) jobProgressReset()
+		//@ts-ignore
+		testJobLoader.runPreview(
+			path,
+			code,
+			lang,
+			selectedTab === 'preprocessor' ? { _ENTRYPOINT_OVERRIDE: 'preprocessor', ...args } : args,
+			tag
+		)
 	}
 
 	async function loadPastTests(): Promise<void> {
@@ -97,31 +126,25 @@
 		})
 	}
 
-	export async function inferSchema(code: string, nlang?: 'go' | 'bash' | 'python3' | 'deno') {
-		schema = schema ?? emptySchema()
-		let isDefault: string[] = []
-		Object.entries(args).forEach(([k, v]) => {
-			if (schema.properties?.[k]?.default == v) {
-				isDefault.push(k)
-			}
-		})
+	let hasPreprocessor = false
+
+	export async function inferSchema(code: string, nlang?: SupportedLanguage) {
+		let nschema = schema ?? emptySchema()
 
 		try {
-			await inferArgs(nlang ?? lang, code, schema)
+			const result = await inferArgs(
+				nlang ?? lang,
+				code,
+				nschema,
+				selectedTab === 'preprocessor' ? 'preprocessor' : undefined
+			)
+			hasPreprocessor =
+				(selectedTab === 'preprocessor' ? !result?.no_main_func : result?.has_preprocessor) ?? false
+
 			validCode = true
+			schema = nschema
 		} catch (e) {
 			validCode = false
-		}
-
-		schema = schema
-
-		isDefault
-			.filter((key) => schema.properties[key] != undefined)
-			.forEach((key) => (args[key] = schema.properties[key].default))
-		for (const key of Object.keys(args)) {
-			if (schema.properties[key] == undefined) {
-				delete args[key]
-			}
 		}
 	}
 
@@ -130,11 +153,9 @@
 		loadPastTests()
 	})
 
+	setLicense()
 	export async function setCollaborationMode() {
-		if (!$enterpriseLicense) {
-			$enterpriseLicense = await SettingsService.getLicenseId()
-		}
-
+		await setLicense()
 		if (!$enterpriseLicense) {
 			sendUserToast(`Multiplayer is an enterprise feature`, true, [
 				{
@@ -157,7 +178,7 @@
 
 		wsProvider = new WebsocketProvider(
 			`${wsProtocol}://${window.location.host}/ws_mp/`,
-			$workspaceStore + '/' + path ?? 'no-room-name',
+			$workspaceStore + '/' + (path ?? 'no-room-name'),
 			ydoc,
 			{ connect: false }
 		)
@@ -182,7 +203,7 @@
 		})
 
 		function setPeers() {
-			peers = Array.from(awareness.getStates().values()).map((x) => x.user)
+			peers = Array.from(awareness.getStates().values()).map((x) => x?.['user'])
 		}
 
 		setPeers()
@@ -205,21 +226,25 @@
 		disableCollaboration()
 	})
 
-	const dispatch = createEventDispatcher()
-
 	function asKind(str: string | undefined) {
 		return str as 'script' | 'approval' | 'trigger' | undefined
 	}
 
 	function collabUrl() {
-		let url = new URL(window.location.toString())
+		let url = new URL(window.location.toString().split('#')[0])
 		url.search = ''
 		return `${url}?collab=1` + (edit ? '' : `&path=${path}`)
 	}
+	let selectedTab: 'main' | 'preprocessor' = 'main'
+	$: showTabs = hasPreprocessor
+	$: !hasPreprocessor && (selectedTab = 'main')
+
+	$: selectedTab && inferSchema(code)
 </script>
 
 <TestJobLoader
 	on:done={loadPastTests}
+	bind:scriptProgress
 	bind:this={testJobLoader}
 	bind:isLoading={testIsLoading}
 	bind:job={testJob}
@@ -231,14 +256,19 @@
 	<div>Have others join by sharing the following url:</div>
 	<div class="flex gap-2 pr-4">
 		<input type="text" disabled value={collabUrl()} />
-		<button on:click={() => copyToClipboard(collabUrl())} class="text-gray-700 ml-2">
-			<Icon data={faClipboard} />
-		</button>
+
+		<Button
+			color="light"
+			startIcon={{ icon: Clipboard }}
+			iconOnly
+			on:click={() => copyToClipboard(collabUrl())}
+		/>
 	</div>
 </Modal>
-<div class="border-b-2 shadow-sm px-1 pr-4" bind:clientWidth={width}>
+<div class="border-b shadow-sm px-1 pr-4" bind:clientWidth={width}>
 	<div class="flex justify-between space-x-2">
 		<EditorBar
+			scriptPath={edit ? path : undefined}
 			on:toggleCollabMode={() => {
 				if (wsProvider?.shouldConnect) {
 					disableCollaboration()
@@ -246,6 +276,7 @@
 					setCollaborationMode()
 				}
 			}}
+			customUi={customUi?.editorBar}
 			collabLive={wsProvider?.shouldConnect}
 			{collabMode}
 			{validCode}
@@ -253,23 +284,31 @@
 			on:collabPopup={() => (showCollabPopup = true)}
 			{editor}
 			{lang}
+			on:createScriptFromInlineScript
 			{websocketAlive}
 			collabUsers={peers}
 			kind={asKind(kind)}
-		/>
-		{#if !noSyncFromGithub}
+			{template}
+			{diffEditor}
+			{args}
+			{noHistory}
+			{saveToWorkspace}
+		>
+			<slot name="editor-bar-right" slot="right" />
+		</EditorBar>
+		{#if !noSyncFromGithub && customUi?.editorBar?.useVsCode != false}
 			<div class="py-1">
 				<Button
 					target="_blank"
-					href="https://github.com/windmill-labs/windmill/tree/main/cli"
+					href="https://www.windmill.dev/docs/cli_local_dev/vscode-extension"
 					color="light"
 					size="xs"
-					btnClasses="mr-1 hidden lg:block"
+					btnClasses="hidden lg:flex"
 					startIcon={{
-						icon: faGithub
+						icon: Github
 					}}
 				>
-					Sync from Github
+					Use VScode
 				</Button>
 			</div>
 		{/if}
@@ -278,9 +317,10 @@
 <SplitPanesWrapper>
 	<Splitpanes class="!overflow-visible">
 		<Pane size={60} minSize={10} class="!overflow-visible">
-			<div class="pl-2 h-full !overflow-visible">
+			<div class="pl-2 h-full !overflow-visible bg-gray-50 dark:bg-[#272D38]">
 				{#key lang}
 					<Editor
+						folding
 						{path}
 						bind:code
 						bind:websocketAlive
@@ -290,6 +330,7 @@
 						on:change={(e) => {
 							inferSchema(e.detail)
 						}}
+						on:saveDraft
 						cmdEnterAction={async () => {
 							await inferSchema(code)
 							runTest()
@@ -305,7 +346,16 @@
 						}}
 						class="flex flex-1 h-full !overflow-visible"
 						lang={scriptLangToEditorLang(lang)}
+						scriptLang={lang}
 						automaticLayout={true}
+						{fixedOverflowWidgets}
+						{args}
+					/>
+					<DiffEditor
+						class="h-full"
+						bind:this={diffEditor}
+						automaticLayout
+						defaultLang={scriptLangToEditorLang(lang)}
 						{fixedOverflowWidgets}
 					/>
 				{/key}
@@ -313,13 +363,21 @@
 		</Pane>
 		<Pane size={40} minSize={10}>
 			<div class="flex flex-col h-full">
+				{#if showTabs}
+					<div transition:slide={{ duration: 200 }}>
+						<Tabs bind:selected={selectedTab}>
+							<Tab value="main">Main</Tab>
+							<Tab value="preprocessor">Preprocessor</Tab>
+						</Tabs>
+					</div>
+				{/if}
 				<div class="flex justify-center pt-1">
 					{#if testIsLoading}
 						<Button on:click={testJobLoader?.cancelJob} btnClasses="w-full" color="red" size="xs">
 							<WindmillIcon
 								white={true}
 								class="mr-2 text-white"
-								height="20px"
+								height="16px"
 								width="20px"
 								spin="fast"
 							/>
@@ -334,15 +392,15 @@
 							btnClasses="w-full"
 							size="xs"
 							startIcon={{
-								icon: faPlay,
+								icon: Play,
 								classes: 'animate-none'
 							}}
+							shortCut={{ Icon: CornerDownLeft, hide: testIsLoading }}
 						>
 							{#if testIsLoading}
 								Running
 							{:else}
-								Test&nbsp;<Kbd small>{getModifierKey()}</Kbd>
-								<Kbd small><span class="text-lg font-bold">⏎</span></Kbd>
+								Test
 							{/if}
 						</Button>
 					{/if}
@@ -351,12 +409,42 @@
 					<Pane size={33}>
 						<div class="px-2">
 							<div class="break-words relative font-sans">
-								<SchemaForm compact {schema} bind:args bind:isValid />
+								<SchemaForm
+									helperScript={{
+										type: 'inline',
+										code,
+										//@ts-ignore
+										lang
+									}}
+									compact
+									{schema}
+									bind:args
+									bind:isValid
+									showSchemaExplorer
+								/>
 							</div>
 						</div>
 					</Pane>
 					<Pane size={67}>
-						<LogPanel {lang} previewJob={testJob} {pastPreviews} previewIsLoading={testIsLoading} />
+						<LogPanel
+							{lang}
+							previewJob={testJob}
+							{pastPreviews}
+							previewIsLoading={testIsLoading}
+							{editor}
+							{diffEditor}
+							{args}
+						>
+							{#if scriptProgress}
+								<!-- Put to the slot in logpanel -->
+								<JobProgressBar
+									job={testJob}
+									bind:scriptProgress
+									bind:reset={jobProgressReset}
+									compact={true}
+								/>
+							{/if}
+						</LogPanel>
 					</Pane>
 				</Splitpanes>
 			</div>

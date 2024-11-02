@@ -9,9 +9,10 @@
 	import { Button } from '../../../common'
 	import { findGridItem, initOutput } from '../../editor/appUtils'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import { concatCustomCss } from '../../utils'
+	import { initCss } from '../../utils'
 	import InputValue from '../helpers/InputValue.svelte'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
 
 	export let id: string
 	export let configuration: RichConfigurations
@@ -187,28 +188,34 @@
 		return value
 	}
 
-	$: css = concatCustomCss($app.css?.pdfcomponent, customCss)
+	let css = initCss($app.css?.pdfcomponent, customCss)
 </script>
 
-<InputValue {id} input={configuration.source} bind:value={source} />
-<InputValue {id} input={configuration.zoom} bind:value={zoom} />
+<InputValue key="source" {id} input={configuration.source} bind:value={source} />
+<InputValue key="zoom" {id} input={configuration.zoom} bind:value={zoom} />
+
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.pdfcomponent}
+	/>
+{/each}
 
 <InitializeComponent {id} />
 
 {#if render}
-	<div class="relative flex flex-col w-full h-full bg-gray-100">
+	<div class="relative flex flex-col w-full h-full bg-gray-100 component-wrapper">
 		{#if source && zoom}
 			{#if pages?.length}
 				<div
 					bind:clientWidth={controlsWidth}
 					bind:clientHeight={controlsHeight}
-					class="flex {$mode !== 'preview'
-						? 'w-[calc(100%-2px)] top-[1px]'
-						: 'w-full top-0'} {wideView
-						? 'justify-center gap-14'
-						: '!justify-between'} overflow-x-auto bg-white border mx-auto py-1"
+					class="flex flex-row w-full justify-between overflow-x-auto bg-surface border-b mx-auto py-1"
 				>
-					<div class="flex justify-start items-center px-2 text-gray-600 text-sm">
+					<div class="flex justify-start items-center px-2 text-secondary text-sm">
 						<Button
 							on:click={() => zoom && (zoom -= 10)}
 							disabled={!doc}
@@ -260,7 +267,7 @@
 							<ZoomIn size={16} />
 						</Button>
 					</div>
-					<div class="center-center px-2 text-gray-600 text-sm">
+					<div class="center-center px-2 text-secondary text-sm">
 						<input
 							on:input={({ currentTarget }) => {
 								scrollToPage(currentTarget.valueAsNumber)
@@ -276,28 +283,24 @@
 							/ {pages.length}
 						</span>
 					</div>
-					<div class="flex justify-end items-center px-2 text-gray-600 text-sm">
+					<div class="flex justify-end items-center px-2 text-secondary text-sm">
 						<Button
 							on:click={downloadPdf}
 							disabled={!doc}
 							size="xs"
 							color="light"
-							variant="border"
 							title="Download PDF"
 							aria-label="Download PDF"
 							btnClasses="!font-medium !px-2"
 						>
-							{#if wideView}
-								<span class="mr-1"> Download </span>
-							{/if}
-							<Download size={16} />
+							<Download size={14} />
 						</Button>
 					</div>
 				</div>
 			{:else}
 				<div
 					out:fade={{ duration: 200 }}
-					class="absolute inset-0 center-center flex-col text-center text-sm bg-white text-gray-600"
+					class="absolute inset-0 center-center flex-col text-center text-sm bg-surface text-secondary"
 				>
 					<Loader2 class="animate-spin mb-2" />
 					Loading PDF
@@ -306,7 +309,12 @@
 			<div
 				bind:this={wrapper}
 				on:scroll={throttledScroll}
-				class={twMerge('w-full h-full overflow-auto', css?.container?.class ?? '', 'bg-gray-100')}
+				class={twMerge(
+					'w-full h-full overflow-auto',
+					css?.container?.class ?? '',
+					'bg-gray-100',
+					'wm-pdf'
+				)}
 				style={css?.container?.style ?? ''}
 			/>
 		{/if}
@@ -322,7 +330,7 @@
 		{#if error}
 			<div
 				class="absolute inset-0 z-20 center-center
-		bg-gray-100 text-center text-gray-600 text-sm"
+		bg-gray-100 text-center text-secondary text-sm"
 			>
 				{error}
 			</div>

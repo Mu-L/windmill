@@ -4,7 +4,7 @@
 
 	let ips: string[] | undefined = undefined
 
-	WorkerService.listWorkers({}).then((workers) => {
+	WorkerService.listWorkers({ pingSince: 300 }).then((workers) => {
 		ips = [
 			...new Set(
 				workers
@@ -18,9 +18,9 @@
 </script>
 
 {#if ips}
-	<div class="mt-2" />
+	<div class="mt-4" />
 	<Alert size="xs" type="info" title="IPs to whitelist">
-		<span class="text-gray-600">If necessary, the workers IPs to whitelist are:</span>
+		<span class="text-tertiary">If necessary, the workers IPs to whitelist are:</span>
 		{ips.join(', ')}
 	</Alert>
 {/if}

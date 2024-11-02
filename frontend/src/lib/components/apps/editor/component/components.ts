@@ -38,19 +38,41 @@ import {
 	Split,
 	Download,
 	PanelLeft,
-	PanelTopInactive
+	PanelTopInactive,
+	ListIcon,
+	Heading1,
+	FileBarChart,
+	Menu,
+	Network,
+	Database,
+	UploadCloud,
+	AlertTriangle,
+	Clock,
+	CalendarClock,
+	AppWindow,
+	PanelTop,
+	RefreshCw
 } from 'lucide-svelte'
 import type {
 	Aligned,
 	BaseAppComponent,
 	ComponentCustomCSS,
 	GridItem,
+	OneOfConfiguration,
 	RichConfiguration,
+	RichConfigurations,
 	StaticRichConfigurations
 } from '../../types'
 import type { Size } from '../../svelte-grid/types'
 
-import type { AppInputSpec, ResultAppInput, StaticAppInput } from '../../inputType'
+import type {
+	AppInputSpec,
+	EvalV2AppInput,
+	InputConnectionEval,
+	ResultAppInput,
+	StaticAppInput,
+	TemplateV2AppInput
+} from '../../inputType'
 
 export type BaseComponent<T extends string> = {
 	type: T
@@ -60,19 +82,37 @@ export type RecomputeOthersSource = {
 	recomputeIds: string[] | undefined
 }
 
+export type CustomComponentConfig = {
+	name: string
+	additionalLibs?: {
+		reactVersion?: string
+	}
+}
 export type TextComponent = BaseComponent<'textcomponent'>
 export type TextInputComponent = BaseComponent<'textinputcomponent'>
+export type QuillComponent = BaseComponent<'quillcomponent'>
 export type TextareaInputComponent = BaseComponent<'textareainputcomponent'>
 export type PasswordInputComponent = BaseComponent<'passwordinputcomponent'>
 export type EmailInputComponent = BaseComponent<'emailinputcomponent'>
 export type DateInputComponent = BaseComponent<'dateinputcomponent'>
+export type TimeInputComponent = BaseComponent<'timeinputcomponent'>
+export type DateTimeInputComponent = BaseComponent<'datetimeinputcomponent'>
 export type NumberInputComponent = BaseComponent<'numberinputcomponent'>
 export type CurrencyComponent = BaseComponent<'currencycomponent'>
 export type SliderComponent = BaseComponent<'slidercomponent'>
+export type DateSliderComponent = BaseComponent<'dateslidercomponent'>
 export type RangeComponent = BaseComponent<'rangecomponent'>
 export type HtmlComponent = BaseComponent<'htmlcomponent'>
+export type CustomComponent = BaseComponent<'customcomponent'> & {
+	customComponent: CustomComponentConfig
+}
+export type MarkdownComponent = BaseComponent<'mardowncomponent'>
 export type VegaLiteComponent = BaseComponent<'vegalitecomponent'>
 export type PlotlyComponent = BaseComponent<'plotlycomponent'>
+export type PlotlyComponentV2 = BaseComponent<'plotlycomponentv2'> & {
+	xData: RichConfiguration | undefined
+	datasets: RichConfiguration | undefined
+}
 export type TimeseriesComponent = BaseComponent<'timeseriescomponent'>
 export type ButtonComponent = BaseComponent<'buttoncomponent'> & RecomputeOthersSource
 export type DownloadComponent = BaseComponent<'downloadcomponent'>
@@ -83,33 +123,100 @@ export type RunFormComponent = BaseComponent<'runformcomponent'>
 export type BarChartComponent = BaseComponent<'barchartcomponent'>
 export type PieChartComponent = BaseComponent<'piechartcomponent'>
 export type ChartJsComponent = BaseComponent<'chartjscomponent'>
+export type ChartJsComponentV2 = BaseComponent<'chartjscomponentv2'> & {
+	xData: RichConfiguration | undefined
+	datasets: RichConfiguration | undefined
+}
+
+export type AgChartsComponent = BaseComponent<'agchartscomponent'> & {
+	xData: RichConfiguration | undefined
+	datasets: RichConfiguration | undefined
+}
+
+export type AgChartsComponentEe = BaseComponent<'agchartscomponentee'> & {
+	license: string
+	xData: RichConfiguration | undefined
+	datasets: RichConfiguration | undefined
+}
 
 export type ScatterChartComponent = BaseComponent<'scatterchartcomponent'>
+
+export type TableAction = BaseAppComponent &
+	(ButtonComponent | CheckboxComponent | SelectComponent) &
+	GridItem
+
 export type TableComponent = BaseComponent<'tablecomponent'> & {
-	actionButtons: (BaseAppComponent & ButtonComponent & GridItem)[]
+	actionButtons: TableAction[]
 }
-export type AggridComponent = BaseComponent<'aggridcomponent'>
+export type AggridComponent = BaseComponent<'aggridcomponent'> & {
+	actions: TableAction[]
+	actionsOrder: RichConfiguration | undefined
+}
+export type AggridComponentEe = BaseComponent<'aggridcomponentee'> & {
+	license: string
+	actions: TableAction[]
+	actionsOrder: RichConfiguration | undefined
+}
+
+export type AggridInfiniteComponent = BaseComponent<'aggridinfinitecomponent'> & {
+	actions: TableAction[]
+	actionsOrder: RichConfiguration | undefined
+}
+
+export type AggridInfiniteComponentEe = BaseComponent<'aggridinfinitecomponentee'> & {
+	actions: TableAction[]
+	license: string
+	actionsOrder: RichConfiguration | undefined
+}
+
 export type DisplayComponent = BaseComponent<'displaycomponent'>
+export type JobIdDisplayComponent = BaseComponent<'jobiddisplaycomponent'>
 export type LogComponent = BaseComponent<'logcomponent'>
+export type JobIdLogComponent = BaseComponent<'jobidlogcomponent'>
 export type FlowStatusComponent = BaseComponent<'flowstatuscomponent'>
+export type JobIdFlowStatusComponent = BaseComponent<'jobidflowstatuscomponent'>
 export type ImageComponent = BaseComponent<'imagecomponent'>
 export type InputComponent = BaseComponent<'inputcomponent'>
-export type SelectComponent = BaseComponent<'selectcomponent'> & RecomputeOthersSource
+export type SelectComponent = BaseComponent<'selectcomponent'> &
+	RecomputeOthersSource & {
+		onSelect?: string[]
+	}
 export type ResourceSelectComponent = BaseComponent<'resourceselectcomponent'> &
-	RecomputeOthersSource
+	RecomputeOthersSource & {
+		onSelect?: string[]
+	}
+export type ResourceConnectComponent = BaseComponent<'userresourcecomponent'> &
+	RecomputeOthersSource & {
+		onSelect?: string[]
+	}
 export type MultiSelectComponent = BaseComponent<'multiselectcomponent'>
-export type CheckboxComponent = BaseComponent<'checkboxcomponent'> & RecomputeOthersSource
+export type MultiSelectComponentV2 = BaseComponent<'multiselectcomponentv2'>
+export type CheckboxComponent = BaseComponent<'checkboxcomponent'> &
+	RecomputeOthersSource & {
+		onToggle?: string[]
+	}
 export type RadioComponent = BaseComponent<'radiocomponent'>
 export type IconComponent = BaseComponent<'iconcomponent'>
 export type HorizontalDividerComponent = BaseComponent<'horizontaldividercomponent'>
 export type VerticalDividerComponent = BaseComponent<'verticaldividercomponent'>
-export type FileInputComponent = BaseComponent<'fileinputcomponent'>
+export type FileInputComponent = BaseComponent<'fileinputcomponent'> & {
+	onFileChange?: string[]
+}
 export type TabsComponent = BaseComponent<'tabscomponent'> & {
 	tabs: string[]
 	disabledTabs: RichConfiguration[]
+	onTabChange?: string[]
 }
-export type ContainerComponent = BaseComponent<'containercomponent'>
-export type DrawerComponent = BaseComponent<'drawercomponent'>
+
+export type ListComponent = BaseComponent<'listcomponent'>
+export type ContainerComponent = BaseComponent<'containercomponent'> & {
+	groupFields: RichConfigurations
+}
+export type DrawerComponent = BaseComponent<'drawercomponent'> & {
+	onOpenRecomputeIds: string[] | undefined
+	onCloseRecomputeIds: string[] | undefined
+}
+
 export type MapComponent = BaseComponent<'mapcomponent'>
 export type VerticalSplitPanesComponent = BaseComponent<'verticalsplitpanescomponent'> & {
 	panes: number[]
@@ -118,23 +225,82 @@ export type HorizontalSplitPanesComponent = BaseComponent<'horizontalsplitpanesc
 	panes: number[]
 }
 export type PdfComponent = BaseComponent<'pdfcomponent'>
-export type ModalComponent = BaseComponent<'modalcomponent'>
+export type ModalComponent = BaseComponent<'modalcomponent'> & {
+	onOpenRecomputeIds: string[] | undefined
+	onCloseRecomputeIds: string[] | undefined
+}
 export type StepperComponent = BaseComponent<'steppercomponent'> & {
 	tabs: string[]
+	onNext?: string[]
+	onPrevious?: string[]
 }
 export type ConditionalWrapperComponent = BaseComponent<'conditionalwrapper'> & {
 	conditions: RichConfiguration[]
+	onTabChange?: string[]
 }
 
 export type Schemaformcomponent = BaseComponent<'schemaformcomponent'>
 export type SelectTabComponent = BaseComponent<'selecttabcomponent'>
 export type SelectStepComponent = BaseComponent<'selectstepcomponent'>
 
+export type CarouselListComponent = BaseComponent<'carousellistcomponent'>
+export type StatisticCardComponent = BaseComponent<'statcomponent'>
+export type MenuComponent = BaseComponent<'menucomponent'> & {
+	menuItems: (BaseAppComponent & ButtonComponent & GridItem)[]
+}
+
+export type DBExplorerComponent = BaseComponent<'dbexplorercomponent'> & {
+	columns: RichConfiguration
+	actions: TableAction[]
+	actionsOrder: RichConfiguration | undefined
+}
+
+export type S3FileInputComponent = BaseComponent<'s3fileinputcomponent'> & {
+	onFileChange?: string[]
+}
+
+export type DecisionTreeNode = {
+	id: string
+	label: string
+	allowed: RichConfiguration | undefined
+	next: Array<{
+		id: string
+		condition?: RichConfiguration | undefined
+	}>
+}
+
+export type DecisionTreeComponent = BaseComponent<'decisiontreecomponent'> & {
+	nodes: DecisionTreeNode[]
+}
+
+export type AlertComponent = BaseComponent<'alertcomponent'>
+
+export type NavbarItem = {
+	path: OneOfConfiguration
+	label: RichConfiguration
+	caption?: string
+	disabled: RichConfiguration
+	hidden: RichConfiguration
+	icon?: string
+}
+
+export type NavBarComponent = BaseComponent<'navbarcomponent'> & {
+	navbarItems: NavbarItem[]
+}
+
+export type DateSelectComponent = BaseComponent<'dateselectcomponent'>
+
+export type RecomputeAllComponent = BaseComponent<'recomputeallcomponent'>
+
 export type TypedComponent =
+	| DBExplorerComponent
 	| DisplayComponent
 	| LogComponent
+	| JobIdLogComponent
 	| FlowStatusComponent
+	| JobIdFlowStatusComponent
 	| TextInputComponent
+	| QuillComponent
 	| TextareaInputComponent
 	| PasswordInputComponent
 	| EmailInputComponent
@@ -146,6 +312,8 @@ export type TypedComponent =
 	| BarChartComponent
 	| TimeseriesComponent
 	| HtmlComponent
+	| CustomComponent
+	| MarkdownComponent
 	| TableComponent
 	| TextComponent
 	| ButtonComponent
@@ -161,12 +329,14 @@ export type TypedComponent =
 	| PlotlyComponent
 	| TabsComponent
 	| ContainerComponent
+	| ListComponent
 	| IconComponent
 	| HorizontalDividerComponent
 	| VerticalDividerComponent
 	| FileInputComponent
 	| ImageComponent
 	| AggridComponent
+	| AggridComponentEe
 	| DrawerComponent
 	| MapComponent
 	| VerticalSplitPanesComponent
@@ -180,6 +350,27 @@ export type TypedComponent =
 	| SelectStepComponent
 	| DownloadComponent
 	| ChartJsComponent
+	| CarouselListComponent
+	| PlotlyComponentV2
+	| ChartJsComponentV2
+	| StatisticCardComponent
+	| MenuComponent
+	| DecisionTreeComponent
+	| S3FileInputComponent
+	| AgChartsComponent
+	| AgChartsComponentEe
+	| AlertComponent
+	| DateSliderComponent
+	| TimeInputComponent
+	| DateTimeInputComponent
+	| AggridInfiniteComponent
+	| AggridInfiniteComponentEe
+	| MultiSelectComponentV2
+	| NavBarComponent
+	| DateSelectComponent
+	| JobIdDisplayComponent
+	| RecomputeAllComponent
+	| ResourceConnectComponent
 
 export type AppComponent = BaseAppComponent & TypedComponent
 
@@ -192,13 +383,27 @@ export function getRecommendedDimensionsByComponent(
 	componentType: AppComponent['type'],
 	column: number
 ): Size {
-	const size = components[componentType].dims.split('-')[column === 3 ? 0 : 1].split(':')
+	return processDimension(components[componentType].dims, column)
+}
+
+export function processDimension(
+	dimension: AppComponentDimensions | undefined,
+	column: number
+): Size {
+	if (!dimension) {
+		return { w: 1, h: 1 }
+	}
+
+	const size = dimension.split('-')[column === 3 ? 0 : 1].split(':')
 	return { w: +size[0], h: +size[1] }
 }
 
+export type Quickstyle = { quickCss?: string[]; quickTailwindClasses?: string[] }
 export type AppComponentConfig<T extends TypedComponent['type']> = {
 	name: string
 	icon: any
+	documentationLink: string
+	quickstyle?: Record<string, Quickstyle>
 	/**
 	 * Dimensions key formula:
 	 * [**mobile width**]:[**mobile height**]-[**desktop width**]:[**desktop height**]
@@ -219,18 +424,22 @@ export type PresetComponentConfig = {
 	targetComponent: keyof typeof components
 	configuration: object
 	type: string
+	dims?: AppComponentDimensions
 }
 
 export interface InitialAppComponent extends Partial<Aligned> {
-	componentInput?: StaticAppInput | ResultAppInput | undefined
+	componentInput?: StaticAppInput | ResultAppInput | EvalV2AppInput | TemplateV2AppInput | undefined
 	configuration: StaticRichConfigurations
 	// Number of subgrids
 	numberOfSubgrids?: number
 	recomputeIds?: boolean
 	actionButtons?: boolean
+	actions?: boolean
+	menuItems?: boolean
 	tabs?: string[]
 	panes?: number[]
 	conditions?: AppInputSpec<'boolean', boolean>[]
+	nodes?: DecisionTreeNode[]
 }
 
 const buttonColorOptions = [...BUTTON_COLORS]
@@ -267,7 +476,15 @@ export const selectOptions = {
 		'polarArea',
 		'radar',
 		'scatter'
-	] as ChartType[]
+	] as ChartType[],
+	animationTimingFunctionOptions: ['linear', 'ease', 'ease-in', 'ease-out', 'ease-in-out'],
+	prose: ['sm', 'Default', 'lg', 'xl', '2xl'],
+	imageSourceKind: [
+		'url',
+		'png encoded as base64',
+		'jpeg encoded as base64',
+		'svg encoded as base64'
+	]
 }
 const labels = {
 	none: 'Do nothing',
@@ -275,7 +492,12 @@ const labels = {
 	gotoUrl: 'Go to an url',
 	setTab: 'Set the tab of a tabs component',
 	sendToast: 'Display a toast notification',
-	sendErrorToast: 'Display an error toast notification'
+	sendErrorToast: 'Display an error toast notification',
+	open: 'Open a modal or a drawer',
+	close: 'Close a modal or a drawer',
+	openModal: 'Open a modal (deprecated)',
+	closeModal: 'Close a modal (deprecated)',
+	clearFiles: 'Clear files from a S3 file input'
 }
 
 const onSuccessClick = {
@@ -291,7 +513,8 @@ const onSuccessClick = {
 				fieldType: 'text',
 				type: 'static',
 				value: '',
-				placeholder: '/apps/get/foo'
+				placeholder: '/apps/get/foo',
+				onDemandOnly: true
 			},
 			newTab: {
 				tooltip: 'Open the url in a new tab',
@@ -306,17 +529,60 @@ const onSuccessClick = {
 				value: [] as Array<{ id: string; index: number }>,
 				fieldType: 'array',
 				subFieldType: 'tab-select',
-				tooltip: 'Set the tabs id and index to go to on success'
+				tooltip: 'Set the tabs id and index to go to on success',
+				onDemandOnly: true
 			}
 		},
 		sendToast: {
 			message: {
-				tooltip: 'The message of the toast to diplay',
+				tooltip: 'The message of the toast to display',
 				fieldType: 'text',
 				type: 'static',
 				value: '',
 				placeholder: 'Hello there',
-				noVariablePicker: true
+				onDemandOnly: true
+			}
+		},
+		openModal: {
+			modalId: {
+				tooltip: 'The id of the modal to open',
+				fieldType: 'text',
+				type: 'static',
+				value: '',
+				deprecated: true
+			}
+		},
+		closeModal: {
+			modalId: {
+				tooltip: 'The id of the modal to close',
+				fieldType: 'text',
+				type: 'static',
+				value: '',
+				deprecated: true
+			}
+		},
+		open: {
+			id: {
+				tooltip: 'The id of the modal or the drawer to open',
+				fieldType: 'text',
+				type: 'static',
+				value: ''
+			}
+		},
+		close: {
+			id: {
+				tooltip: 'The id of the modal or the drawer to close',
+				fieldType: 'text',
+				type: 'static',
+				value: ''
+			}
+		},
+		clearFiles: {
+			id: {
+				tooltip: 'The id of s3 file input to clear',
+				fieldType: 'text',
+				type: 'static',
+				value: ''
 			}
 		}
 	}
@@ -335,7 +601,8 @@ const onErrorClick = {
 				fieldType: 'text',
 				type: 'static',
 				value: '',
-				placeholder: '/apps/get/foo'
+				placeholder: '/apps/get/foo',
+				onDemandOnly: true
 			},
 			newTab: {
 				tooltip: 'Open the url in a new tab',
@@ -350,22 +617,42 @@ const onErrorClick = {
 				value: [] as Array<{ id: string; index: number }>,
 				fieldType: 'array',
 				subFieldType: 'tab-select',
-				tooltip: 'Set the tabs id and index to go to on error'
+				tooltip: 'Set the tabs id and index to go to on error',
+				onDemandOnly: true
 			}
 		},
 		sendErrorToast: {
 			message: {
-				tooltip: 'The message of the toast to diplay',
+				tooltip: 'The message of the toast to display',
 				fieldType: 'text',
 				type: 'static',
-				value: '',
-				placeholder: 'Hello there'
+				value: 'An error occured',
+				placeholder: 'Hello there',
+				onDemandOnly: true
 			},
 			appendError: {
 				tooltip: 'Append the error message to the toast',
 				fieldType: 'boolean',
 				type: 'static',
 				value: true
+			}
+		},
+		open: {
+			id: {
+				tooltip: 'The id of the modal or the drawer to open',
+				fieldType: 'text',
+				type: 'static',
+				value: '',
+				noVariablePicker: true
+			}
+		},
+		close: {
+			id: {
+				tooltip: 'The id of the modal or the drawer to close',
+				fieldType: 'text',
+				type: 'static',
+				value: '',
+				noVariablePicker: true
 			}
 		}
 	}
@@ -375,16 +662,18 @@ const paginationOneOf = {
 	type: 'oneOf',
 	selected: 'auto',
 	labels: {
-		auto: 'Auto',
-		manual: 'Manual'
+		auto: 'Managed by component',
+		manual: 'Managed by runnable'
 	},
+	tooltip:
+		'Pagination can be managed using two methods: By the component: Based on a specified page size, the component divides the array into several pages. By the runnable: The component shows all items, leaving the task of pagination to the runnable. The current page number is available in the component outputs.',
 	configuration: {
 		auto: {
 			pageSize: {
 				type: 'static',
 				fieldType: 'number',
 				value: 20,
-				onlyStatic: true,
+
 				tooltip: 'Number of rows per page'
 			}
 		},
@@ -399,10 +688,237 @@ const paginationOneOf = {
 	}
 } as const
 
+const documentationBaseUrl = 'https://www.windmill.dev/docs/apps/app_configuration_settings'
+
+const aggridcomponentconst = {
+	name: 'AgGrid Table',
+	icon: Table2,
+	documentationLink: `${documentationBaseUrl}/aggrid_table`,
+	dims: '3:10-6:10' as AppComponentDimensions,
+	customCss: {
+		container: { class: '', style: '' }
+	},
+	initialData: {
+		configuration: {
+			columnDefs: {
+				type: 'static',
+				fieldType: 'array',
+				subFieldType: 'ag-grid',
+				value: [
+					{ field: 'id', flex: 1 },
+					{ field: 'name', editable: true, flex: 1 },
+					{ field: 'age', flex: 1 }
+				]
+			} as StaticAppInput,
+			flex: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true,
+
+				tooltip: 'default col flex is 1 (see ag-grid docs)'
+			},
+			allEditable: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+				hide: true,
+				tooltip: 'Configure all columns as Editable by users'
+			},
+			multipleSelectable: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+
+				tooltip: 'Make multiple rows selectable at once'
+			},
+			rowMultiselectWithClick: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true,
+
+				tooltip: 'If multiple selectable, allow multiselect with click'
+			},
+			pagination: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false as boolean | undefined
+			},
+			selectFirstRowByDefault: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true as boolean,
+				tooltip: 'Select the first row by default on start'
+			},
+			extraConfig: {
+				type: 'static',
+				fieldType: 'object',
+				value: {},
+				tooltip: 'any configuration that can be passed to ag-grid top level'
+			},
+			compactness: {
+				type: 'static',
+				fieldType: 'select',
+				value: 'normal',
+				selectOptions: ['normal', 'compact', 'comfortable'],
+				tooltip: 'Change the row height'
+			},
+			wrapActions: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+				tooltip:
+					'When true, actions will wrap to the next line. Otherwise, the column will grow to fit the actions.'
+			},
+			footer: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true,
+				tooltip: 'Allow visible footer for pagination and download'
+			},
+			customActionsHeader: {
+				type: 'static',
+				fieldType: 'text',
+				value: undefined,
+				tooltip: 'Custom header for the actions columns'
+			}
+		},
+		componentInput: {
+			type: 'static',
+			fieldType: 'array',
+			subFieldType: 'object',
+			value: [
+				{
+					id: 1,
+					name: 'A cell with a long name',
+					age: 42
+				},
+				{
+					id: 2,
+					name: 'A briefer cell',
+					age: 84
+				}
+			]
+		} as StaticAppInput
+	}
+} as const
+
+const aggridinfinitecomponentconst = {
+	name: 'AgGrid Infinite Table',
+	icon: Table2,
+	documentationLink: `${documentationBaseUrl}/aggrid_table#aggrid-infinite-table`,
+	dims: '3:10-6:10' as AppComponentDimensions,
+	customCss: {
+		container: { class: '', style: '' }
+	},
+	initialData: {
+		configuration: {
+			columnDefs: {
+				type: 'static',
+				fieldType: 'array',
+				subFieldType: 'ag-grid',
+				value: []
+			} as StaticAppInput,
+			flex: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true,
+				tooltip: 'default col flex is 1 (see ag-grid docs)'
+			},
+			allEditable: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+				hide: true,
+				tooltip: 'Configure all columns as Editable by users'
+			},
+			multipleSelectable: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+
+				tooltip: 'Make multiple rows selectable at once'
+			},
+			rowMultiselectWithClick: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true,
+
+				tooltip: 'If multiple selectable, allow multiselect with click'
+			},
+
+			selectFirstRowByDefault: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true as boolean,
+				tooltip: 'Select the first row by default on start'
+			},
+			extraConfig: {
+				type: 'static',
+				fieldType: 'object',
+				value: {},
+				tooltip: 'any configuration that can be passed to ag-grid top level'
+			},
+			compactness: {
+				type: 'static',
+				fieldType: 'select',
+				value: 'normal',
+				selectOptions: ['normal', 'compact', 'comfortable'],
+				tooltip: 'Change the row height'
+			},
+			wrapActions: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+				tooltip:
+					'When true, actions will wrap to the next line. Otherwise, the column will grow to fit the actions.'
+			},
+			searchEnabled: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: false,
+				tooltip: 'Enable search in the table'
+			},
+			footer: {
+				type: 'static',
+				fieldType: 'boolean',
+				value: true,
+				tooltip: 'Allow visible footer for pagination and download'
+			},
+			customActionsHeader: {
+				type: 'static',
+				fieldType: 'text',
+				value: undefined,
+				tooltip: 'Custom header for the actions columns'
+			}
+		},
+		componentInput: {
+			type: 'runnable',
+			fieldType: 'any',
+			fields: {},
+			runnable: undefined
+		}
+	}
+} as const
+
+const agchartscomponentconst = {
+	name: 'AgCharts',
+	icon: BarChart4,
+	documentationLink: `${documentationBaseUrl}/agcharts`,
+	dims: '2:8-6:8' as AppComponentDimensions,
+	customCss: {
+		container: { class: '', style: '' }
+	},
+	initialData: {
+		configuration: {},
+		componentInput: undefined
+	}
+} as const
+
 export const components = {
 	displaycomponent: {
 		name: 'Rich Result',
 		icon: Monitor,
+		documentationLink: `${documentationBaseUrl}/rich_result`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			header: { class: '', style: '' },
@@ -414,12 +930,46 @@ export const components = {
 				fieldType: 'object',
 				value: { foo: 42 }
 			},
-			configuration: {}
+			configuration: {
+				title: {
+					type: 'static',
+					fieldType: 'text',
+					value: 'Result'
+				},
+				hideDetails: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					tooltip:
+						'Hide the details section: the object keys, the clipboard button and the maximise button'
+				}
+			}
+		}
+	},
+	jobidlogcomponent: {
+		name: 'Log by Job Id',
+		icon: Monitor,
+		documentationLink: `${documentationBaseUrl}/log_display`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			header: { class: '', style: '' },
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				jobId: {
+					type: 'static',
+					fieldType: 'text',
+					value: '',
+					tooltip: 'Job id to display logs from'
+				}
+			}
 		}
 	},
 	logcomponent: {
 		name: 'Log',
 		icon: Monitor,
+		documentationLink: `${documentationBaseUrl}/log_display`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			header: { class: '', style: '' },
@@ -438,6 +988,7 @@ export const components = {
 	flowstatuscomponent: {
 		name: 'Flow Status',
 		icon: Monitor,
+		documentationLink: `${documentationBaseUrl}/flow_status`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			header: { class: '', style: '' },
@@ -453,11 +1004,31 @@ export const components = {
 			}
 		}
 	},
+	jobidflowstatuscomponent: {
+		name: 'Flow Status by Job Id',
+		icon: Monitor,
+		documentationLink: `${documentationBaseUrl}/flow_status`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			header: { class: '', style: '' },
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				jobId: {
+					type: 'static',
+					fieldType: 'text',
+					value: '',
+					tooltip: 'Job id to display status from'
+				}
+			}
+		}
+	},
 	containercomponent: {
 		name: 'Container',
 		icon: BoxSelect,
+		documentationLink: `${documentationBaseUrl}/container`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {
 			container: { class: '', style: '' }
 		},
@@ -467,43 +1038,135 @@ export const components = {
 			numberOfSubgrids: 1
 		}
 	},
+	listcomponent: {
+		name: 'List',
+		icon: ListIcon,
+		documentationLink: `${documentationBaseUrl}/list`,
+		dims: '3:8-12:8' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				width: {
+					type: 'oneOf',
+					selected: 'card',
+					labels: {
+						card: 'Card',
+						row: 'Full Row'
+					},
+					configuration: {
+						card: {
+							minWidthPx: {
+								type: 'static',
+								fieldType: 'number',
+								value: 300,
+								tooltip: 'Min Width in pixels'
+							}
+						},
+						row: {}
+					}
+				} as const,
+				heightPx: {
+					type: 'static',
+					fieldType: 'number',
+					value: undefined,
+					tooltip: 'Height in pixels'
+				},
+
+				pagination: {
+					type: 'oneOf',
+					selected: 'auto',
+					labels: {
+						auto: 'Managed by component',
+						manual: 'Managed by runnable'
+					},
+					tooltip:
+						'Pagination can be managed using two methods: By the component: Based on a specified page size, the component divides the array into several pages. By the runnable: The component shows all items, leaving the task of pagination to the runnable. The current page number is available in the component outputs.',
+					configuration: {
+						manual: {
+							pageCount: {
+								type: 'static',
+								fieldType: 'number',
+								value: -1,
+								tooltip: 'Number of pages (-1 if you do not know)'
+							}
+						},
+						auto: {
+							pageSize: {
+								type: 'static',
+								fieldType: 'number',
+								value: 20,
+								tooltip: 'Number of items per page'
+							}
+						}
+					}
+				} as const,
+				displayBorders: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: true,
+					tooltip: 'Display borders between items'
+				}
+			},
+			componentInput: {
+				type: 'static',
+				fieldType: 'array',
+				subFieldType: 'object',
+				value: [{ foo: 1 }, { foo: 2 }, { foo: 3 }] as object[]
+			},
+			numberOfSubgrids: 1
+		}
+	},
 	textcomponent: {
 		name: 'Text',
 		icon: Type,
 		dims: '1:1-3:1' as AppComponentDimensions,
-
+		documentationLink: `${documentationBaseUrl}/text`,
 		customCss: {
-			text: { class: '', style: '' }
+			text: { class: '', style: '' },
+			container: { class: '', style: '' }
 		},
 		initialData: {
 			horizontalAlignment: 'left',
 			verticalAlignment: 'top',
 
 			componentInput: {
-				type: 'static',
+				type: 'templatev2',
 				fieldType: 'template',
-				value: 'Hello ${ctx.username}'
+				eval: 'Hello ${ctx.username}',
+				connections: [
+					{
+						id: 'username',
+						componentId: 'ctx'
+					}
+				] as InputConnectionEval[]
 			},
 			configuration: {
 				style: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.textStyleOptions,
 					value: 'Body' as 'Title' | 'Subtitle' | 'Body' | 'Label' | 'Caption'
 				},
 				copyButton: {
 					type: 'static',
 					value: false,
-					fieldType: 'boolean',
-					onlyStatic: true
+					fieldType: 'boolean'
 				},
 				tooltip: {
 					type: 'static',
 					value: '',
 					fieldType: 'text',
-					onlyStatic: true,
+
 					tooltip: 'Tooltip text if not empty'
+				},
+				disableNoText: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean',
+					tooltip: 'Remove the "No text" placeholder'
 				}
 			}
 		}
@@ -512,7 +1175,7 @@ export const components = {
 		name: 'Button',
 		icon: Inspect,
 		dims: '1:1-2:1' as AppComponentDimensions,
-
+		documentationLink: `${documentationBaseUrl}/button`,
 		customCss: {
 			button: { style: '', class: '' },
 			container: { style: '', class: '' }
@@ -537,19 +1200,19 @@ export const components = {
 					type: 'static',
 					selectOptions: selectOptions.buttonColorOptions,
 					value: 'blue',
-					tooltip: 'Theses presets can be overwritten with custom styles.'
+					tooltip: 'These presets can be overwritten with custom styles.'
 				},
 				size: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.buttonSizeOptions,
 					value: 'xs'
 				},
 				fillContainer: {
 					fieldType: 'boolean',
 					type: 'static',
-					onlyStatic: true,
+
 					value: false,
 					tooltip:
 						'This will make the button fill the container width and height. Height and width can be overwritten with custom styles.'
@@ -562,31 +1225,62 @@ export const components = {
 				beforeIcon: {
 					type: 'static',
 					value: undefined,
-					fieldType: 'icon-select',
-					onlyStatic: true
+					fieldType: 'icon-select'
 				},
 				afterIcon: {
 					type: 'static',
 					value: undefined,
-					fieldType: 'icon-select',
-					onlyStatic: true
+					fieldType: 'icon-select'
 				},
 				triggerOnAppLoad: {
 					type: 'static',
 					value: false,
-					fieldType: 'boolean',
-					onlyStatic: true
+					fieldType: 'boolean'
 				},
+
 				onSuccess: onSuccessClick,
-				onError: onErrorClick
+				onError: onErrorClick,
+				confirmationModal: {
+					type: 'oneOf',
+					selected: 'none',
+					tooltip: 'If defined, the user will be asked to confirm the action in a modal.',
+					labels: {
+						none: 'Do nothing',
+						confirmationModal: 'Show confirmation modal'
+					},
+					configuration: {
+						none: {},
+						confirmationModal: {
+							title: {
+								fieldType: 'text',
+								type: 'static',
+								value: 'Title',
+								placeholder: 'Confirmation modal title'
+							},
+							description: {
+								fieldType: 'text',
+								type: 'static',
+								value: 'Are you sure?',
+								placeholder: 'Are you sure?'
+							},
+							confirmationText: {
+								fieldType: 'text',
+								type: 'static',
+								value: 'Confirm',
+								placeholder: 'Confirm',
+								tooltip: 'The text of the button that confirms the action.'
+							}
+						}
+					}
+				}
 			}
 		}
 	},
 	downloadcomponent: {
 		name: 'Download Button',
 		icon: Download,
+		documentationLink: `${documentationBaseUrl}/download_button`,
 		dims: '1:1-2:1' as AppComponentDimensions,
-
 		customCss: {
 			button: { style: '', class: '' }
 		},
@@ -601,7 +1295,7 @@ export const components = {
 						accept: '*',
 						convertTo: 'base64'
 					},
-					placeholder: 'Enter URL or upload file'
+					placeholder: 'Enter URL or upload file (base64)'
 				},
 				filename: {
 					type: 'static',
@@ -622,34 +1316,33 @@ export const components = {
 				size: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.buttonSizeOptions,
 					value: 'xs'
 				},
 				fillContainer: {
 					fieldType: 'boolean',
 					type: 'static',
-					onlyStatic: true,
+
 					value: false
 				},
 				beforeIcon: {
 					type: 'static',
 					value: undefined,
-					fieldType: 'icon-select',
-					onlyStatic: true
+					fieldType: 'icon-select'
 				},
 				afterIcon: {
 					type: 'static',
 					value: undefined,
-					fieldType: 'icon-select',
-					onlyStatic: true
+					fieldType: 'icon-select'
 				}
 			}
 		}
 	},
 	formcomponent: {
-		name: 'Submit form',
+		name: 'Submit Form',
 		icon: FormInput,
+		documentationLink: `${documentationBaseUrl}/submit_form`,
 		dims: '3:5-6:5' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' },
@@ -680,7 +1373,7 @@ export const components = {
 					fieldType: 'select',
 					type: 'static',
 					value: 'xs',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.buttonSizeOptions
 				},
 				onSuccess: onSuccessClick,
@@ -691,6 +1384,7 @@ export const components = {
 	formbuttoncomponent: {
 		name: 'Modal Form',
 		icon: PlusSquare,
+		documentationLink: `${documentationBaseUrl}/modal_form`,
 		dims: '1:1-2:1' as AppComponentDimensions,
 		customCss: {
 			button: { class: '', style: '' },
@@ -707,6 +1401,11 @@ export const components = {
 			},
 			recomputeIds: true,
 			configuration: {
+				modalTitle: {
+					type: 'static',
+					fieldType: 'text',
+					value: 'Modal title'
+				},
 				label: {
 					type: 'static',
 					value: 'Open popup',
@@ -717,13 +1416,13 @@ export const components = {
 					type: 'static',
 					value: 'dark',
 					selectOptions: buttonColorOptions,
-					tooltip: 'Theses presets can be overwritten with custom styles.'
+					tooltip: 'These presets can be overwritten with custom styles.'
 				},
 				size: {
 					fieldType: 'select',
 					type: 'static',
 					value: 'xs',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.buttonSizeOptions
 				},
 				onSuccess: onSuccessClick,
@@ -739,6 +1438,7 @@ export const components = {
 	piechartcomponent: {
 		name: 'Pie Chart',
 		icon: PieChart,
+		documentationLink: `${documentationBaseUrl}/pie_chart`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -747,14 +1447,14 @@ export const components = {
 			configuration: {
 				theme: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'select',
 					selectOptions: selectOptions.chartThemeOptions,
 					value: 'theme1'
 				},
 				doughnutStyle: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				}
@@ -769,6 +1469,7 @@ export const components = {
 	chartjscomponent: {
 		name: 'ChartJs',
 		icon: PieChart,
+		documentationLink: `${documentationBaseUrl}/chartjs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -777,10 +1478,16 @@ export const components = {
 			configuration: {
 				type: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'select',
 					selectOptions: selectOptions.chartTypeOptions,
 					value: 'pie'
+				},
+				options: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip: 'ChartJs options object https://www.chartjs.org/docs/latest/general/options.html'
 				}
 			},
 			componentInput: {
@@ -798,9 +1505,37 @@ export const components = {
 			}
 		}
 	},
+	chartjscomponentv2: {
+		name: 'ChartJs',
+		icon: PieChart,
+		documentationLink: `${documentationBaseUrl}/chartjs`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				type: {
+					type: 'static',
+
+					fieldType: 'select',
+					selectOptions: selectOptions.chartTypeOptions,
+					value: 'pie'
+				},
+				options: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip: 'ChartJs options object https://www.chartjs.org/docs/latest/general/options.html'
+				}
+			},
+			componentInput: undefined
+		}
+	},
 	barchartcomponent: {
 		name: 'Bar/Line Chart',
 		icon: BarChart4,
+		documentationLink: `${documentationBaseUrl}/bar_line_chart`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -809,14 +1544,13 @@ export const components = {
 			configuration: {
 				theme: {
 					type: 'static',
-					onlyStatic: true,
 					fieldType: 'select',
 					selectOptions: selectOptions.chartThemeOptions,
 					value: 'theme1'
 				},
 				line: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				}
@@ -828,33 +1562,91 @@ export const components = {
 			}
 		}
 	},
+
+	agchartscomponent: agchartscomponentconst,
+	agchartscomponentee: { ...agchartscomponentconst, name: 'AgCharts EE' },
 	htmlcomponent: {
 		name: 'HTML',
 		icon: Code2,
+		documentationLink: `${documentationBaseUrl}/html`,
 		dims: '1:2-1:2' as AppComponentDimensions,
-
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			componentInput: {
+				type: 'templatev2',
+				fieldType: 'template',
+				eval: `<img
+src="https://images.unsplash.com/photo-1554629947-334ff61d85dc?ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&amp;ixlib=rb-1.2.1&amp;auto=format&amp;fit=crop&amp;w=1024&amp;h=1280&amp;q=80"
+>
+<h1 class="absolute top-4 left-2 text-white">
+Hello \${ctx.username}
+</h1>`,
+				connections: [
+					{
+						id: 'username',
+						componentId: 'ctx'
+					}
+				] as InputConnectionEval[]
+			},
+			configuration: {}
+		}
+	},
+	customcomponent: {
+		name: 'Custom',
+		icon: Code2,
+		documentationLink: `https://www.windmill.dev/docs/apps/react_components`,
+		dims: '1:2-1:2' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
 		},
 		initialData: {
 			componentInput: {
 				type: 'static',
-				fieldType: 'template',
-				value: `<img
-src="https://images.unsplash.com/photo-1554629947-334ff61d85dc?ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&amp;ixlib=rb-1.2.1&amp;auto=format&amp;fit=crop&amp;w=1024&amp;h=1280&amp;q=80"
->
-<h1 class="absolute top-4 left-2 text-white">
-Hello \${ctx.username}
-</h1>`
+				fieldType: 'object',
+				value: {}
 			},
 			configuration: {}
+		}
+	},
+	mardowncomponent: {
+		name: 'Markdown',
+		icon: Heading1,
+		documentationLink: `${documentationBaseUrl}/html`,
+		dims: '1:2-4:4' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			componentInput: {
+				type: 'templatev2',
+				fieldType: 'template',
+				eval: `# This is a header
+## This is a subheader				
+This is a paragraph.
+				
+* This is a list
+* With two items`,
+				connections: [] as InputConnectionEval[]
+			},
+			configuration: {
+				size: {
+					fieldType: 'select',
+					type: 'static',
+					selectOptions: selectOptions.prose,
+					value: 'Default',
+
+					tooltip: 'See Tailwind documentation: https://tailwindcss.com/docs/typography-plugin'
+				}
+			}
 		}
 	},
 	vegalitecomponent: {
 		name: 'Vega Lite',
 		icon: PieChart,
+		documentationLink: `${documentationBaseUrl}/vega_lite`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {},
 		initialData: {
 			componentInput: {
@@ -879,7 +1671,7 @@ Hello \${ctx.username}
 			configuration: {
 				canvas: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false,
 					tooltip: 'Use the canvas renderer instead of the svg one for more interactive plots'
@@ -890,8 +1682,8 @@ Hello \${ctx.username}
 	plotlycomponent: {
 		name: 'Plotly',
 		icon: PieChart,
+		documentationLink: `${documentationBaseUrl}/plotly`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {},
 		initialData: {
 			componentInput: {
@@ -915,8 +1707,26 @@ Hello \${ctx.username}
 					fieldType: 'object',
 					value: {},
 					tooltip:
-						'Layout options for the plot. See https://plotly.com/javascript/reference/layout/ for more information',
-					onlyStatic: true
+						'Layout options for the plot. See https://plotly.com/javascript/reference/layout/ for more information'
+				}
+			}
+		}
+	},
+	plotlycomponentv2: {
+		name: 'Plotly',
+		icon: PieChart,
+		documentationLink: `${documentationBaseUrl}/plotly`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {},
+		initialData: {
+			componentInput: undefined,
+			configuration: {
+				layout: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip:
+						'Layout options for the plot. See https://plotly.com/javascript/reference/layout/ for more information'
 				}
 			}
 		}
@@ -924,6 +1734,7 @@ Hello \${ctx.username}
 	timeseriescomponent: {
 		name: 'Timeseries',
 		icon: GripHorizontal,
+		documentationLink: `${documentationBaseUrl}/timeseries`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -932,19 +1743,19 @@ Hello \${ctx.username}
 			configuration: {
 				logarithmicScale: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				},
 				zoomable: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				},
 				pannable: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				}
@@ -997,6 +1808,7 @@ Hello \${ctx.username}
 	scatterchartcomponent: {
 		name: 'Scatter Chart',
 		icon: GripHorizontal,
+		documentationLink: `${documentationBaseUrl}/scatter_chart`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -1005,13 +1817,13 @@ Hello \${ctx.username}
 			configuration: {
 				zoomable: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				},
 				pannable: {
 					type: 'static',
-					onlyStatic: true,
+
 					fieldType: 'boolean',
 					value: false
 				}
@@ -1044,8 +1856,9 @@ Hello \${ctx.username}
 		}
 	},
 	tablecomponent: {
-		name: 'Table',
+		name: 'TanStack Table',
 		icon: Table2,
+		documentationLink: `${documentationBaseUrl}/table`,
 		dims: '3:10-6:10' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' },
@@ -1055,62 +1868,41 @@ Hello \${ctx.username}
 		},
 		initialData: {
 			configuration: {
+				columnDefs: {
+					type: 'static',
+					fieldType: 'array',
+					subFieldType: 'table-column',
+					value: [{ field: 'id' }, { field: 'name' }, { field: 'age' }]
+				} as StaticAppInput,
 				search: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.tableSearchOptions,
 					value: 'Disabled' as string,
 					tooltip:
 						'Search can be configured in the following ways: Disabled: The search is disabled,By Runnable: The search is done in the backend, or by component: The search is done in the frontend.'
 				},
-				pagination: paginationOneOf
-			},
-			componentInput: {
-				type: 'static',
-				fieldType: 'array',
-				subFieldType: 'object',
-				value: [
-					{
-						id: 1,
-						name: 'A cell with a long name',
-						age: 42
-					},
-					{
-						id: 2,
-						name: 'A briefer cell',
-						age: 84
-					}
-				]
-			} as StaticAppInput,
-			actionButtons: true
-		}
-	},
-	aggridcomponent: {
-		name: 'AgGrid Table',
-		icon: Table2,
-		dims: '3:10-6:10' as AppComponentDimensions,
-		customCss: {},
-		initialData: {
-			configuration: {
-				columnDefs: {
-					type: 'static',
-					fieldType: 'array',
-					subFieldType: 'object',
-					value: [{ field: 'id' }, { field: 'name', editable: true }, { field: 'age' }]
-				} as StaticAppInput,
-				allEditable: {
+				pagination: paginationOneOf,
+				downloadButton: {
 					type: 'static',
 					fieldType: 'boolean',
-					value: false,
-					onlyStatic: true,
-					tooltip: 'Configure all columns as Editable by users'
+					value: true,
+
+					tooltip: 'display a button to download the table as a csv file'
 				},
-				pagination: {
+				initialState: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip:
+						'any configuration that can be passed to the tanstack table component as initial state (https://tanstack.com/table/v8/docs/api/core/table#initialstate)'
+				},
+				selectFirstRowByDefault: {
 					type: 'static',
 					fieldType: 'boolean',
-					value: false,
-					onlyStatic: true
+					value: true as boolean,
+					tooltip: 'Select the first row by default on start'
 				}
 			},
 			componentInput: {
@@ -1128,21 +1920,29 @@ Hello \${ctx.username}
 						name: 'A briefer cell',
 						age: 84
 					}
-				]
-			} as StaticAppInput
+				],
+				hideRefreshButton: true
+			} as StaticAppInput,
+			actionButtons: true
 		}
 	},
+	aggridcomponent: aggridcomponentconst,
+	aggridcomponentee: { ...aggridcomponentconst, name: 'AgGrid Table EE' },
+	aggridinfinitecomponent: aggridinfinitecomponentconst,
+	aggridinfinitecomponentee: { ...aggridinfinitecomponentconst, name: 'AgGrid Infinite Table EE' },
 	checkboxcomponent: {
 		name: 'Toggle',
 		icon: ToggleLeft,
+		documentationLink: `${documentationBaseUrl}/toggle`,
 		dims: '1:1-2:1' as AppComponentDimensions,
-
 		customCss: {
-			text: { class: '', style: '' }
+			text: { class: '', style: '' },
+			container: { class: '', style: '' }
 		},
 		initialData: {
 			...defaultAlignement,
 			componentInput: undefined,
+			onToggle: [],
 			recomputeIds: true,
 			configuration: {
 				label: {
@@ -1154,6 +1954,11 @@ Hello \${ctx.username}
 					type: 'static',
 					value: undefined,
 					fieldType: 'boolean'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
 				}
 			}
 		}
@@ -1161,8 +1966,8 @@ Hello \${ctx.username}
 	textinputcomponent: {
 		name: 'Text Input',
 		icon: TextCursorInput,
+		documentationLink: `${documentationBaseUrl}/text_input`,
 		dims: '2:1-2:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1173,8 +1978,44 @@ Hello \${ctx.username}
 				placeholder: {
 					type: 'static',
 					value: 'Type...',
-					fieldType: 'text',
-					onlyStatic: true
+					fieldType: 'text'
+				},
+				defaultValue: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'text'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				beforeIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
+				},
+				afterIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
+				}
+			}
+		}
+	},
+	quillcomponent: {
+		name: 'Rich Text Editor',
+		icon: TextCursorInput,
+		documentationLink: `${documentationBaseUrl}/rich_text_editor`,
+		dims: '2:1-4:4' as AppComponentDimensions,
+		customCss: {},
+		initialData: {
+			componentInput: undefined,
+			configuration: {
+				placeholder: {
+					type: 'static',
+					value: 'Type...',
+					fieldType: 'text'
 				},
 				defaultValue: {
 					type: 'static',
@@ -1187,8 +2028,8 @@ Hello \${ctx.username}
 	textareainputcomponent: {
 		name: 'Textarea',
 		icon: TextCursorInput,
+		documentationLink: `${documentationBaseUrl}/textarea`,
 		dims: '2:1-2:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1198,13 +2039,17 @@ Hello \${ctx.username}
 				placeholder: {
 					type: 'static',
 					value: 'Type...',
-					fieldType: 'text',
-					onlyStatic: true
+					fieldType: 'text'
 				},
 				defaultValue: {
 					type: 'static',
 					value: undefined,
 					fieldType: 'text'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
 				}
 			}
 		}
@@ -1212,12 +2057,14 @@ Hello \${ctx.username}
 	selectcomponent: {
 		name: 'Select',
 		icon: List,
+		documentationLink: `${documentationBaseUrl}/select`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: {
 				style: '',
-				tooltip: 'https://github.com/rob-balfre/svelte-select/blob/master/docs/theming_variables.md'
+				tooltip:
+					'https://github.com/rob-balfre/svelte-select/blob/master/docs/theming_variables.md',
+				class: ''
 			}
 		},
 		initialData: {
@@ -1238,26 +2085,44 @@ Hello \${ctx.username}
 					type: 'static',
 					fieldType: 'boolean',
 					value: false,
-					onlyStatic: true,
+
 					tooltip: 'Allows user to manually add new value',
 					customTitle: 'User creatable'
 				},
 				placeholder: {
 					type: 'static',
 					fieldType: 'text',
-					value: 'Select an item',
-					onlyStatic: true
+					value: 'Select an item'
+				},
+				disabled: {
+					fieldType: 'boolean',
+					type: 'static',
+					value: false
 				},
 				defaultValue: {
 					type: 'static',
 					value: undefined,
 					fieldType: 'object'
 				},
+				preselectFirst: {
+					type: 'static',
+					value: true,
+					fieldType: 'boolean',
+
+					tooltip: 'Preselect first item in the options if no default value is set'
+				},
+				nativeHtmlSelect: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+
+					tooltip: 'Use a native html select instead of the Windmill select component'
+				},
 				fullWidth: {
 					type: 'static',
 					fieldType: 'boolean',
 					value: true,
-					onlyStatic: true,
+
 					tooltip: 'Set the width of the options popup to 100% of the select width'
 				}
 			}
@@ -1266,8 +2131,8 @@ Hello \${ctx.username}
 	multiselectcomponent: {
 		name: 'Multi Select',
 		icon: List,
+		documentationLink: `${documentationBaseUrl}/multiselect`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			multiselect: {
 				style: '',
@@ -1277,6 +2142,7 @@ Hello \${ctx.username}
 		},
 		initialData: {
 			componentInput: undefined,
+			verticalAlignment: 'center',
 			configuration: {
 				items: {
 					type: 'static',
@@ -1293,14 +2159,13 @@ Hello \${ctx.username}
 				placeholder: {
 					type: 'static',
 					fieldType: 'text',
-					value: 'Select items',
-					onlyStatic: true
+					value: 'Select items'
 				},
 				create: {
 					type: 'static',
 					fieldType: 'boolean',
 					value: false,
-					onlyStatic: true,
+
 					tooltip: 'Allows user to manually add new value',
 					customTitle: 'User creatable'
 				},
@@ -1308,7 +2173,59 @@ Hello \${ctx.username}
 					type: 'static',
 					fieldType: 'boolean',
 					value: true,
-					onlyStatic: true,
+
+					tooltip:
+						'If too many items, the box overflow its container instead of having an internal scroll'
+				}
+			}
+		}
+	},
+	multiselectcomponentv2: {
+		name: 'Multi Select',
+		icon: List,
+		documentationLink: `${documentationBaseUrl}/multiselect`,
+		dims: '2:1-3:1' as AppComponentDimensions,
+		customCss: {
+			multiselect: {
+				style: '',
+				tooltip:
+					'See https://multiselect.janosh.dev/#with-css-variables for the available variables'
+			}
+		},
+		initialData: {
+			componentInput: undefined,
+			verticalAlignment: 'center',
+			configuration: {
+				items: {
+					type: 'static',
+					fieldType: 'array',
+					subFieldType: 'text',
+					value: ['Foo', 'Bar']
+				} as StaticAppInput,
+				defaultItems: {
+					type: 'static',
+					fieldType: 'array',
+					subFieldType: 'text',
+					value: []
+				} as StaticAppInput,
+				placeholder: {
+					type: 'static',
+					fieldType: 'text',
+					value: 'Select items'
+				},
+				create: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+
+					tooltip: 'Allows user to manually add new value',
+					customTitle: 'User creatable'
+				},
+				allowOverflow: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: true,
+
 					tooltip:
 						'If too many items, the box overflow its container instead of having an internal scroll'
 				}
@@ -1316,10 +2233,10 @@ Hello \${ctx.username}
 		}
 	},
 	resourceselectcomponent: {
-		name: 'Resource Select',
+		name: 'Static Resource Select',
 		icon: List,
+		documentationLink: `${documentationBaseUrl}/resource_select`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { style: '' }
 		},
@@ -1331,20 +2248,57 @@ Hello \${ctx.username}
 					type: 'static',
 					fieldType: 'array',
 					subFieldType: 'labeledresource',
+					allowTypeChange: false,
 					value: []
 				} as StaticAppInput,
 				placeholder: {
 					type: 'static',
 					fieldType: 'text',
-					value: 'Select an item',
-					onlyStatic: true
+					value: 'Select an item'
 				},
 				fullWidth: {
 					type: 'static',
 					fieldType: 'boolean',
 					value: true,
-					onlyStatic: true,
+
 					tooltip: 'Set the width of the options popup to 100% of the select width'
+				},
+				disabled: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false
+				}
+			}
+		}
+	},
+	userresourcecomponent: {
+		name: 'User Resource Input',
+		icon: List,
+		documentationLink: `${documentationBaseUrl}/resource_select`,
+		dims: '2:1-3:1' as AppComponentDimensions,
+		customCss: {
+			input: { style: '', class: '' }
+		},
+		initialData: {
+			verticalAlignment: 'center',
+			componentInput: undefined,
+			configuration: {
+				resourceType: {
+					type: 'static',
+					fieldType: 'text',
+					value: 'postgresql'
+				},
+				expressOauthSetup: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					tooltip:
+						'If enabled, skip some steps while adding oauth resources: No scopes to set prior to OAuth sign-in,  and no path to set after OAuth sign-in'
+				},
+				disabled: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false
 				}
 			}
 		}
@@ -1352,8 +2306,8 @@ Hello \${ctx.username}
 	numberinputcomponent: {
 		name: 'Number',
 		icon: Binary,
+		documentationLink: `${documentationBaseUrl}/number_input`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1364,8 +2318,7 @@ Hello \${ctx.username}
 				placeholder: {
 					type: 'static',
 					value: 'Type...',
-					fieldType: 'text',
-					onlyStatic: true
+					fieldType: 'text'
 				},
 				defaultValue: {
 					type: 'static',
@@ -1394,8 +2347,8 @@ Hello \${ctx.username}
 	currencycomponent: {
 		name: 'Currency',
 		icon: DollarSign,
+		documentationLink: `${documentationBaseUrl}/currency_input`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1411,21 +2364,20 @@ Hello \${ctx.username}
 				isNegativeAllowed: {
 					type: 'static',
 					value: false,
-					fieldType: 'boolean',
-					onlyStatic: true
+					fieldType: 'boolean'
 				},
 				currency: {
 					type: 'static',
 					value: 'USD',
 					fieldType: 'select',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.currencyOptions
 				},
 				locale: {
 					type: 'static',
 					value: 'en-US',
 					fieldType: 'select',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.localeOptions,
 					tooltip: 'Currency format'
 				}
@@ -1435,11 +2387,11 @@ Hello \${ctx.username}
 	slidercomponent: {
 		name: 'Slider',
 		icon: SlidersHorizontal,
+		documentationLink: `${documentationBaseUrl}/slider`,
 		dims: '3:1-4:1' as AppComponentDimensions,
-
 		customCss: {
-			bar: { style: '' },
-			handle: { style: '' },
+			bar: { style: '', class: '' },
+			handle: { style: '', class: '' },
 			limits: { class: '', style: '' },
 			value: { class: '', style: '' }
 		},
@@ -1450,8 +2402,7 @@ Hello \${ctx.username}
 				min: {
 					type: 'static',
 					value: 0,
-					fieldType: 'number',
-					onlyStatic: true
+					fieldType: 'number'
 				},
 				max: {
 					type: 'static',
@@ -1468,6 +2419,78 @@ Hello \${ctx.username}
 					value: 1,
 					fieldType: 'number',
 					tooltip: 'Spread between each number suggestion'
+				},
+				vertical: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				axisStep: {
+					type: 'static',
+					value: 10,
+					fieldType: 'number',
+					tooltip: 'Spread between each number suggestion when using the arrow keys'
+				}
+			}
+		}
+	},
+	dateslidercomponent: {
+		name: 'Date Slider',
+		icon: SlidersHorizontal,
+		documentationLink: `${documentationBaseUrl}/date_slider`,
+		dims: '3:1-4:1' as AppComponentDimensions,
+		customCss: {
+			bar: { style: '', class: '' },
+			handle: { style: '', class: '' },
+			limits: { class: '', style: '' },
+			value: { class: '', style: '' }
+		},
+		initialData: {
+			verticalAlignment: 'center',
+			componentInput: undefined,
+			configuration: {
+				min: {
+					type: 'static',
+					value: '',
+					fieldType: 'date'
+				},
+				max: {
+					type: 'static',
+					value: '',
+					fieldType: 'date'
+				},
+				defaultValue: {
+					type: 'static',
+					value: '',
+					fieldType: 'date'
+				},
+				step: {
+					type: 'static',
+					value: 1,
+					fieldType: 'number',
+					tooltip: 'Number of days between each date suggestion'
+				},
+				vertical: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				outputFormat: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'text',
+					tooltip: 'See date-fns format for more information',
+					documentationLink: 'https://date-fns.org/v1.29.0/docs/format'
 				}
 			}
 		}
@@ -1475,8 +2498,8 @@ Hello \${ctx.username}
 	rangecomponent: {
 		name: 'Range',
 		icon: SlidersHorizontal,
+		documentationLink: `${documentationBaseUrl}/range`,
 		dims: '3:2-4:2' as AppComponentDimensions,
-
 		customCss: {
 			handles: { style: '' },
 			bar: { style: '' },
@@ -1512,6 +2535,19 @@ Hello \${ctx.username}
 					value: 1,
 					fieldType: 'number',
 					tooltip: 'Spread between each number suggestion'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean',
+					tooltip:
+						'Determine if the slider is disabled, or enabled (only disables interactions, and events)'
+				},
+				axisStep: {
+					type: 'static',
+					value: 10,
+					fieldType: 'number',
+					tooltip: 'Spread between each number suggestion when using the arrow keys'
 				}
 			}
 		}
@@ -1519,8 +2555,8 @@ Hello \${ctx.username}
 	passwordinputcomponent: {
 		name: 'Password',
 		icon: Lock,
+		documentationLink: `${documentationBaseUrl}/password_input`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1531,8 +2567,22 @@ Hello \${ctx.username}
 				placeholder: {
 					type: 'static',
 					value: 'Password',
-					fieldType: 'text',
-					onlyStatic: true
+					fieldType: 'text'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				beforeIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
+				},
+				afterIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
 				}
 			}
 		}
@@ -1540,8 +2590,8 @@ Hello \${ctx.username}
 	emailinputcomponent: {
 		name: 'Email Input',
 		icon: AtSignIcon,
+		documentationLink: `${documentationBaseUrl}/email_input`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1552,13 +2602,27 @@ Hello \${ctx.username}
 				placeholder: {
 					type: 'static',
 					value: 'Email',
-					fieldType: 'text',
-					onlyStatic: true
+					fieldType: 'text'
 				},
 				defaultValue: {
 					type: 'static',
 					value: undefined,
 					fieldType: 'text'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				beforeIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
+				},
+				afterIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
 				}
 			}
 		}
@@ -1566,8 +2630,8 @@ Hello \${ctx.username}
 	dateinputcomponent: {
 		name: 'Date',
 		icon: Calendar,
+		documentationLink: `${documentationBaseUrl}/date_input`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			input: { class: '', style: '' }
 		},
@@ -1578,17 +2642,148 @@ Hello \${ctx.username}
 				minDate: {
 					type: 'static',
 					value: '',
-					fieldType: 'date'
+					fieldType: 'date',
+					tooltip: 'The minimum date that can be selected. The format is: "yyyy-MM-dd"'
 				},
 				maxDate: {
 					type: 'static',
 					value: '',
-					fieldType: 'date'
+					fieldType: 'date',
+					tooltip: 'The maximum date that can be selected. The format is: "yyyy-MM-dd"'
 				},
 				defaultValue: {
 					type: 'static',
 					value: undefined,
 					fieldType: 'date'
+				},
+				outputFormat: {
+					type: 'static',
+					value: 'yyyy-MM-dd',
+					fieldType: 'text',
+					markdownTooltip: `### Output format				
+See date-fns format for more information. By default, it is 'yyyy-MM-dd'
+
+| Format      | Result | Description |
+| ----------- | ----------- | ----------- |
+| dd 				| 01, 02, ..., 31 | Day of the month |
+| d 				| 1, 2, ..., 31 | Day of the month |
+| MM 				| 01, 02, ..., 12 | Month |
+| MMM 				| Jan, Feb, ..., Dec | Month |
+| MMMM 				| January, February, ..., December | Month |
+| yyyy 				| 2021, 2022, ... | Year |
+`,
+
+					documentationLink: 'https://date-fns.org/v2.30.0/docs/format',
+					placeholder: 'yyyy-MM-dd'
+				}
+			}
+		}
+	},
+	datetimeinputcomponent: {
+		name: 'Date & Time',
+		icon: CalendarClock,
+		documentationLink: `${documentationBaseUrl}/datetime_input`,
+		dims: '2:1-6:2' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			verticalAlignment: 'center',
+			componentInput: undefined,
+			configuration: {
+				displayPresets: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean',
+					tooltip: 'Display presets to select the date for example, in 1 week, in 1 month, etc.'
+				},
+				minDateTime: {
+					type: 'static',
+					value: '',
+					fieldType: 'datetime',
+					tooltip:
+						'The minimum date and time that can be selected. The format is the ISO 8601 format: "yyyy-MM-ddTHH:mm:ss:SSSZ", for example "2021-11-06T23:39:30.000Z", or toISOString() from a Date'
+				},
+				maxDateTime: {
+					type: 'static',
+					value: '',
+					fieldType: 'datetime',
+					tooltip:
+						'The maximum date and time that can be selected. The format is the ISO 8601 format: "yyyy-MM-ddTHH:mm:ss:SSSZ", for example "2021-11-06T23:39:30.000Z", or toISOString() from a Date'
+				},
+				outputFormat: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'text',
+					documentationLink: 'https://date-fns.org/v2.30.0/docs/format',
+					placeholder: 'dd.MM.yyyy HH:mm',
+					markdownTooltip: `### Output format				
+See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
+
+| Format      | Result | Description |
+| ----------- | ----------- | ----------- |
+| dd 				| 01, 02, ..., 31 | Day of the month |
+| d 				| 1, 2, ..., 31 | Day of the month |
+| MM 				| 01, 02, ..., 12 | Month |
+| MMM 				| Jan, Feb, ..., Dec | Month |
+| MMMM 				| January, February, ..., December | Month |
+| yyyy 				| 2021, 2022, ... | Year |
+| HH 				| 00, 01, ..., 23 | Hours |
+| mm 				| 00, 01, ..., 59 | Minutes |
+| ss 				| 00, 01, ..., 59 | Seconds |
+					`
+				},
+				defaultValue: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'datetime'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				}
+			}
+		}
+	},
+	timeinputcomponent: {
+		name: 'Time',
+		icon: Clock,
+		documentationLink: `${documentationBaseUrl}/time_input`,
+		dims: '2:1-3:1' as AppComponentDimensions,
+		customCss: {
+			input: { class: '', style: '' }
+		},
+		initialData: {
+			verticalAlignment: 'center',
+			componentInput: undefined,
+			configuration: {
+				minTime: {
+					type: 'static',
+					value: '',
+					fieldType: 'time',
+					tooltip:
+						'The minimum time that can be selected. If the time provided is not valid, it will set the output "validity" to false. The format is: "HH:mm"'
+				},
+				maxTime: {
+					type: 'static',
+					value: '',
+					fieldType: 'time',
+					tooltip:
+						'The maximum time that can be selected. If the time provided is not valid, it will set the output "validity" to false. The format is: "HH:mm"'
+				},
+				defaultValue: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'time'
+				},
+
+				['24hFormat']: {
+					type: 'static',
+					value: true,
+					fieldType: 'boolean',
+					tooltip:
+						'Use 24h format. Will change the format of the output of the component: HH:mm to hh:mm am/pm'
 				}
 			}
 		}
@@ -1596,8 +2791,8 @@ Hello \${ctx.username}
 	tabscomponent: {
 		name: 'Tabs',
 		icon: ListOrdered,
+		documentationLink: `${documentationBaseUrl}/tabs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {
 			tabRow: { class: '', style: '' },
 			allTabs: { class: '', style: '' },
@@ -1609,7 +2804,7 @@ Hello \${ctx.username}
 				tabsKind: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.tabsKindOptions,
 					value: 'tabs' as string,
 					tooltip: `Tabs can be configured to be either horizontal (tabs), vertical (sidebar), or invisible.`
@@ -1623,8 +2818,8 @@ Hello \${ctx.username}
 	steppercomponent: {
 		name: 'Stepper',
 		icon: ListOrdered,
+		documentationLink: `${documentationBaseUrl}/stepper`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {
 			container: { class: '', style: '' }
 		},
@@ -1640,11 +2835,39 @@ Hello \${ctx.username}
 			tabs: ['First', 'Second'] as string[]
 		}
 	},
+	carousellistcomponent: {
+		name: 'Carousel List',
+		icon: ListIcon,
+		documentationLink: `${documentationBaseUrl}/carousel`,
+		dims: '3:8-12:8' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				timingFunction: {
+					fieldType: 'select',
+					type: 'static',
+					selectOptions: selectOptions.animationTimingFunctionOptions,
+					value: 'linear',
+					tooltip:
+						'Sets how an animation progresses through the duration of each cycle, see https://developer.mozilla.org/en-US/docs/Web/CSS/animation-timing-function'
+				}
+			},
+			componentInput: {
+				type: 'static',
+				fieldType: 'array',
+				subFieldType: 'object',
+				value: [{ foo: 1 }, { foo: 2 }, { foo: 3 }] as object[]
+			},
+			numberOfSubgrids: 1
+		}
+	},
 	iconcomponent: {
 		name: 'Icon',
 		icon: Smile,
+		documentationLink: `${documentationBaseUrl}/icon`,
 		dims: '1:3-1:2' as AppComponentDimensions,
-
 		customCss: {
 			container: { class: '', style: '' },
 			icon: { class: '', style: '' }
@@ -1670,14 +2893,12 @@ Hello \${ctx.username}
 				size: {
 					type: 'static',
 					value: 24,
-					fieldType: 'number',
-					onlyStatic: true
+					fieldType: 'number'
 				},
 				strokeWidth: {
 					type: 'static',
 					value: 2,
-					fieldType: 'number',
-					onlyStatic: true
+					fieldType: 'number'
 				}
 			}
 		}
@@ -1685,6 +2906,7 @@ Hello \${ctx.username}
 	horizontaldividercomponent: {
 		name: 'Divider X',
 		icon: SeparatorHorizontal,
+		documentationLink: `${documentationBaseUrl}/divider_x`,
 		dims: '3:1-12:1' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' },
@@ -1702,7 +2924,7 @@ Hello \${ctx.username}
 					type: 'static',
 					value: 2,
 					fieldType: 'number',
-					onlyStatic: true,
+
 					tooltip:
 						'The height of the divider in pixels can be overridden by the `height` property in the styling menu'
 				},
@@ -1710,7 +2932,7 @@ Hello \${ctx.username}
 					type: 'static',
 					value: '#00000060',
 					fieldType: 'color',
-					onlyStatic: true,
+
 					tooltip:
 						'The color of the divider can be overridden by the `background-color` property in the styling menu'
 				}
@@ -1720,6 +2942,7 @@ Hello \${ctx.username}
 	verticaldividercomponent: {
 		name: 'Divider Y',
 		icon: SeparatorVertical,
+		documentationLink: `${documentationBaseUrl}/divider_y`,
 		dims: '1:4-1:6' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' },
@@ -1733,7 +2956,7 @@ Hello \${ctx.username}
 					type: 'static',
 					value: 2,
 					fieldType: 'number',
-					onlyStatic: true,
+
 					tooltip:
 						'The width of the divider in pixels can be overridden by the `width` property in the styling menu'
 				},
@@ -1741,7 +2964,7 @@ Hello \${ctx.username}
 					type: 'static',
 					value: '#00000060',
 					fieldType: 'color',
-					onlyStatic: true,
+
 					tooltip:
 						'The color of the divider can be overridden by the `background-color` property in the styling menu'
 				}
@@ -1751,6 +2974,7 @@ Hello \${ctx.username}
 	fileinputcomponent: {
 		name: 'File Input',
 		icon: Paperclip,
+		documentationLink: `${documentationBaseUrl}/file_input`,
 		dims: '3:4-6:4' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -1761,21 +2985,34 @@ Hello \${ctx.username}
 				acceptedFileTypes: {
 					type: 'static',
 					value: ['image/*', 'application/pdf'] as string[],
-					fieldType: 'array',
-					onlyStatic: true
+					fieldType: 'array'
 				},
 				allowMultiple: {
 					type: 'static',
 					value: false,
 					fieldType: 'boolean',
-					tooltip: 'If allowed, the user will be able to select more than one file',
-					onlyStatic: true
+					tooltip: 'If allowed, the user will be able to select more than one file'
 				},
 				text: {
 					type: 'static',
 					value: 'Drag and drop files or click to select them',
-					fieldType: 'text',
-					onlyStatic: true
+					fieldType: 'text'
+				},
+				includeMimeType: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean',
+					tooltip: 'If enabled, the mime type of the file will be included.'
+				},
+				submittedFileText: {
+					type: 'static',
+					value: 'Selected file',
+					fieldType: 'text'
+				},
+				disabled: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
 				}
 			}
 		}
@@ -1783,6 +3020,7 @@ Hello \${ctx.username}
 	imagecomponent: {
 		name: 'Image',
 		icon: Image,
+		documentationLink: `${documentationBaseUrl}/image`,
 		dims: '3:4-5:4' as AppComponentDimensions,
 		customCss: {
 			image: { class: '', style: '' }
@@ -1799,10 +3037,16 @@ Hello \${ctx.username}
 						convertTo: 'base64'
 					}
 				},
+				sourceKind: {
+					fieldType: 'select',
+					type: 'static',
+					selectOptions: selectOptions.imageSourceKind,
+					value: 'url' as (typeof selectOptions.imageSourceKind)[number]
+				},
 				imageFit: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.objectFitOptions,
 					value: 'contain',
 					tooltip:
@@ -1812,7 +3056,7 @@ Hello \${ctx.username}
 					type: 'static',
 					value: '',
 					fieldType: 'text',
-					onlyStatic: true,
+
 					tooltip: "This text will appear if the image can't be loaded for any reason"
 				}
 			}
@@ -1821,11 +3065,12 @@ Hello \${ctx.username}
 	drawercomponent: {
 		name: 'Drawer',
 		icon: SidebarClose,
+		documentationLink: `${documentationBaseUrl}/drawer`,
 		dims: '1:1-2:1' as AppComponentDimensions,
-
 		customCss: {
 			button: { style: '', class: '' },
-			container: { class: '', style: '' }
+			container: { class: '', style: '' },
+			drawer: { class: '', style: '' }
 		},
 		initialData: {
 			horizontalAlignment: 'center',
@@ -1834,8 +3079,13 @@ Hello \${ctx.username}
 				drawerTitle: {
 					type: 'static',
 					fieldType: 'text',
-					value: 'Drawer title',
-					onlyStatic: true
+					value: 'Drawer title'
+				},
+				hideButtonOnView: {
+					fieldType: 'boolean',
+					type: 'static',
+					value: false,
+					tooltip: 'Make button invisible when app is used outside of the edit mode'
 				},
 				label: {
 					type: 'static',
@@ -1853,14 +3103,14 @@ Hello \${ctx.username}
 				size: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.buttonSizeOptions,
 					value: 'xs'
 				},
 				fillContainer: {
 					fieldType: 'boolean',
 					type: 'static',
-					onlyStatic: true,
+
 					value: false,
 					tooltip:
 						'This will make the button fill the container width and height. Height and width can be overwritten with custom styles.'
@@ -1878,6 +3128,7 @@ Hello \${ctx.username}
 	mapcomponent: {
 		name: 'Map',
 		icon: MapPin,
+		documentationLink: `${documentationBaseUrl}/map`,
 		dims: '3:6-6:10' as AppComponentDimensions,
 		customCss: {
 			map: { class: '', style: '' }
@@ -1924,15 +3175,21 @@ Hello \${ctx.username}
 							title: 'London'
 						}
 					]
-				} as StaticAppInput
+				} as StaticAppInput,
+				lock: {
+					fieldType: 'boolean',
+					type: 'static',
+					value: false,
+					tooltip: 'Lock the map to prevent user interaction'
+				}
 			}
 		}
 	},
 	verticalsplitpanescomponent: {
 		name: 'Vertical Split Panes',
 		icon: FlipHorizontal,
+		documentationLink: `${documentationBaseUrl}/vertical_split_panes`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {
 			container: { class: '', style: '' }
 		},
@@ -1946,8 +3203,8 @@ Hello \${ctx.username}
 	horizontalsplitpanescomponent: {
 		name: 'Horizontal Split Panes',
 		icon: FlipVertical,
+		documentationLink: `${documentationBaseUrl}/horizontal_split_panes`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {
 			container: { class: '', style: '' }
 		},
@@ -1961,6 +3218,7 @@ Hello \${ctx.username}
 	pdfcomponent: {
 		name: 'PDF',
 		icon: FileText,
+		documentationLink: `${documentationBaseUrl}/pdf`,
 		dims: '3:8-8:12' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -1976,7 +3234,7 @@ Hello \${ctx.username}
 						accept: 'application/pdf',
 						convertTo: 'base64'
 					},
-					placeholder: 'Enter URL or upload file'
+					placeholder: 'Enter URL or upload file (base64)'
 				},
 				zoom: {
 					fieldType: 'number',
@@ -1989,6 +3247,7 @@ Hello \${ctx.username}
 	modalcomponent: {
 		name: 'Modal',
 		icon: SidebarClose,
+		documentationLink: `${documentationBaseUrl}/modal`,
 		dims: '1:1-2:1' as AppComponentDimensions,
 		customCss: {
 			button: { class: '', style: '' },
@@ -2002,8 +3261,13 @@ Hello \${ctx.username}
 				modalTitle: {
 					type: 'static',
 					fieldType: 'text',
-					value: 'Modal title',
-					onlyStatic: true
+					value: 'Modal title'
+				},
+				hideButtonOnView: {
+					fieldType: 'boolean',
+					type: 'static',
+					value: false,
+					tooltip: 'Make button invisible when app is used outside of the edit mode'
 				},
 				buttonLabel: {
 					type: 'static',
@@ -2013,22 +3277,22 @@ Hello \${ctx.username}
 				buttonColor: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: buttonColorOptions,
 					value: 'blue',
-					tooltip: 'Theses presets can be overwritten with custom styles.'
+					tooltip: 'These presets can be overwritten with custom styles.'
 				},
 				buttonSize: {
 					fieldType: 'select',
 					type: 'static',
-					onlyStatic: true,
+
 					selectOptions: selectOptions.buttonSizeOptions,
 					value: 'xs'
 				},
 				buttonFillContainer: {
 					fieldType: 'boolean',
 					type: 'static',
-					onlyStatic: true,
+
 					value: false,
 					tooltip:
 						'This will make the button fill the container width and height. Height and width can be overwritten with custom styles.'
@@ -2046,6 +3310,7 @@ Hello \${ctx.username}
 	schemaformcomponent: {
 		name: 'Form',
 		icon: FileText,
+		documentationLink: `${documentationBaseUrl}/form_input`,
 		dims: '3:8-8:12' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' },
@@ -2068,18 +3333,31 @@ Hello \${ctx.username}
 				}
 			},
 			configuration: {
+				defaultValues: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip:
+						'This enables setting default form values dynamically using an object: keys are field names, and values are the defaults.'
+				},
+				dynamicEnums: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip:
+						'This enables setting form enum values dynamically using an object: keys are field names, and values are arrays of strings.'
+				},
+
 				displayType: {
 					fieldType: 'boolean',
 					type: 'static',
 					value: false,
-					onlyStatic: true,
-					tooltip: 'This will diplay the type and/or the format on the field next to the label.'
+					tooltip: 'This will display the type and/or the format on the field next to the label.'
 				},
 				largeGap: {
 					fieldType: 'boolean',
 					type: 'static',
 					value: false,
-					onlyStatic: true,
 					tooltip: 'This will add a large gap between the form elements.'
 				}
 			}
@@ -2088,8 +3366,8 @@ Hello \${ctx.username}
 	selecttabcomponent: {
 		name: 'Select Tab',
 		icon: List,
+		documentationLink: `${documentationBaseUrl}/select_tab`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
 			tabRow: { class: '', style: '' },
 			allTabs: { class: '', style: '' },
@@ -2111,7 +3389,7 @@ Hello \${ctx.username}
 
 				defaultValue: {
 					type: 'static',
-					value: undefined as { value: string; label: string } | undefined,
+					value: undefined,
 					fieldType: 'object'
 				},
 				tabSize: {
@@ -2128,12 +3406,10 @@ Hello \${ctx.username}
 	selectstepcomponent: {
 		name: 'Select Step',
 		icon: List,
+		documentationLink: `${documentationBaseUrl}/select_step`,
 		dims: '2:1-3:1' as AppComponentDimensions,
-
 		customCss: {
-			tabRow: { class: '', style: '' },
-			allTabs: { class: '', style: '' },
-			selectedTab: { class: '', style: '' }
+			container: { class: '', style: '' }
 		},
 		initialData: {
 			verticalAlignment: 'center',
@@ -2157,10 +3433,10 @@ Hello \${ctx.username}
 		}
 	},
 	conditionalwrapper: {
-		name: 'Conditional tabs',
+		name: 'Conditional Tabs',
 		icon: Split,
+		documentationLink: `${documentationBaseUrl}/conditional_tabs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
-
 		customCss: {
 			container: { class: '', style: '' }
 		},
@@ -2170,16 +3446,675 @@ Hello \${ctx.username}
 			numberOfSubgrids: 2,
 			conditions: [
 				{
-					type: 'eval',
+					type: 'evalv2',
 					expr: 'false',
-					fieldType: 'boolean'
+					fieldType: 'boolean',
+					connections: []
 				},
 				{
-					type: 'eval',
+					type: 'evalv2',
 					expr: 'true',
-					fieldType: 'boolean'
+					fieldType: 'boolean',
+					connections: []
 				}
 			] as AppInputSpec<'boolean', boolean>[]
+		}
+	},
+	statcomponent: {
+		name: 'Statistic Card',
+		icon: FileBarChart,
+		documentationLink: `${documentationBaseUrl}/statistic_card`,
+		dims: '2:4-3:4' as AppComponentDimensions,
+		quickstyle: {
+			title: {
+				quickCss: ['font-size: 1rem', 'font-size: 1.5rem', 'font-size: 2rem'],
+				quickTailwindClasses: ['text-xs', 'text-sm', 'text-base', 'text-lg', 'text-xl', 'text-2xl']
+			},
+			value: {
+				quickCss: ['font-size: 1rem', 'font-size: 1.5rem', 'font-size: 2rem'],
+				quickTailwindClasses: ['text-xs', 'text-sm', 'text-base', 'text-lg', 'text-xl', 'text-2xl']
+			}
+		} as Record<string, Quickstyle>,
+		customCss: {
+			title: {
+				class: '',
+				style: ''
+			},
+			container: { class: '', style: '' },
+			value: {
+				class: '',
+				style: ''
+			},
+			media: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				title: {
+					type: 'static',
+					value: 'Title',
+					fieldType: 'text'
+				},
+				value: {
+					type: 'static',
+					value: 'Value',
+					fieldType: 'text'
+				},
+				progress: {
+					type: 'static',
+					value: 0,
+					fieldType: 'number'
+				},
+				media: {
+					type: 'oneOf',
+					selected: 'image',
+					labels: {
+						icon: 'Icon',
+						image: 'Image'
+					},
+					configuration: {
+						icon: {
+							icon: {
+								type: 'static',
+								value: undefined,
+								fieldType: 'icon-select'
+							}
+						},
+						image: {
+							source: {
+								type: 'static',
+								value: '/logo.svg',
+								fieldType: 'text',
+								fileUpload: {
+									accept: 'image/*',
+									convertTo: 'base64'
+								}
+							},
+							sourceKind: {
+								fieldType: 'select',
+								type: 'static',
+								selectOptions: selectOptions.imageSourceKind,
+								value: 'url' as (typeof selectOptions.imageSourceKind)[number]
+							}
+						}
+					}
+				} as const
+			}
+		}
+	},
+	menucomponent: {
+		name: 'Dropdown Menu',
+		icon: Menu,
+		documentationLink: `${documentationBaseUrl}/dropdown_menu`,
+		dims: '1:1-1:2' as AppComponentDimensions,
+		customCss: {
+			button: { style: '', class: '' }
+		},
+		initialData: {
+			...defaultAlignement,
+			componentInput: undefined,
+			configuration: {
+				label: {
+					type: 'static',
+					fieldType: 'text',
+					value: '' as string
+				},
+				color: {
+					fieldType: 'select',
+					type: 'static',
+					selectOptions: selectOptions.buttonColorOptions,
+					value: 'light'
+				},
+				size: {
+					fieldType: 'select',
+					type: 'static',
+
+					selectOptions: selectOptions.buttonSizeOptions,
+					value: 'xs'
+				},
+				fillContainer: {
+					fieldType: 'boolean',
+					type: 'static',
+
+					value: false
+				},
+				beforeIcon: {
+					type: 'static',
+					value: 'Menu',
+					fieldType: 'icon-select'
+				},
+				afterIcon: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'icon-select'
+				}
+			},
+			menuItems: true
+		}
+	},
+	decisiontreecomponent: {
+		name: 'Decision Tree',
+		icon: Network,
+		documentationLink: `${documentationBaseUrl}/decision_tree`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {},
+			componentInput: undefined,
+			numberOfSubgrids: 1,
+			nodes: [
+				{
+					id: 'a',
+					label: 'a',
+					allowed: {
+						type: 'evalv2',
+						expr: 'true',
+						fieldType: 'boolean',
+						connections: []
+					},
+					next: []
+				}
+			] as DecisionTreeNode[]
+		}
+	},
+	s3fileinputcomponent: {
+		name: 'S3 File Uploader',
+		icon: UploadCloud,
+		documentationLink: `${documentationBaseUrl}/s3fileinput`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				type: {
+					type: 'oneOf',
+					selected: 's3',
+					labels: {
+						s3: 'S3'
+					},
+					configuration: {
+						s3: {
+							resource: {
+								type: 'static',
+								fieldType: 'resource',
+								value: '',
+								subFieldType: 's3'
+							} as StaticAppInput,
+							acceptedFileTypes: {
+								type: 'static',
+								value: ['image/*', 'application/pdf'] as string[],
+								fieldType: 'array'
+							},
+							allowMultiple: {
+								type: 'static',
+								value: false,
+								fieldType: 'boolean',
+								tooltip: 'If allowed, the user will be able to select more than one file'
+							},
+							text: {
+								type: 'static',
+								value: 'Drag and drop files or click to select them',
+								fieldType: 'text'
+							},
+							/*
+							displayDirectLink: {
+								type: 'static',
+								value: false,
+								fieldType: 'boolean'
+							},
+							*/
+							pathTemplate: {
+								type: 'evalv2',
+								expr: `\`\${file.name}\``,
+								fieldType: 'template',
+								connections: [],
+								onDemandOnly: true
+							} as EvalV2AppInput,
+							disabled: {
+								type: 'static',
+								value: false,
+								fieldType: 'boolean'
+							}
+						}
+					}
+				} as const
+			}
+		}
+	},
+	dbexplorercomponent: {
+		name: 'Database Studio Table',
+		icon: Database,
+		documentationLink: `${documentationBaseUrl}/database_studio`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				type: {
+					type: 'oneOf',
+					selected: 'postgresql',
+					labels: {
+						postgresql: 'PostgreSQL',
+						mysql: 'MySQL',
+						ms_sql_server: 'MS SQL Server',
+						snowflake: 'Snowflake',
+						bigquery: 'BigQuery'
+					},
+					configuration: {
+						postgresql: {
+							resource: {
+								type: 'static',
+								fieldType: 'resource',
+								subFieldType: 'postgres',
+								value: '',
+								allowTypeChange: false
+							} as StaticAppInput,
+							table: {
+								fieldType: 'select',
+								subFieldType: 'db-table',
+								type: 'static',
+								selectOptions: [],
+								value: undefined,
+								allowTypeChange: false
+							}
+						},
+						mysql: {
+							resource: {
+								type: 'static',
+								fieldType: 'resource',
+								subFieldType: 'mysql',
+								value: ''
+							} as StaticAppInput,
+							table: {
+								fieldType: 'select',
+								subFieldType: 'db-table',
+								type: 'static',
+								selectOptions: [],
+								value: undefined
+							}
+						},
+						ms_sql_server: {
+							resource: {
+								type: 'static',
+								fieldType: 'resource',
+								subFieldType: 'ms_sql_server',
+								value: ''
+							} as StaticAppInput,
+							table: {
+								fieldType: 'select',
+								subFieldType: 'db-table',
+								type: 'static',
+								selectOptions: [],
+								value: undefined
+							}
+						},
+						snowflake: {
+							resource: {
+								type: 'static',
+								fieldType: 'resource',
+								subFieldType: 'snowflake',
+								value: ''
+							} as StaticAppInput,
+							table: {
+								fieldType: 'select',
+								subFieldType: 'db-table',
+								type: 'static',
+								selectOptions: [],
+								value: undefined
+							}
+						},
+						bigquery: {
+							resource: {
+								type: 'static',
+								fieldType: 'resource',
+								subFieldType: 'bigquery',
+								value: ''
+							} as StaticAppInput,
+							table: {
+								fieldType: 'select',
+								subFieldType: 'db-table',
+								type: 'static',
+								selectOptions: [],
+								value: undefined
+							}
+						}
+					}
+				} as const,
+				columnDefs: {
+					type: 'static',
+					fieldType: 'array',
+					subFieldType: 'db-explorer',
+					value: [],
+					loading: false
+				} as StaticAppInput,
+				whereClause: {
+					type: 'static',
+					fieldType: 'text',
+					value: '',
+					allowTypeChange: false
+				},
+				flex: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: true,
+
+					tooltip: 'default col flex is 1 (see ag-grid docs)'
+				},
+				allEditable: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					hide: true,
+					tooltip: 'Configure all columns as Editable by users'
+				},
+				allowDelete: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					hide: true,
+					tooltip: 'Allow deleting rows'
+				},
+				multipleSelectable: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+
+					tooltip: 'Make multiple rows selectable at once'
+				},
+				rowMultiselectWithClick: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: true,
+
+					tooltip: 'If multiple selectable, allow multiselect with click'
+				},
+				selectFirstRowByDefault: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: true as boolean,
+					tooltip: 'Select the first row by default on start'
+				},
+				extraConfig: {
+					type: 'static',
+					fieldType: 'object',
+					value: {},
+					tooltip: 'any configuration that can be passed to ag-grid top level'
+				},
+				hideInsert: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					tooltip: 'Hide the insert button'
+				},
+				hideSearch: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					tooltip: 'Hide the search bar'
+				},
+				wrapActions: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					tooltip:
+						'When true, actions will wrap to the next line. Otherwise, the column will grow to fit the actions.'
+				},
+				footer: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: true,
+					tooltip: 'Allow visible footer for pagination and download'
+				},
+				customActionsHeader: {
+					type: 'static',
+					fieldType: 'text',
+					value: undefined,
+					tooltip: 'Custom header for the actions columns'
+				}
+			},
+			componentInput: undefined
+		}
+	},
+	alertcomponent: {
+		name: 'Alert',
+		icon: AlertTriangle,
+		documentationLink: `${documentationBaseUrl}/alert`,
+		dims: '2:1-4:5' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' },
+			background: { class: '', style: '' },
+			icon: { class: '', style: '' },
+			title: { class: '', style: '' },
+			description: { class: '', style: '' }
+		},
+		initialData: {
+			verticalAlignment: 'center',
+			componentInput: undefined,
+			configuration: {
+				type: {
+					fieldType: 'select',
+					type: 'static',
+					selectOptions: [
+						{ value: 'info', label: 'Info' },
+						{ value: 'success', label: 'Success' },
+						{ value: 'warning', label: 'Warning' },
+						{ value: 'error', label: 'Error' }
+					],
+					value: 'info'
+				},
+				title: {
+					type: 'static',
+					value: 'Title',
+					fieldType: 'text'
+				},
+				description: {
+					type: 'static',
+					value: 'Description',
+					fieldType: 'text'
+				},
+				notRounded: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				tooltip: {
+					type: 'static',
+					value: '',
+					fieldType: 'text'
+				},
+				size: {
+					type: 'static',
+					value: 'sm',
+					fieldType: 'select',
+					selectOptions: [
+						{ value: 'xs', label: 'Extra Small' },
+						{ value: 'sm', label: 'Small' }
+					]
+				},
+				collapsible: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				},
+				initiallyCollapsed: {
+					type: 'static',
+					value: false,
+					fieldType: 'boolean'
+				}
+			}
+		}
+	},
+	navbarcomponent: {
+		name: 'Navbar',
+		icon: AppWindow,
+		documentationLink: `${documentationBaseUrl}/navbar`,
+		dims: '12:1-12:2' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' },
+			image: { class: '', style: '' }
+		},
+		initialData: {
+			...defaultAlignement,
+			componentInput: undefined,
+			configuration: {
+				title: {
+					type: 'static',
+					fieldType: 'text',
+					value: 'Title'
+				},
+				borderColor: {
+					type: 'static',
+					value: '#555',
+					fieldType: 'color'
+				},
+				logo: {
+					type: 'oneOf',
+					selected: 'no',
+					labels: {
+						yes: 'Use logo',
+						no: 'No logo'
+					},
+					configuration: {
+						yes: {
+							source: {
+								type: 'static',
+								value: '/logo.svg',
+								fieldType: 'text',
+								fileUpload: {
+									accept: 'image/*',
+									convertTo: 'base64'
+								}
+							},
+							sourceKind: {
+								fieldType: 'select',
+								type: 'static',
+								selectOptions: selectOptions.imageSourceKind,
+								value: 'url' as (typeof selectOptions.imageSourceKind)[number]
+							},
+							altText: {
+								type: 'static',
+								value: '',
+								fieldType: 'text',
+								tooltip: "This text will appear if the image can't be loaded for any reason"
+							}
+						},
+						no: {}
+					}
+				} as const,
+				orientation: {
+					type: 'static',
+					fieldType: 'select',
+					value: 'horizontal',
+					selectOptions: [
+						{ value: 'horizontal', label: 'Horizontal' },
+						{ value: 'vertical', label: 'Vertical' }
+					]
+				}
+			}
+		}
+	},
+	dateselectcomponent: {
+		name: 'Date Select',
+		icon: Calendar,
+		documentationLink: `${documentationBaseUrl}/date_select`,
+		dims: '3:4-6:4' as AppComponentDimensions,
+		customCss: {
+			container: { class: '', style: '' },
+			input: { class: '', style: '' }
+		},
+		initialData: {
+			componentInput: undefined,
+			verticalAlignment: 'center',
+
+			configuration: {
+				enableDay: {
+					type: 'static',
+					value: true,
+					fieldType: 'boolean'
+				},
+				enableMonth: {
+					type: 'static',
+					value: true,
+					fieldType: 'boolean'
+				},
+				enableYear: {
+					type: 'static',
+					value: true,
+					fieldType: 'boolean'
+				},
+				defaultValue: {
+					type: 'static',
+					value: undefined,
+					fieldType: 'date'
+				},
+
+				orientation: {
+					type: 'static',
+					value: 'horizontal',
+					fieldType: 'select',
+					selectOptions: [
+						{ value: 'horizontal', label: 'Horizontal' },
+						{ value: 'vertical', label: 'Vertical' }
+					]
+				},
+				locale: {
+					type: 'static',
+					value: 'en-US',
+					fieldType: 'select',
+					selectOptions: selectOptions.localeOptions,
+					tooltip: 'Format on the month names'
+				}
+			}
+		}
+	},
+	jobiddisplaycomponent: {
+		name: 'Rich Result by Job Id',
+		icon: Monitor,
+		documentationLink: `${documentationBaseUrl}/rich_result_by_job_id`,
+		dims: '2:8-6:8' as AppComponentDimensions,
+		customCss: {
+			header: { class: '', style: '' },
+			container: { class: '', style: '' }
+		},
+		initialData: {
+			configuration: {
+				jobId: {
+					type: 'static',
+					fieldType: 'text',
+					value: '',
+					tooltip: 'Job id to display result from'
+				},
+				title: {
+					type: 'static',
+					fieldType: 'text',
+					value: 'Result'
+				},
+				hideDetails: {
+					type: 'static',
+					fieldType: 'boolean',
+					value: false,
+					tooltip:
+						'Hide the details section: the object keys, the clipboard button and the maximise button'
+				}
+			}
+		}
+	},
+	recomputeallcomponent: {
+		name: 'Recompute all',
+		icon: RefreshCw,
+		documentationLink: `${documentationBaseUrl}/recompute_all`,
+		dims: '4:1-6:1' as AppComponentDimensions,
+		customCss: {
+			container: { style: '', class: '' }
+		},
+		initialData: {
+			...defaultAlignement,
+			componentInput: undefined,
+			configuration: {},
+			menuItems: true
 		}
 	}
 } as const
@@ -2206,6 +4141,14 @@ export const presetComponents = {
 			}
 		},
 		type: 'invisibletabscomponent'
+	},
+	topbarcomponent: {
+		name: 'Top Bar',
+		icon: PanelTop,
+		targetComponent: 'containercomponent' as const,
+		configuration: {},
+		type: 'topbarcomponent',
+		dims: '6:2-12:2' as AppComponentDimensions
 	}
 }
 

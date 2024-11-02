@@ -1,16 +1,28 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
-	import { UserService, WorkspaceService } from '$lib/gen'
+	import { goto } from '$lib/navigation'
+	import { base } from '$lib/base'
+	import {
+		ResourceService,
+		SettingService,
+		UserService,
+		VariableService,
+		WorkspaceService
+	} from '$lib/gen'
 	import { validateUsername } from '$lib/utils'
 	import { logoutWithRedirect } from '$lib/logout'
 	import { page } from '$app/stores'
-	import { switchWorkspace, usersWorkspaceStore } from '$lib/stores'
+	import { usersWorkspaceStore } from '$lib/stores'
 	import CenteredModal from '$lib/components/CenteredModal.svelte'
 	import { Button } from '$lib/components/common'
 	import Toggle from '$lib/components/Toggle.svelte'
 	import Tooltip from '$lib/components/Tooltip.svelte'
 	import { onMount } from 'svelte'
 	import { sendUserToast } from '$lib/toast'
+	import TestOpenaiKey from '$lib/components/copilot/TestOpenaiKey.svelte'
+	import { switchWorkspace } from '$lib/storeUtils'
+	import { isCloudHosted } from '$lib/cloud'
+	import ToggleButtonGroup from '$lib/components/common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from '$lib/components/common/toggleButton-v2/ToggleButton.svelte'
 
 	const rd = $page.url.searchParams.get('rd')
 
@@ -20,6 +32,8 @@
 
 	let errorId = ''
 	let errorUser = ''
+	let openAiKey = ''
+	let codeCompletionEnabled = true
 	let checking = false
 
 	$: id = name.toLowerCase().replace(/\s/gi, '-')
@@ -45,15 +59,49 @@
 			requestBody: {
 				id,
 				name,
-				username
+				username: automateUsernameCreation ? undefined : username
 			}
 		})
 		if (auto_invite) {
 			await WorkspaceService.editAutoInvite({
 				workspace: id,
-				requestBody: { operator: operatorOnly }
+				requestBody: { operator: operatorOnly, invite_all: !isCloudHosted(), auto_add: true }
 			})
 		}
+		if (openAiKey != '') {
+			let actualUsername = username
+			if (automateUsernameCreation) {
+				const user = await UserService.whoami({
+					workspace: id
+				})
+				actualUsername = user.username
+			}
+			let path = `u/${actualUsername}/openai_windmill_codegen`
+			await VariableService.createVariable({
+				workspace: id,
+				requestBody: {
+					path,
+					value: openAiKey,
+					is_secret: true,
+					description: 'Token for openai'
+				}
+			})
+			await ResourceService.createResource({
+				workspace: id,
+				requestBody: {
+					path,
+					value: {
+						api_key: '$var:' + path
+					},
+					resource_type: 'openai'
+				}
+			})
+			await WorkspaceService.editCopilotConfig({
+				workspace: id,
+				requestBody: { openai_resource_path: path, code_completion_enabled: codeCompletionEnabled }
+			})
+		}
+
 		sendUserToast(`Created workspace id: ${id}`)
 
 		usersWorkspaceStore.set(await WorkspaceService.listUserWorkspaces())
@@ -82,17 +130,28 @@
 		}
 	}
 
+	let automateUsernameCreation = false
+	async function getAutomateUsernameCreationSetting() {
+		automateUsernameCreation =
+			((await SettingService.getGlobal({ key: 'automate_username_creation' })) as any) ?? false
+
+		if (!automateUsernameCreation) {
+			UserService.globalWhoami().then((x) => {
+				let uname = ''
+				if (x.name) {
+					uname = x.name.split(' ')[0]
+				} else {
+					uname = x.email.split('@')[0]
+				}
+				uname = uname.replace(/\./gi, '')
+				username = uname.toLowerCase()
+			})
+		}
+	}
+	getAutomateUsernameCreationSetting()
+
 	onMount(() => {
 		loadWorkspaces()
-
-		UserService.globalWhoami().then((x) => {
-			if (x.name) {
-				username = x.name.split(' ')[0]
-			} else {
-				username = x.email.split('@')[0]
-			}
-			username = username.toLowerCase()
-		})
 
 		WorkspaceService.isDomainAllowed().then((x) => {
 			isDomainAllowed = x
@@ -108,49 +167,99 @@
 </script>
 
 <CenteredModal title="New Workspace">
-	<label class="block pb-2 pt-4">
-		<span class="text-gray-700 text-sm">Workspace name</span>
-		<input type="text" bind:value={name} />
+	<label class="block pb-4 pt-4">
+		<span class="text-secondary text-sm">Workspace name</span>
+		<span class="ml-4 text-tertiary text-xs">Displayable name</span>
+		<!-- svelte-ignore a11y-autofocus -->
+		<input autofocus type="text" bind:value={name} />
 	</label>
-	<label class="block pb-2">
-		<span class="text-gray-700 text-sm">Workspace ID</span>
+	<label class="block pb-4">
+		<span class="text-secondary text-sm">Workspace ID</span>
+		<span class="ml-10 text-tertiary text-xs">Slug to uniquely identify your workspace</span>
 		{#if errorId}
 			<span class="text-red-500 text-xs">{errorId}</span>
 		{/if}
 		<input type="text" bind:value={id} class:input-error={errorId != ''} />
 	</label>
-	<label class="block pb-2">
-		<span class="text-gray-700 text-sm">Your username in that workspace</span>
-		{#if errorUser}
-			<span class="text-red-500 text-xs">{errorUser}</span>
+	{#if !automateUsernameCreation}
+		<label class="block pb-4">
+			<span class="text-secondary text-sm">Your username in that workspace</span>
+			<input type="text" bind:value={username} on:keyup={handleKeyUp} />
+			{#if errorUser}
+				<span class="text-red-500 text-xs">{errorUser}</span>
+			{/if}
+		</label>
+	{/if}
+	<label class="block pb-4">
+		<span class="text-secondary text-sm">
+			OpenAI key for Windmill AI
+			<Tooltip>
+				Find out how it can help you <a
+					href="https://www.windmill.dev/docs/core_concepts/ai_generation"
+					target="_blank"
+					rel="noopener noreferrer">in the docs</a
+				>
+			</Tooltip>
+			<span class="text-2xs text-tertiary ml-2">(optional but recommended)</span>
+		</span>
+		<div class="flex flex-row gap-1">
+			<input
+				type="password"
+				autocomplete="new-password"
+				bind:value={openAiKey}
+				on:keyup={handleKeyUp}
+			/>
+			<TestOpenaiKey apiKey={openAiKey} disabled={!openAiKey} />
+		</div>
+		{#if openAiKey}
+			<Toggle
+				disabled={!openAiKey}
+				size="xs"
+				bind:checked={codeCompletionEnabled}
+				options={{ right: 'Enable code completion' }}
+			/>
 		{/if}
-		<input type="text" bind:value={username} on:keyup={handleKeyUp} />
 	</label>
 	<Toggle
-		disabled={!isDomainAllowed}
+		disabled={isCloudHosted() && !isDomainAllowed}
 		bind:checked={auto_invite}
-		options={{ right: `Auto invite users with the same email address domain (${domain})` }}
+		options={{
+			right: isCloudHosted()
+				? `Auto-invite anyone from ${domain}`
+				: `Auto-invite anyone joining the instance`
+		}}
 	/>
-	<div class="flex items-center gap-1">
-		<Toggle
-			disabled={!auto_invite}
-			bind:checked={operatorOnly}
-			options={{ right: `Auto invite users as operators` }}
-		/>
-		<Tooltip
-			>An operator can only execute and view scripts/flows/apps from your workspace, and only those
-			that he has visibility on</Tooltip
-		>
-	</div>
-	{#if isDomainAllowed == false}
-		<div class="text-gray-600 text-sm mb-4 mt-2">{domain} domain not allowed for auto-invite</div>
+	{#if isCloudHosted() && isDomainAllowed == false}
+		<div class="text-tertiary text-sm mb-4 mt-2">{domain} domain not allowed for auto-invite</div>
 	{/if}
+	<div class={'overflow-hidden transition-all ' + (auto_invite ? 'h-36' : 'h-0')}>
+		<div class="text-xs mb-1 leading-6 pt-2">
+			Mode <Tooltip>Whether to invite or add users directly to the workspace.</Tooltip>
+		</div>
+
+		<div class="text-xs mb-1 leading-6 pt-2"
+			>Role <Tooltip>Role of the auto-invited users</Tooltip></div
+		>
+		<ToggleButtonGroup
+			selected={operatorOnly ? 'operator' : 'developer'}
+			on:selected={(e) => {
+				operatorOnly = e.detail == 'operator'
+			}}
+		>
+			<ToggleButton value="operator" size="xs" label="Operator" />
+			<ToggleButton value="developer" size="xs" label="Developer" />
+		</ToggleButtonGroup>
+	</div>
 	<div class="flex flex-wrap flex-row justify-between pt-10 gap-1">
-		<Button variant="border" size="sm" href="/user/workspaces"
+		<Button variant="border" size="sm" href="{base}/user/workspaces"
 			>&leftarrow; Back to workspaces</Button
 		>
 		<Button
-			disabled={checking || errorId != '' || errorUser != '' || !name || !username || !id}
+			disabled={checking ||
+				errorId != '' ||
+				!name ||
+				(!automateUsernameCreation && (errorUser != '' || !username)) ||
+				!id}
 			on:click={createWorkspace}
 		>
 			Create workspace

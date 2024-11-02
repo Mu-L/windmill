@@ -6,8 +6,9 @@
 
 	export let id: string
 	export let field: RichConfiguration
+	export let index: number
 
-	let disablable = !(field.type === 'static' && field.value === false)
+	let disablable = field && !(field?.type === 'static' && field?.value === false)
 </script>
 
 <Toggle
@@ -19,9 +20,10 @@
 	on:change={() => {
 		if (disablable) {
 			field = {
-				type: 'eval',
+				type: 'evalv2',
 				expr: 'false',
-				fieldType: 'boolean'
+				fieldType: 'boolean',
+				connections: []
 			}
 		} else {
 			field = {
@@ -36,24 +38,21 @@
 {#if disablable}
 	<div transition:slide|local>
 		<InputsSpecEditor
-			key={`Tab disabled`}
+			key="tabDisabled {index}"
 			bind:componentInput={field}
 			{id}
 			userInputEnabled={false}
 			shouldCapitalize={true}
 			resourceOnly={false}
-			hasRows={false}
 			fieldType={field?.['fieldType']}
 			subFieldType={field?.['subFieldType']}
 			format={field?.['format']}
 			selectOptions={field?.['selectOptions']}
 			tooltip={field?.['tooltip']}
-			onlyStatic={field?.['onlyStatic']}
 			fileUpload={field?.['fileUpload']}
 			placeholder={field?.['placeholder']}
 			customTitle={field?.['customTitle']}
 			displayType={false}
-			noVariablePicker={true}
 		/>
 	</div>
 {/if}

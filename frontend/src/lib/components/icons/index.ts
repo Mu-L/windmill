@@ -18,6 +18,7 @@ import S3Icon from './S3Icon.svelte'
 import Slack from './Slack.svelte'
 import TogglIcon from './TogglIcon.svelte'
 import WindmillIcon from './WindmillIcon.svelte'
+import WindmillIcon2 from './WindmillIcon2.svelte'
 import MailchimpIcon from './MailchimpIcon.svelte'
 import SendgridIcon from './SendgridIcon.svelte'
 import SendflakeIcon from './SendflakeIcon.svelte'
@@ -38,6 +39,7 @@ import LinkdingIconSvelte from './LinkdingIcon.svelte'
 import AwsIcon from './AwsIcon.svelte'
 import BcryptIcon from './BcryptIcon.svelte'
 import GoogleIcon from './GoogleIcon.svelte'
+import MicrosoftIcon from './MicrosoftIcon.svelte'
 import HackernewsIcon from './HackernewsIcon.svelte'
 import MongodbIcon from './MongodbIcon.svelte'
 import RedditIcon from './RedditIcon.svelte'
@@ -59,6 +61,37 @@ import PineconeIcon from './PineconeIcon.svelte'
 import RssIcon from './RssIcon.svelte'
 import ShopifyIcon from './ShopifyIcon.svelte'
 import TypeformIcon from './TypeformIcon.svelte'
+import BigQueryIcon from './BigQueryIcon.svelte'
+import GraphqlIcon from './GraphqlIcon.svelte'
+import NocoDbIcon from './NocoDbIcon.svelte'
+import AzureIcon from './AzureIcon.svelte'
+import OktaIcon from './OktaIcon.svelte'
+import MsSqlServerIcon from './MSSqlServerIcon.svelte'
+import AuthentikIcon from './AuthentikIcon.svelte'
+import AutheliaIcon from './AutheliaIcon.svelte'
+import KanidmIcon from './KanidmIcon.svelte'
+import AsanaIcon from './AsanaIcon.svelte'
+import BitbucketIcon from './BitbucketIcon.svelte'
+import DynatraceIcon from './DynatraceIcon.svelte'
+import EdgeDbIcon from './EdgeDbIcon.svelte'
+import GitIcon from './GitIcon.svelte'
+import ZendeskIcon from './ZendeskIcon.svelte'
+import TwilioIcon from './TwilioIcon.svelte'
+import TrelloIcon from './TrelloIcon.svelte'
+import ResendIcon from './ResendIcon.svelte'
+import PushoverIcon from './PushoverIcon.svelte'
+import QuickbooksIcon from './QuickbooksIcon.svelte'
+import MsTeamsIcon from './MSTeamsIcon.svelte'
+import MailgunIcon from './MailgunIcon.svelte'
+import IpinfoIcon from './IpinfoIcon.svelte'
+import GoogleCloudIcon from './GoogleCloudIcon.svelte'
+import CaCertificate from './CACertificate.svelte'
+import CurrencyApiIcon from './CurrencyApiIcon.svelte'
+import VismaIcon from './VismaIcon.svelte'
+import JumpCloudIcon from './JumpCloudIcon.svelte'
+import KeycloakIcon from './KeycloakIcon.svelte'
+import ZitadelIcon from './ZitadelIcon.svelte'
+import SpotifyIcon from './SpotifyIcon.svelte'
 
 export const APP_TO_ICON_COMPONENT = {
 	postgresql: PostgresIcon,
@@ -84,6 +117,7 @@ export const APP_TO_ICON_COMPONENT = {
 	mailchimp: MailchimpIcon,
 	sendgrid: SendgridIcon,
 	snowflake: SendflakeIcon,
+	ms_sql_server: MsSqlServerIcon,
 	qrcode: QRCodeIcon,
 	linkedin: LinkedinIcon,
 	hubspot: HubspotIcon,
@@ -101,6 +135,7 @@ export const APP_TO_ICON_COMPONENT = {
 	appwrite: AppwriteIcon,
 	linkding: LinkdingIconSvelte,
 	aws: AwsIcon,
+	microsoft: MicrosoftIcon,
 	bcrypt: BcryptIcon,
 	google: GoogleIcon,
 	hackernews: HackernewsIcon,
@@ -124,7 +159,38 @@ export const APP_TO_ICON_COMPONENT = {
 	pinecone: PineconeIcon,
 	rss: RssIcon,
 	shopify: ShopifyIcon,
-	typeform: TypeformIcon
+	typeform: TypeformIcon,
+	bigquery: BigQueryIcon,
+	graphql: GraphqlIcon,
+	nocodb: NocoDbIcon,
+	azure: AzureIcon,
+	okta: OktaIcon,
+	authentik: AuthentikIcon,
+	authelia: AutheliaIcon,
+	kanidm: KanidmIcon,
+	asana: AsanaIcon,
+	bitbucket: BitbucketIcon,
+	dynatrace: DynatraceIcon,
+	edgedb: EdgeDbIcon,
+	git_repository: GitIcon,
+	zendesk: ZendeskIcon,
+	twilio: TwilioIcon,
+	trello: TrelloIcon,
+	resend: ResendIcon,
+	pushover: PushoverIcon,
+	quickbooks: QuickbooksIcon,
+	ms_teams_webhook: MsTeamsIcon,
+	mailgun: MailgunIcon,
+	ipinfo: IpinfoIcon,
+	gworkspace: GoogleIcon,
+	gcp_service_account: GoogleCloudIcon,
+	cacertificate: CaCertificate,
+	currencyapi: CurrencyApiIcon,
+	visma: VismaIcon,
+	jumpcloud: JumpCloudIcon,
+	keycloak: KeycloakIcon,
+	zitadel: ZitadelIcon,
+	spotify: SpotifyIcon
 } as const
 
 export {
@@ -148,6 +214,7 @@ export {
 	Slack,
 	TogglIcon,
 	WindmillIcon,
+	WindmillIcon2,
 	MailchimpIcon,
 	SendgridIcon,
 	LinkedinIcon,
@@ -184,5 +251,35 @@ export {
 	PineconeIcon,
 	RssIcon,
 	ShopifyIcon,
-	TypeformIcon
+	TypeformIcon,
+	BigQueryIcon,
+	GraphqlIcon,
+	NocoDbIcon,
+	AzureIcon,
+	MicrosoftIcon,
+	OktaIcon,
+	AuthentikIcon,
+	AutheliaIcon,
+	KanidmIcon,
+	AsanaIcon,
+	BitbucketIcon,
+	DynatraceIcon,
+	EdgeDbIcon,
+	GitIcon,
+	ZendeskIcon,
+	TwilioIcon,
+	TrelloIcon,
+	ResendIcon,
+	PushoverIcon,
+	QuickbooksIcon,
+	MsTeamsIcon,
+	MailgunIcon,
+	IpinfoIcon,
+	GoogleCloudIcon,
+	CaCertificate,
+	CurrencyApiIcon,
+	VismaIcon,
+	JumpCloudIcon,
+	KeycloakIcon,
+	ZitadelIcon
 }

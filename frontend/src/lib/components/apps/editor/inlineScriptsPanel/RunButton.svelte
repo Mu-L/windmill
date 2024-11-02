@@ -1,9 +1,13 @@
 <script lang="ts">
 	import { getContext } from 'svelte'
-	import type { AppViewerContext, CancelablePromise, InlineScript } from '../../types'
-	import { Button, Kbd } from '$lib/components/common'
-	import { getModifierKey } from '$lib/utils'
-	import { Loader2 } from 'lucide-svelte'
+	import type {
+		AppEditorContext,
+		AppViewerContext,
+		CancelablePromise,
+		InlineScript
+	} from '../../types'
+	import { Button } from '$lib/components/common'
+	import { CornerDownLeft, Loader2 } from 'lucide-svelte'
 
 	export let id: string
 	export let inlineScript: InlineScript | undefined = undefined
@@ -11,7 +15,8 @@
 	export let hideShortcut = false
 
 	const { runnableComponents } = getContext<AppViewerContext>('AppViewerContext')
-	let cancelable: CancelablePromise<void> | undefined = undefined
+	const { runnableJobEditorPanel } = getContext<AppEditorContext>('AppEditorContext')
+	let cancelable: CancelablePromise<void>[] | undefined = undefined
 </script>
 
 {#if $runnableComponents[id] != undefined}
@@ -20,26 +25,19 @@
 			loading={runLoading}
 			size="xs"
 			color="dark"
-			variant="border"
-			btnClasses="!px-2 !py-1 !bg-gray-700 !text-white hover:!bg-gray-900"
+			btnClasses="!px-2 !py-1"
 			on:click={async () => {
 				runLoading = true
+				$runnableJobEditorPanel.focused = true
 				try {
-					cancelable = $runnableComponents[id]?.cb?.(inlineScript)
-					await cancelable
+					cancelable = $runnableComponents[id]?.cb?.map((f) => f(inlineScript, true))
+					await Promise.all(cancelable)
 				} catch {}
 				runLoading = false
 			}}
+			shortCut={{ Icon: CornerDownLeft, hide: hideShortcut }}
 		>
-			<div class="flex flex-row gap-1 items-center">
-				Run
-				{#if !hideShortcut}
-					<div class="flex flex-row items-center">
-						<Kbd small>{getModifierKey()}</Kbd>
-						<Kbd small><span class="text-lg font-bold">⏎</span></Kbd>
-					</div>
-				{/if}
-			</div>
+			Run
 		</Button>
 	{:else}
 		<Button
@@ -48,7 +46,7 @@
 			variant="border"
 			btnClasses="!px-2 !py-1.5"
 			on:click={async () => {
-				cancelable?.cancel()
+				cancelable?.forEach((f) => f.cancel())
 				runLoading = false
 			}}
 		>

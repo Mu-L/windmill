@@ -1,20 +1,11 @@
 // deno-lint-ignore-file no-explicit-any
 import { requireLogin, resolveWorkspace, validatePath } from "./context.ts";
-import {
-  AppService,
-  AppWithLastVersion,
-  colors,
-  Command,
-  ListableApp,
-  Policy,
-  Table,
-} from "./deps.ts";
-import {
-  GlobalOptions,
-  isSuperset,
-  parseFromFile,
-  removeType,
-} from "./types.ts";
+import { colors, Command, log, SEP, Table, yamlParseFile } from "./deps.ts";
+import * as wmill from "./gen/services.gen.ts";
+import { ListableApp, Policy } from "./gen/types.gen.ts";
+
+import { GlobalOptions, isSuperset } from "./types.ts";
+import { readInlinePathSync } from "./utils.ts";
 
 export interface AppFile {
   value: any;
@@ -22,48 +13,91 @@ export interface AppFile {
   policy: Policy;
 }
 
+const alreadySynced: string[] = [];
+
 export async function pushApp(
   workspace: string,
   remotePath: string,
-  app: AppFile | AppWithLastVersion | undefined,
-  newApp: AppFile,
-  raw: boolean
+  localPath: string,
+  message?: string
 ): Promise<void> {
-  remotePath = removeType(remotePath, "app");
-  if (raw) {
-    // deleting old app if it exists in raw mode
-    try {
-      app = await AppService.getAppByPath({ workspace, path: remotePath });
-    } catch {
-      //ignore
-    }
+  if (alreadySynced.includes(localPath)) {
+    return;
+  }
+  alreadySynced.push(localPath);
+  remotePath = remotePath.replaceAll(SEP, "/");
+  let app: any = undefined;
+  // deleting old app if it exists in raw mode
+  try {
+    app = await wmill.getAppByPath({
+      workspace,
+      path: remotePath,
+    });
+  } catch {
+    //ignore
   }
 
-  if (app) {
-    if (isSuperset(newApp, app)) {
+  if (!localPath.endsWith(SEP)) {
+    localPath += SEP;
+  }
+  const path = localPath + "app.yaml";
+  const localApp = (await yamlParseFile(path)) as AppFile;
+
+  function replaceInlineScripts(rec: any) {
+    if (!rec) {
       return;
     }
-    await AppService.updateApp({
+    if (typeof rec == "object") {
+      return Object.entries(rec).flatMap(([k, v]) => {
+        if (k == "inlineScript" && typeof v == "object") {
+          const o: Record<string, any> = v as any;
+          if (o["content"] && o["content"].startsWith("!inline")) {
+            const basePath = localPath + o["content"].split(" ")[1];
+            o["content"] = readInlinePathSync(basePath);
+          }
+          if (o["lock"] && o["lock"].startsWith("!inline")) {
+            const basePath = localPath + o["lock"].split(" ")[1];
+            o["lock"] = readInlinePathSync(basePath);
+          }
+        } else {
+          replaceInlineScripts(v);
+        }
+      });
+    }
+    return [];
+  }
+
+  replaceInlineScripts(localApp.value);
+
+  if (app) {
+    if (isSuperset(localApp, app)) {
+      log.info(colors.green(`App ${remotePath} is up to date`));
+      return;
+    }
+    log.info(colors.bold.yellow(`Updating app ${remotePath}...`));
+    await wmill.updateApp({
       workspace,
       path: remotePath,
       requestBody: {
-        ...newApp,
+        deployment_message: message,
+        ...localApp,
       },
     });
   } else {
-    console.log(colors.yellow.bold("Creating new app..."));
+    log.info(colors.yellow.bold("Creating new app..."));
 
-    await AppService.createApp({
+    await wmill.createApp({
       workspace,
       requestBody: {
         path: remotePath,
-        ...newApp,
+        deployment_message: message,
+        ...localApp,
       },
     });
   }
 }
 
-async function list(opts: GlobalOptions) {
+async function list(opts: GlobalOptions & { includeDraftOnly?: boolean }) {
   const workspace = await resolveWorkspace(opts);
   await requireLogin(opts);
 
@@ -71,10 +105,11 @@ async function list(opts: GlobalOptions) {
   const perPage = 10;
   const total: ListableApp[] = [];
   while (true) {
-    const res = await AppService.listApps({
+    const res = await wmill.listApps({
       workspace: workspace.workspaceId,
       page,
       perPage,
+      includeDraftOnly: opts.includeDraftOnly ?? false,
     });
     page += 1;
     total.push(...res);
@@ -91,39 +126,22 @@ async function list(opts: GlobalOptions) {
     .render();
 }
 
-async function push(opts: GlobalOptions, filePath: string) {
-  const remotePath = filePath.split(".")[0];
+async function push(opts: GlobalOptions, filePath: string, remotePath: string) {
   if (!validatePath(remotePath)) {
     return;
   }
   const workspace = await resolveWorkspace(opts);
   await requireLogin(opts);
 
-  let app: AppWithLastVersion | undefined = undefined;
-  try {
-    app = await AppService.getAppByPath({
-      workspace: workspace.workspaceId,
-      path: remotePath,
-    });
-  } catch {
-    // app doesn't exist
-  }
-
-  await pushApp(
-    workspace.workspaceId,
-    remotePath,
-    app,
-    parseFromFile(filePath),
-    false
-  );
-  console.log(colors.bold.underline.green("App pushed"));
+  await pushApp(workspace.workspaceId, remotePath, filePath);
+  log.info(colors.bold.underline.green("Flow pushed"));
 }
 
 const command = new Command()
   .description("app related commands")
   .action(list as any)
   .command("push", "push a local app ")
-  .arguments("<file_path:file>")
+  .arguments("<file_path:string> <remote_path:string>")
   .action(push as any);
 
 export default command;

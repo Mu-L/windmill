@@ -10,14 +10,20 @@ const layout: ComponentSet = {
 	title: 'Layout',
 	components: [
 		'containercomponent',
+		'listcomponent',
 		'horizontaldividercomponent',
 		'verticaldividercomponent',
 		'drawercomponent',
 		'verticalsplitpanescomponent',
 		'horizontalsplitpanescomponent',
 		'modalcomponent',
-		'steppercomponent'
-	]
+		'steppercomponent',
+		'carousellistcomponent',
+		'decisiontreecomponent',
+		'navbarcomponent',
+		'recomputeallcomponent'
+	],
+	presets: ['topbarcomponent']
 } as const
 
 const buttons: ComponentSet = {
@@ -31,18 +37,25 @@ const inputs: ComponentSet = {
 		'schemaformcomponent',
 		'textinputcomponent',
 		'textareainputcomponent',
+		'quillcomponent',
 		'passwordinputcomponent',
 		'emailinputcomponent',
 		'numberinputcomponent',
 		'currencycomponent',
 		'slidercomponent',
+		'dateslidercomponent',
 		'rangecomponent',
 		'dateinputcomponent',
+		'timeinputcomponent',
+		'datetimeinputcomponent',
+		'dateselectcomponent',
 		'fileinputcomponent',
+		's3fileinputcomponent',
 		'checkboxcomponent',
 		'selectcomponent',
 		'resourceselectcomponent',
-		'multiselectcomponent',
+		'userresourcecomponent',
+		'multiselectcomponentv2',
 		'selecttabcomponent',
 		'selectstepcomponent'
 	]
@@ -56,29 +69,44 @@ const display: ComponentSet = {
 		'imagecomponent',
 		'mapcomponent',
 		'htmlcomponent',
+		'mardowncomponent',
 		'pdfcomponent',
 		'displaycomponent',
-		'logcomponent',
-		'flowstatuscomponent'
+		'jobidlogcomponent',
+		'jobidflowstatuscomponent',
+		'jobiddisplaycomponent',
+		'statcomponent',
+		'menucomponent',
+		'alertcomponent'
 	]
 } as const
 
 const tables: ComponentSet = {
 	title: 'Tables',
-	components: ['tablecomponent', 'aggridcomponent']
+	components: [
+		'aggridcomponent',
+		'aggridcomponentee',
+		'dbexplorercomponent',
+		'aggridinfinitecomponent',
+		'aggridinfinitecomponentee',
+		'tablecomponent'
+	]
 } as const
 
 const charts: ComponentSet = {
 	title: 'Charts',
 	components: [
-		'barchartcomponent',
-		'piechartcomponent',
+		'plotlycomponentv2',
+		'chartjscomponentv2',
 		'vegalitecomponent',
-		'plotlycomponent',
-		'scatterchartcomponent',
-		'timeseriescomponent',
-		'chartjscomponent'
+		'agchartscomponent',
+		'agchartscomponentee'
 	]
 } as const
 
 export const COMPONENT_SETS = [layout, tabs, buttons, inputs, tables, display, charts] as const
+
+export const DEPRECATED_COMPONENTS = {
+	tablecomponent:
+		'We will be removing this component in the future. we recommend using the AgGrid table instead.'
+}

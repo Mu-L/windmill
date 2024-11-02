@@ -59,7 +59,8 @@ class LanguageServerWebSocketHandler(websocket.WebSocketHandler):
 
     def on_message(self, message):
         """Forward client->server messages to the endpoint."""
-        self.writer.write(json.loads(message))
+        if not "Unhandled method" in message:
+            self.writer.write(json.loads(message))
 
     def on_close(self) -> None:
         log.info("CLOSING: " + str(self.id))
@@ -87,6 +88,7 @@ class DenoLS(LanguageServerWebSocketHandler):
     procargs = ["deno", "lsp"]
 
 
+
 class GoLS(LanguageServerWebSocketHandler):
     procargs = ["gopls", "serve"]
 
@@ -103,7 +105,7 @@ if __name__ == "__main__":
     go_mod_path = os.path.join(monaco_path, "go.mod")
     if not os.path.exists(go_mod_path):
         f = open(go_mod_path, "w")
-        f.write("module mymod\ngo 1.19")
+        f.write("module mymod\ngo 1.22")
         f.close()
     port = int(os.environ.get("PORT", "3001"))
     app = web.Application(

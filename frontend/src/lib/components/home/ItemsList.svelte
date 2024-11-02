@@ -1,13 +1,12 @@
 <script lang="ts">
 	import CenteredPage from '$lib/components/CenteredPage.svelte'
-	import { Alert, Badge, Skeleton } from '$lib/components/common'
-	import ShareModal from '$lib/components/ShareModal.svelte'
+	import { Button, Skeleton } from '$lib/components/common'
 	import Toggle from '$lib/components/Toggle.svelte'
 	import {
 		AppService,
 		FlowService,
-		ListableApp,
-		Script,
+		type ListableApp,
+		type Script,
 		ScriptService,
 		type Flow,
 		type ListableRawApp,
@@ -15,28 +14,36 @@
 	} from '$lib/gen'
 	import { userStore, workspaceStore } from '$lib/stores'
 	import type uFuzzy from '@leeoniya/ufuzzy'
-	import { Code2, LayoutDashboard } from 'lucide-svelte'
+	import {
+		Code2,
+		FoldVertical,
+		LayoutDashboard,
+		SearchCode,
+		SlidersHorizontal,
+		UnfoldVertical
+	} from 'lucide-svelte'
 
 	export let filter = ''
-
-	import AppRow from '$lib/components/common/table/AppRow.svelte'
-	import FlowRow from '$lib/components/common/table/FlowRow.svelte'
-	import ScriptRow from '$lib/components/common/table/ScriptRow.svelte'
+	export let subtab: 'flow' | 'script' | 'app' = 'script'
 
 	import { HOME_SEARCH_SHOW_FLOW, HOME_SEARCH_PLACEHOLDER } from '$lib/consts'
 
-	import ConfirmationModal from '../common/confirmationModal/ConfirmationModal.svelte'
-	import MoveDrawer from '../MoveDrawer.svelte'
 	import SearchItems from '../SearchItems.svelte'
 	import ListFilters from './ListFilters.svelte'
 	import NoItemFound from './NoItemFound.svelte'
 	import ToggleButtonGroup from '../common/toggleButton-v2/ToggleButtonGroup.svelte'
 	import ToggleButton from '../common/toggleButton-v2/ToggleButton.svelte'
 	import FlowIcon from './FlowIcon.svelte'
-	import RawAppRow from '../common/table/RawAppRow.svelte'
-	import { canWrite } from '$lib/utils'
+	import { canWrite, getLocalSetting, storeLocalSetting } from '$lib/utils'
 	import { page } from '$app/stores'
 	import { setQuery } from '$lib/navigation'
+	import Drawer from '../common/drawer/Drawer.svelte'
+	import HighlightCode from '../HighlightCode.svelte'
+	import DrawerContent from '../common/drawer/DrawerContent.svelte'
+	import Item from './Item.svelte'
+	import TreeViewRoot from './TreeViewRoot.svelte'
+	import { Popup } from '../common'
+	import { getContext } from 'svelte'
 
 	type TableItem<T, U extends 'script' | 'flow' | 'app' | 'raw_app'> = T & {
 		canWrite: boolean
@@ -44,6 +51,7 @@
 		type?: U
 		time?: number
 		starred?: boolean
+		has_draft?: boolean
 	}
 
 	type TableScript = TableItem<Script, 'script'>
@@ -60,20 +68,16 @@
 
 	let itemKind = ($page.url.searchParams.get('kind') as 'script' | 'flow' | 'app' | 'all') ?? 'all'
 
-	let shareModal: ShareModal
-	let moveDrawer: MoveDrawer
-
 	let loading = true
 
-	let nbDisplayed = 30
+	let nbDisplayed = 15
 
-	export let deleteConfirmedCallback: (() => void) | undefined = undefined
-
-	async function loadScripts(): Promise<void> {
+	async function loadScripts(includeWithoutMain: boolean): Promise<void> {
 		const loadedScripts = await ScriptService.listScripts({
 			workspace: $workspaceStore!,
 			showArchived: archived ? true : undefined,
-			perPage: 300
+			includeWithoutMain: includeWithoutMain ? true : undefined,
+			includeDraftOnly: true
 		})
 
 		scripts = loadedScripts.map((script: Script) => {
@@ -89,7 +93,8 @@
 		flows = (
 			await FlowService.listFlows({
 				workspace: $workspaceStore!,
-				showArchived: archived ? true : undefined
+				showArchived: archived ? true : undefined,
+				includeDraftOnly: true
 			})
 		).map((x: Flow) => {
 			return {
@@ -104,15 +109,17 @@
 	}
 
 	async function loadApps(): Promise<void> {
-		apps = (await AppService.listApps({ workspace: $workspaceStore! })).map((app: ListableApp) => {
-			return {
-				canWrite:
-					canWrite(app.path!, app.extra_perms!, $userStore) &&
-					app.workspace_id == $workspaceStore &&
-					!$userStore?.operator,
-				...app
+		apps = (await AppService.listApps({ workspace: $workspaceStore!, includeDraftOnly: true })).map(
+			(app: ListableApp) => {
+				return {
+					canWrite:
+						canWrite(app.path!, app.extra_perms!, $userStore) &&
+						app.workspace_id == $workspaceStore &&
+						!$userStore?.operator,
+					...app
+				}
 			}
-		})
+		)
 		loading = false
 	}
 
@@ -165,12 +172,30 @@
 					a.starred != b.starred ? (a.starred ? -1 : 1) : a.time - b.time > 0 ? -1 : 1
 			  )
 
+	function filterItemsPathsBaseOnUserFilters(
+		item: TableScript | TableFlow | TableApp | TableRawApp,
+		filterUserFolders: boolean
+	) {
+		if ($workspaceStore == 'admins') return true
+		if (filterUserFolders) {
+			return !item.path.startsWith('u/') || item.path.startsWith('u/' + $userStore?.username + '/')
+		} else {
+			return true
+		}
+	}
 	$: preFilteredItems =
 		ownerFilter != undefined
 			? combinedItems?.filter(
-					(x) => x.path.startsWith(ownerFilter ?? '') && (x.type == itemKind || itemKind == 'all')
+					(x) =>
+						x.path.startsWith(ownerFilter + '/' ?? '') &&
+						(x.type == itemKind || itemKind == 'all') &&
+						filterItemsPathsBaseOnUserFilters(x, filterUserFolders)
 			  )
-			: combinedItems?.filter((x) => x.type == itemKind || itemKind == 'all')
+			: combinedItems?.filter(
+					(x) =>
+						(x.type == itemKind || itemKind == 'all') &&
+						filterItemsPathsBaseOnUserFilters(x, filterUserFolders)
+			  )
 
 	let ownerFilter: string | undefined = undefined
 
@@ -180,7 +205,7 @@
 
 	$: {
 		if ($userStore && $workspaceStore) {
-			loadScripts()
+			loadScripts(includeWithoutMain)
 			loadFlows()
 			if (!archived) {
 				loadApps()
@@ -250,6 +275,35 @@
 	$: items && resetScroll()
 
 	let archived = false
+
+	const TREE_VIEW_SETTING_NAME = 'treeView'
+	const FILTER_USER_FOLDER_SETTING_NAME = 'filterUserFolders'
+	const INCLUDE_WITHOUT_MAIN_SETTING_NAME = 'includeWithoutMain'
+	let treeView = getLocalSetting(TREE_VIEW_SETTING_NAME) == 'true'
+	let filterUserFolders = getLocalSetting(FILTER_USER_FOLDER_SETTING_NAME) == 'true'
+	let includeWithoutMain = getLocalSetting(INCLUDE_WITHOUT_MAIN_SETTING_NAME)
+		? getLocalSetting(INCLUDE_WITHOUT_MAIN_SETTING_NAME) == 'true'
+		: true
+
+	$: storeLocalSetting(TREE_VIEW_SETTING_NAME, treeView ? 'true' : undefined)
+	$: storeLocalSetting(FILTER_USER_FOLDER_SETTING_NAME, filterUserFolders ? 'true' : undefined)
+	$: storeLocalSetting(INCLUDE_WITHOUT_MAIN_SETTING_NAME, includeWithoutMain ? 'true' : undefined)
+
+	const openSearchWithPrefilledText: (t?: string) => void = getContext("openSearchWithPrefilledText")
+
+	let viewCodeDrawer: Drawer
+	let viewCodeTitle: string | undefined
+	let script: Script | undefined
+	async function showCode(path: string, summary: string) {
+		viewCodeTitle = summary || path
+		await viewCodeDrawer.openDrawer()
+		script = await ScriptService.getScriptByPath({
+			workspace: $workspaceStore!,
+			path
+		})
+	}
+
+	let collapseAll = true
 </script>
 
 <SearchItems
@@ -260,32 +314,33 @@
 	{opts}
 />
 
-<ShareModal
-	bind:this={shareModal}
-	on:change={() => {
-		loadScripts()
-		loadApps()
-		loadFlows()
-		loadRawApps()
+<Drawer
+	bind:this={viewCodeDrawer}
+	on:close={() => {
+		setTimeout(() => {
+			viewCodeTitle = undefined
+			script = undefined
+		}, 300)
 	}}
-/>
-
-<MoveDrawer
-	bind:this={moveDrawer}
-	on:update={() => {
-		loadScripts()
-		loadApps()
-		loadFlows()
-		loadRawApps()
-	}}
-/>
+>
+	<DrawerContent title={viewCodeTitle} on:close={viewCodeDrawer.closeDrawer}>
+		{#if script}
+			<HighlightCode language={script?.language} code={script?.content} />
+		{:else}
+			<Skeleton layout={[[40]]} />
+		{/if}
+	</DrawerContent>
+</Drawer>
 
 <CenteredPage>
-	<div class="flex flex-wrap gap-2 items-center justify-between w-full">
+	<div class="flex flex-wrap gap-2 items-center justify-between w-full mt-2">
 		<div class="flex justify-start">
 			<ToggleButtonGroup
 				bind:selected={itemKind}
 				on:selected={() => {
+					if (itemKind != 'all') {
+						subtab = itemKind
+					}
 					setQuery($page.url, 'kind', itemKind)
 				}}
 				class="h-10"
@@ -311,13 +366,13 @@
 			</ToggleButtonGroup>
 		</div>
 
-		<div class="relative text-gray-600 grow min-w-[100px]">
+		<div class="relative text-tertiary grow min-w-[100px]">
 			<!-- svelte-ignore a11y-autofocus -->
 			<input
 				autofocus
 				placeholder={HOME_SEARCH_PLACEHOLDER}
 				bind:value={filter}
-				class="bg-white !h-10 !px-4 !pr-10 !rounded-lg text-sm focus:outline-none"
+				class="bg-surface !h-10 !px-4 !pr-10 !rounded-lg text-sm focus:outline-none"
 			/>
 			<button type="submit" class="absolute right-0 top-0 mt-3 mr-4">
 				<svg
@@ -340,16 +395,92 @@
 				</svg>
 			</button>
 		</div>
+		<Button
+			on:click={() => openSearchWithPrefilledText("#")}
+			variant="border"
+			size="sm"
+			spacingSize="lg"
+			wrapperClasses="h-10"
+			color="light"
+			endIcon={{
+				icon: SearchCode
+			}}
+		>
+			Content
+		</Button>
 	</div>
 	<div class="relative">
-		<ListFilters bind:selectedFilter={ownerFilter} filters={owners} />
+		<ListFilters
+			syncQuery
+			bind:selectedFilter={ownerFilter}
+			filters={owners}
+			bottomMargin={false}
+		/>
 		{#if filteredItems?.length == 0}
 			<div class="mt-10" />
 		{/if}
 		{#if !loading}
-			<div class="absolute -bottom-2 right-0 bg-white/90">
-				<Toggle size="xs" bind:checked={archived} options={{ right: 'Show archived' }} /></div
-			>
+			<div class="flex w-full flex-row-reverse gap-2 mt-4 mb-1 items-center h-6">
+				<Popup
+					floatingConfig={{ placement: 'bottom-end' }}
+					containerClasses="border rounded-lg shadow-lg p-4 bg-surface"
+				>
+					<svelte:fragment slot="button">
+						<Button
+							startIcon={{
+								icon: SlidersHorizontal
+							}}
+							nonCaptureEvent
+							iconOnly
+							size="xs"
+							color="light"
+							variant="border"
+							spacingSize="xs2"
+						/>
+					</svelte:fragment>
+					<div>
+						<span class="text-sm font-semibold">Filters</span>
+						<div class="flex flex-col gap-2 mt-2">
+							<Toggle size="xs" bind:checked={archived} options={{ right: 'Only archived' }} />
+							{#if $userStore && !$userStore.operator}
+								<Toggle
+									size="xs"
+									bind:checked={includeWithoutMain}
+									options={{ right: 'Include without main function' }}
+								/>
+							{/if}
+						</div>
+					</div>
+				</Popup>
+				{#if $userStore?.is_super_admin && $userStore.username.includes('@')}
+					<Toggle size="xs" bind:checked={filterUserFolders} options={{ right: 'Only f/*' }} />
+				{:else if $userStore?.is_admin || $userStore?.is_super_admin}
+					<Toggle
+						size="xs"
+						bind:checked={filterUserFolders}
+						options={{ right: `Only u/${$userStore.username} and f/*` }}
+					/>
+				{/if}
+				<Toggle size="xs" bind:checked={treeView} options={{ right: 'Tree view' }} />
+				{#if treeView}
+					<Button
+						btnClasses="py-0 h-6"
+						size="xs"
+						variant="border"
+						color="light"
+						on:click={() => (collapseAll = !collapseAll)}
+						startIcon={{
+							icon: collapseAll ? UnfoldVertical : FoldVertical
+						}}
+					>
+						{#if collapseAll}
+							Expand all
+						{:else}
+							Collapse all
+						{/if}
+					</Button>
+				{/if}
+			</div>
 		{/if}
 	</div>
 	<div>
@@ -361,91 +492,49 @@
 			{/each}
 		{:else if filteredItems.length === 0}
 			<NoItemFound />
+		{:else if treeView}
+			<TreeViewRoot
+				{items}
+				{nbDisplayed}
+				{collapseAll}
+				isSearching={filter !== ''}
+				on:scriptChanged={() => loadScripts(includeWithoutMain)}
+				on:flowChanged={loadFlows}
+				on:appChanged={loadApps}
+				on:rawAppChanged={loadRawApps}
+				on:reload={() => {
+					loadScripts(includeWithoutMain)
+					loadFlows()
+					loadApps()
+					loadRawApps()
+				}}
+				{showCode}
+			/>
 		{:else}
-			<div class="border rounded-md divide-y divide-gray-200">
-				<!-- <VirtualList {items} let:item bind:start bind:end> -->
+			<div class="border rounded-md">
 				{#each (items ?? []).slice(0, nbDisplayed) as item (item.type + '/' + item.path)}
-					{#key item.summary}
-						{#key item.starred}
-							{#if item.type == 'script'}
-								<ScriptRow
-									bind:deleteConfirmedCallback
-									starred={item.starred ?? false}
-									marked={item.marked}
-									on:change={loadScripts}
-									script={item}
-									{shareModal}
-									{moveDrawer}
-								/>
-							{:else if item.type == 'flow'}
-								<FlowRow
-									bind:deleteConfirmedCallback
-									starred={item.starred ?? false}
-									marked={item.marked}
-									on:change={loadFlows}
-									flow={item}
-									{shareModal}
-									{moveDrawer}
-								/>
-							{:else if item.type == 'app'}
-								<AppRow
-									bind:deleteConfirmedCallback
-									starred={item.starred ?? false}
-									marked={item.marked}
-									on:change={loadApps}
-									app={item}
-									{moveDrawer}
-									{shareModal}
-								/>
-							{:else if item.type == 'raw_app'}
-								<RawAppRow
-									bind:deleteConfirmedCallback
-									starred={item.starred ?? false}
-									marked={item.marked}
-									on:change={loadRawApps}
-									app={item}
-									{moveDrawer}
-									{shareModal}
-								/>
-							{/if}
-						{/key}
-					{/key}
+					<Item
+						{item}
+						on:scriptChanged={() => loadScripts(includeWithoutMain)}
+						on:flowChanged={loadFlows}
+						on:appChanged={loadApps}
+						on:rawAppChanged={loadRawApps}
+						on:reload={() => {
+							loadScripts(includeWithoutMain)
+							loadFlows()
+							loadApps()
+							loadRawApps()
+						}}
+						{showCode}
+					/>
 				{/each}
-				<!-- </VirtualList> -->
 			</div>
-			{#if items && items?.length > 30}
+			{#if items && items?.length > 15 && nbDisplayed < items.length}
 				<span class="text-xs"
 					>{nbDisplayed} items out of {items.length}
 					<button class="ml-4" on:click={() => (nbDisplayed += 30)}>load 30 more</button></span
 				>
 			{/if}
-			<div class="pb-80" />
 		{/if}
 	</div>
 </CenteredPage>
-
-<ConfirmationModal
-	open={Boolean(deleteConfirmedCallback)}
-	title="Remove"
-	confirmationText="Remove"
-	on:canceled={() => {
-		deleteConfirmedCallback = undefined
-	}}
-	on:confirmed={() => {
-		if (deleteConfirmedCallback) {
-			deleteConfirmedCallback()
-		}
-		deleteConfirmedCallback = undefined
-	}}
->
-	<div class="flex flex-col w-full space-y-4">
-		<span>Are you sure you want to remove it?</span>
-		<Alert type="info" title="Bypass confirmation">
-			<div>
-				You can press
-				<Badge color="dark-gray">SHIFT</Badge>
-				while removing to bypass confirmation.
-			</div>
-		</Alert>
-	</div>
-</ConfirmationModal>

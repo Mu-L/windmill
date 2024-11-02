@@ -1,68 +1,56 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte'
-	// A table suitable if you can pass data as a list of row objects
+	import DropdownV2 from './DropdownV2.svelte'
+	import Cell from './table/Cell.svelte'
+	import DataTable from './table/DataTable.svelte'
+	import Head from './table/Head.svelte'
+
 	export let headers: string[] | undefined
 	export let data: any[] | undefined // Object containing the data
 	export let keys: string[]
-	export let defaultText: string = 'No data to display'
-	export let paginated = false
-	export let twTextSize: string = 'text-sm md:text-base'
+	export let size: 'sm' | 'md' | 'lg' = 'md'
 
-	const dispatch = createEventDispatcher()
+	export let getRowActions: ((row: any) => any[]) | undefined = undefined
 </script>
 
-<div class="mt-2 flex flex-col {$$props.class}">
-	<div class="inline-block min-w-full align-middle">
-		<table class="min-w-full divide-y divide-gray-300 table-auto">
-			<thead>
-				<tr class={twTextSize}>
-					{#if headers}
-						{#each headers as header, i}
-							<th
-								class="py-3.5 text-left text-sm font-semibold text-gray-900 capitalize {i == 0
-									? 'sm:pl-6 md:pl-0 pl-4 pr-3'
-									: 'px-3 '}">{header}</th
-							>
-						{/each}
-					{/if}
-				</tr>
-			</thead>
-			<tbody class="divide-y divide-gray-200">
-				{#if data && keys && data.length > 0}
-					{#each data as row}
-						<tr>
-							{#each keys as key, i}
-								<td
-									class="py-2 text-sm text-gray-700 break-words {i == 0
-										? 'pl-4 pr-3 sm:pl-6 md:pl-0 font-semibold'
-										: 'px-3'} {twTextSize}"
-								>
-									{row[key] ?? ''}</td
-								>
-							{/each}
-						</tr>
+<div class="mt-2 w-full">
+	<DataTable {size}>
+		<Head>
+			<tr>
+				{#if headers}
+					{#each headers as header, i}
+						<Cell first={i == 0} last={i == headers.length - 1} head class="max-w-96">{header}</Cell
+						>
 					{/each}
-				{:else if data}
-					<tr>{defaultText}</tr>
-				{:else}
-					<tr>Loading...</tr>
+					{#if getRowActions !== undefined}
+						<Cell head last />
+					{/if}
 				{/if}
-			</tbody>
-		</table>
-	</div>
+			</tr>
+		</Head>
+		<tbody class="divide-y">
+			{#if data && keys && data.length > 0}
+				{#each data as row}
+					{@const rowActions = getRowActions?.(row)}
+					<tr>
+						{#each keys as key, i}
+							<Cell
+								first={i == 0}
+								last={i == keys.length - 1}
+								class="max-w-96 whitespace-pre-wrap overflow-hidden text-ellipsis"
+							>
+								{row[key] ?? ''}
+							</Cell>
+						{/each}
+						{#if rowActions && rowActions.length > 0}
+							<Cell last shouldStopPropagation>
+								<DropdownV2 items={rowActions} />
+							</Cell>
+						{/if}
+					</tr>
+				{/each}
+			{:else}
+				<tr>Loading...</tr>
+			{/if}
+		</tbody>
+	</DataTable>
 </div>
-{#if paginated}
-	<div class="flex flex-row-reverse text-gray-500">
-		<button
-			on:click={() => {
-				dispatch('next')
-			}}>Next</button
-		>
-		<button
-			class="mx-2"
-			on:click={() => {
-				dispatch('next')
-			}}>Previous</button
-		>
-	</div>
-{/if}

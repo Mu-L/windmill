@@ -1,54 +1,178 @@
-import { ScriptService, type MainArgSignature } from '$lib/gen'
+import { ScriptService, type MainArgSignature, FlowService, type Script } from '$lib/gen'
 import { get, writable } from 'svelte/store'
-import type { Schema, SchemaProperty } from './common.js'
-import { sortObject } from './utils.js'
+import type { Schema, SupportedLanguage } from './common.js'
+import { emptySchema, sortObject } from './utils.js'
 import { tick } from 'svelte'
 
-const loadSchemaLastRun = writable<[string | undefined, MainArgSignature | undefined]>(undefined)
+import initTsParser, { parse_deno, parse_outputs } from 'windmill-parser-wasm-ts'
+import initRegexParsers, {
+	parse_sql,
+	parse_mysql,
+	parse_bigquery,
+	parse_snowflake,
+	parse_graphql,
+	parse_mssql,
+	parse_db_resource,
+	parse_bash,
+	parse_powershell
+} from 'windmill-parser-wasm-regex'
+import initPythonParser, { parse_python } from 'windmill-parser-wasm-py'
+import initGoParser, { parse_go } from 'windmill-parser-wasm-go'
+import initPhpParser, { parse_php } from 'windmill-parser-wasm-php'
+import initRustParser, { parse_rust } from 'windmill-parser-wasm-rust'
+import initYamlParser, { parse_ansible } from 'windmill-parser-wasm-yaml'
+
+import wasmUrlTs from 'windmill-parser-wasm-ts/windmill_parser_wasm_bg.wasm?url'
+import wasmUrlRegex from 'windmill-parser-wasm-regex/windmill_parser_wasm_bg.wasm?url'
+import wasmUrlPy from 'windmill-parser-wasm-py/windmill_parser_wasm_bg.wasm?url'
+import wasmUrlGo from 'windmill-parser-wasm-go/windmill_parser_wasm_bg.wasm?url'
+import wasmUrlPhp from 'windmill-parser-wasm-php/windmill_parser_wasm_bg.wasm?url'
+import wasmUrlRust from 'windmill-parser-wasm-rust/windmill_parser_wasm_bg.wasm?url'
+import wasmUrlYaml from 'windmill-parser-wasm-yaml/windmill_parser_wasm_bg.wasm?url'
+import { workspaceStore } from './stores.js'
+import { argSigToJsonSchemaType } from './inferArgSig.js'
+
+const loadSchemaLastRun =
+	writable<[string | undefined, MainArgSignature | undefined, string | undefined]>(undefined)
+
+let initializeTsPromise: Promise<any> | undefined = undefined
+export async function initWasmTs() {
+	if (initializeTsPromise == undefined) {
+		initializeTsPromise = initTsParser(wasmUrlTs)
+	}
+	await initializeTsPromise
+}
+async function initWasmRegex() {
+	await initRegexParsers(wasmUrlRegex)
+}
+async function initWasmPython() {
+	await initPythonParser(wasmUrlPy)
+}
+async function initWasmPhp() {
+	await initPhpParser(wasmUrlPhp)
+}
+async function initWasmRust() {
+	await initRustParser(wasmUrlRust)
+}
+async function initWasmGo() {
+	await initGoParser(wasmUrlGo)
+}
+async function initWasmYaml() {
+	await initYamlParser(wasmUrlYaml)
+}
 
 export async function inferArgs(
-	language: 'python3' | 'deno' | 'go' | 'bash',
+	language: SupportedLanguage | 'bunnative' | undefined,
 	code: string,
-	schema: Schema
-): Promise<void> {
+	schema: Schema,
+	mainOverride?: string
+): Promise<{
+	no_main_func: boolean | null
+	has_preprocessor: boolean | null
+} | null> {
 	const lastRun = get(loadSchemaLastRun)
 	let inferedSchema: MainArgSignature
-	if (lastRun && code == lastRun[0] && lastRun[1]) {
+	if (lastRun && code == lastRun[0] && lastRun[1] && lastRun[2] == mainOverride) {
 		inferedSchema = lastRun[1]
 	} else {
 		if (code == '') {
 			code = ' '
 		}
+
+		let inlineDBResource: string | undefined = undefined
+		if (['postgresql', 'mysql', 'bigquery', 'snowflake', 'mssql'].includes(language ?? '')) {
+			await initWasmRegex()
+			inlineDBResource = parse_db_resource(code)
+		}
 		if (language == 'python3') {
-			inferedSchema = await ScriptService.pythonToJsonschema({
-				requestBody: code
-			})
+			await initWasmPython()
+			inferedSchema = JSON.parse(parse_python(code, mainOverride))
 		} else if (language == 'deno') {
-			inferedSchema = await ScriptService.denoToJsonschema({
-				requestBody: code
-			})
+			await initWasmTs()
+			inferedSchema = JSON.parse(parse_deno(code, mainOverride))
+		} else if (language == 'nativets') {
+			await initWasmTs()
+			inferedSchema = JSON.parse(parse_deno(code, mainOverride))
+		} else if (language == 'bun' || language == 'bunnative') {
+			await initWasmTs()
+			inferedSchema = JSON.parse(parse_deno(code, mainOverride))
+		} else if (language == 'postgresql') {
+			inferedSchema = JSON.parse(parse_sql(code))
+			if (inlineDBResource === undefined) {
+				inferedSchema.args = [
+					{
+						name: 'database',
+						typ: { resource: 'postgresql' }
+					},
+					...inferedSchema.args
+				]
+			}
+		} else if (language == 'mysql') {
+			inferedSchema = JSON.parse(parse_mysql(code))
+			if (inlineDBResource === undefined) {
+				inferedSchema.args = [
+					{ name: 'database', typ: { resource: 'mysql' } },
+					...inferedSchema.args
+				]
+			}
+		} else if (language == 'bigquery') {
+			inferedSchema = JSON.parse(parse_bigquery(code))
+			if (inlineDBResource === undefined) {
+				inferedSchema.args = [
+					{ name: 'database', typ: { resource: 'bigquery' } },
+					...inferedSchema.args
+				]
+			}
+		} else if (language == 'snowflake') {
+			inferedSchema = JSON.parse(parse_snowflake(code))
+			if (inlineDBResource === undefined) {
+				inferedSchema.args = [
+					{ name: 'database', typ: { resource: 'snowflake' } },
+					...inferedSchema.args
+				]
+			}
+		} else if (language == 'mssql') {
+			inferedSchema = JSON.parse(parse_mssql(code))
+			if (inlineDBResource === undefined) {
+				inferedSchema.args = [
+					{ name: 'database', typ: { resource: 'ms_sql_server' } },
+					...inferedSchema.args
+				]
+			}
+		} else if (language == 'graphql') {
+			await initWasmRegex()
+			inferedSchema = JSON.parse(parse_graphql(code))
+			inferedSchema.args = [{ name: 'api', typ: { resource: 'graphql' } }, ...inferedSchema.args]
 		} else if (language == 'go') {
-			inferedSchema = await ScriptService.goToJsonschema({
-				requestBody: code
-			})
+			await initWasmGo()
+			inferedSchema = JSON.parse(parse_go(code))
 		} else if (language == 'bash') {
-			inferedSchema = await ScriptService.bashToJsonschema({
-				requestBody: code
-			})
+			await initWasmRegex()
+			inferedSchema = JSON.parse(parse_bash(code))
+		} else if (language == 'powershell') {
+			await initWasmRegex()
+			inferedSchema = JSON.parse(parse_powershell(code))
+		} else if (language == 'php') {
+			await initWasmPhp()
+			inferedSchema = JSON.parse(parse_php(code))
+		} else if (language == 'rust') {
+			await initWasmRust()
+			inferedSchema = JSON.parse(parse_rust(code))
+		} else if (language == 'ansible') {
+			await initWasmYaml()
+			inferedSchema = JSON.parse(parse_ansible(code))
 		} else {
-			return
+			return null
 		}
 		if (inferedSchema.type == 'Invalid') {
 			throw new Error(inferedSchema.error)
 		}
-		loadSchemaLastRun.set([code, inferedSchema])
+		loadSchemaLastRun.set([code, inferedSchema, mainOverride])
 	}
 
 	schema.required = []
 	const oldProperties = JSON.parse(JSON.stringify(schema.properties))
-
 	schema.properties = {}
-
 	for (const arg of inferedSchema.args) {
 		if (!(arg.name in oldProperties)) {
 			schema.properties[arg.name] = { description: '', type: '' }
@@ -66,83 +190,98 @@ export async function inferArgs(
 		}
 	}
 	await tick()
+
+	return {
+		no_main_func: inferedSchema.no_main_func,
+		has_preprocessor: inferedSchema.has_preprocessor
+	}
 }
 
-function argSigToJsonSchemaType(
-	t:
-		| string
-		| { resource: string | null }
-		| { list: string | { str: any } | { object: { key: string; typ: any }[] } | null }
-		| { str: string[] | null }
-		| { object: { key: string; typ: any }[] },
-	oldS: SchemaProperty
-): void {
-	const newS: SchemaProperty = { type: '' }
-	if (t === 'int') {
-		newS.type = 'integer'
-	} else if (t === 'float') {
-		newS.type = 'number'
-	} else if (t === 'bool') {
-		newS.type = 'boolean'
-	} else if (t === 'email') {
-		newS.type = 'string'
-		newS.format = 'email'
-	} else if (t === 'sql') {
-		newS.type = 'string'
-		newS.format = 'sql'
-	} else if (t === 'yaml') {
-		newS.type = 'string'
-		newS.format = 'yaml'
-	} else if (t === 'bytes') {
-		newS.type = 'string'
-		newS.contentEncoding = 'base64'
-	} else if (t === 'datetime') {
-		newS.type = 'string'
-		newS.format = 'date-time'
-	} else if (typeof t !== 'string' && `object` in t) {
-		newS.type = 'object'
-		if (t.object) {
-			const properties = {}
-			for (const prop of t.object) {
-				properties[prop.key] = {}
-				argSigToJsonSchemaType(prop.typ, properties[prop.key])
-			}
-			newS.properties = properties
-		}
-	} else if (typeof t !== 'string' && `str` in t) {
-		newS.type = 'string'
-		if (t.str) {
-			newS.enum = t.str
-		}
-	} else if (typeof t !== 'string' && `resource` in t) {
-		newS.type = 'object'
-		newS.format = `resource-${t.resource}`
-	} else if (typeof t !== 'string' && `list` in t) {
-		newS.type = 'array'
-		if (t.list === 'int' || t.list === 'float') {
-			newS.items = { type: 'number' }
-		} else if (t.list === 'bytes') {
-			newS.items = { type: 'string', contentEncoding: 'base64' }
-		} else if (t.list && typeof t.list == 'object' && `object` in t.list) {
-			newS.items = { type: 'object' }
-		} else {
-			newS.items = { type: 'string' }
-		}
-	} else {
-		newS.type = 'object'
-	}
-	if (oldS.type != newS.type) {
-		for (const prop of Object.getOwnPropertyNames(newS)) {
-			if (prop != 'description') {
-				delete oldS[prop]
-			}
-		}
-	} else if (oldS.format == 'date-time' && newS.format != 'date-time') {
-		delete oldS.format
-	}
+export async function loadSchemaFromPath(path: string, hash?: string): Promise<Schema> {
+	if (path.startsWith('hub/')) {
+		const { content, language, schema } = await ScriptService.getHubScriptByPath({ path })
 
-	Object.assign(oldS, newS)
-	if (oldS.format?.startsWith('resource-') && newS.type != 'object') {
-		oldS.format = undefined
+		if (schema && typeof schema === 'object' && 'properties' in schema) {
+			return schema as any
+		} else {
+			const newSchema = emptySchema()
+			await inferArgs(language as SupportedLanguage, content ?? '', newSchema)
+			return newSchema
+		}
+	} else if (hash) {
+		const script = await ScriptService.getScriptByHash({
+			workspace: get(workspaceStore)!,
+			hash
+		})
+
+		return inferSchemaIfNecessary(script)
+	} else {
+		const script = await ScriptService.getScriptByPath({
+			workspace: get(workspaceStore)!,
+			path: path ?? ''
+		})
+		return inferSchemaIfNecessary(script)
 	}
+}
+
+async function inferSchemaIfNecessary(script: Script) {
+	if (script.schema) {
+		return script.schema as any
+	} else {
+		const newSchema = emptySchema()
+		await inferArgs(script.language, script.content ?? '', newSchema)
+		return newSchema
+	}
+}
+
+export async function loadSchema(
+	workspace: string,
+	path: string,
+	runType: 'script' | 'flow' | 'hubscript'
+): Promise<{ schema: Schema; summary: string | undefined }> {
+	if (runType === 'script') {
+		const script = await ScriptService.getScriptByPath({
+			workspace,
+			path
+		})
+
+		return { schema: script.schema as any, summary: script.summary }
+	} else if (runType === 'flow') {
+		const flow = await FlowService.getFlowByPath({
+			workspace,
+			path
+		})
+
+		return { schema: flow.schema as any, summary: flow.summary }
+	} else {
+		const script = await ScriptService.getHubScriptByPath({
+			path
+		})
+		if (
+			script.schema == undefined ||
+			Object.keys(script.schema).length == 0 ||
+			typeof script.schema != 'object'
+		) {
+			script.schema = emptySchema()
+		}
+
+		await inferArgs(script.language as SupportedLanguage, script.content, script.schema as any)
+		return { schema: script.schema as any, summary: script.summary }
+	}
+}
+
+export async function parseOutputs(
+	code: string,
+	ignoreError
+): Promise<[string, string][] | undefined> {
+	await initWasmTs()
+	const getOutputs = await parse_outputs(code)
+	const outputs = JSON.parse(getOutputs)
+	if (outputs.error) {
+		if (ignoreError) {
+			return undefined
+		}
+		throw new Error(outputs.error)
+	}
+	return outputs.error ? [] : outputs.outputs
 }

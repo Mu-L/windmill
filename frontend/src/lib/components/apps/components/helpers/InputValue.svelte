@@ -1,12 +1,25 @@
 <script lang="ts">
-	import { isCodeInjection } from '$lib/components/flows/utils'
 	import { createEventDispatcher, getContext, onDestroy, tick } from 'svelte'
-	import type { AppInput, EvalAppInput, UploadAppInput } from '../../inputType'
-	import type { AppViewerContext, RichConfiguration } from '../../types'
+	import type {
+		AppInput,
+		EvalAppInput,
+		EvalV2AppInput,
+		TemplateV2Input,
+		UploadAppInput
+	} from '../../inputType'
+	import type {
+		AppEditorContext,
+		AppViewerContext,
+		GroupContext,
+		ListContext,
+		RichConfiguration
+	} from '../../types'
 	import { accessPropertyByPath } from '../../utils'
 	import { computeGlobalContext, eval_like } from './eval'
 	import deepEqualWithOrderedArray from './deepEqualWithOrderedArray'
 	import { deepEqual } from 'fast-equals'
+	import { deepMergeWithPriority, isCodeInjection } from '$lib/utils'
+	import sum from 'hash-sum'
 
 	type T = string | number | boolean | Record<string | number, any> | undefined
 
@@ -14,10 +27,50 @@
 	export let value: T
 	export let id: string | undefined = undefined
 	export let error: string = ''
-	export let extraContext: Record<string, any> = {}
 	export let key: string = ''
+	export let field: string = key
+	export let onDemandOnly: boolean = false
+	export let exportValueFunction: boolean = false
 
 	const { componentControl, runnableComponents } = getContext<AppViewerContext>('AppViewerContext')
+
+	const editorContext = getContext<AppEditorContext>('AppEditorContext')
+	const iterContext = getContext<ListContext>('ListWrapperContext')
+	const rowContext = getContext<ListContext>('RowWrapperContext')
+	const groupContext = getContext<GroupContext>('GroupContext')
+
+	let previousConnectedValue: any | undefined = undefined
+
+	let previousConnectedValues: Record<string, any> = {}
+
+	let groupStore = groupContext?.context
+
+	$: fullContext = {
+		iter: iterContext ? $iterContext : undefined,
+		row: rowContext ? $rowContext : undefined,
+		group: groupStore ? $groupStore : undefined
+	}
+
+	$: lastInput?.type == 'evalv2' &&
+		!onDemandOnly &&
+		(fullContext.iter != undefined ||
+			fullContext.row != undefined ||
+			fullContext.group != undefined) &&
+		lastInput.connections?.some(
+			(x) => x.componentId == 'row' || x.componentId == 'iter' || x.componentId == 'group'
+		) &&
+		debounceEval()
+
+	$: lastInput &&
+		lastInput.type == 'templatev2' &&
+		isCodeInjection(lastInput.eval) &&
+		(fullContext.iter != undefined ||
+			fullContext.row != undefined ||
+			fullContext.group != undefined) &&
+		lastInput.connections?.some(
+			(x) => x.componentId == 'row' || x.componentId == 'iter' || x.componentId == 'group'
+		) &&
+		debounceTemplate()
 
 	const dispatch = createEventDispatcher()
 
@@ -25,14 +78,15 @@
 		dispatch('done')
 	}
 
-	let lastInput = input ? JSON.parse(JSON.stringify(input)) : undefined
+	let lastInput: AppInput | undefined = input ? JSON.parse(JSON.stringify(input)) : undefined
 
 	onDestroy(() => (lastInput = undefined))
 
 	$: if (input && !deepEqualWithOrderedArray(input, lastInput)) {
 		lastInput = JSON.parse(JSON.stringify(input))
 		// Needed because of file uploads
-		if (input?.['value'] instanceof ArrayBuffer) {
+		if (lastInput && input?.['value'] instanceof ArrayBuffer) {
+			// @ts-ignore
 			lastInput.value = input?.['value']
 		}
 	}
@@ -45,6 +99,10 @@
 
 	let firstDebounce = true
 	const debounce_ms = 50
+
+	export async function computeExpr(args?: Record<string, any>) {
+		return await evalExpr(lastInput as EvalAppInput, args)
+	}
 
 	function debounce(cb: () => Promise<void>) {
 		if (firstDebounce) {
@@ -73,9 +131,9 @@
 	$: lastInput && $worldStore && debounce(handleConnection)
 
 	const debounceTemplate = async () => {
-		console.log('template')
-		let nvalue = await getValue(lastInput)
+		let nvalue = await getValue(lastInput as EvalAppInput)
 		if (!deepEqual(nvalue, value)) {
+			// console.log('template')
 			value = nvalue
 		}
 	}
@@ -87,22 +145,93 @@
 		$state &&
 		debounce(debounceTemplate)
 
-	const debounceEval = async () => {
-		let nvalue = await evalExpr(lastInput)
-		if (!deepEqual(nvalue, value)) {
-			value = nvalue
+	let lastExprHash: any = undefined
+
+	const debounceEval = async (s?: string) => {
+		let args = s == 'exprChanged' ? { file: { name: 'example.png' } } : undefined
+		let nvalue = await evalExpr(lastInput as EvalAppInput, args)
+
+		if (field) {
+			editorContext?.evalPreview.update((x) => {
+				x[`${id}.${field}`] = nvalue
+				return x
+			})
+		}
+
+		if (!onDemandOnly) {
+			let nhash = typeof nvalue != 'object' ? nvalue : sum(nvalue)
+			if (lastExprHash != nhash) {
+				// console.log('eval changed', field, nvalue)
+				value = nvalue
+				lastExprHash = nhash
+			}
 		}
 	}
 
 	$: lastInput && lastInput.type == 'eval' && $stateId && $state && debounce2(debounceEval)
 
+	$: lastInput?.type == 'evalv2' && lastInput.expr && debounceEval('exprChanged')
+	$: lastInput?.type == 'templatev2' && lastInput.eval && debounceTemplate()
+
 	async function handleConnection() {
+		// console.log('handleCon')
 		if (lastInput?.type === 'connected') {
-			$worldStore?.connect<any>(lastInput, onValueChange, `${id}-${key}`)
+			if (lastInput.connection) {
+				const { path, componentId } = lastInput.connection
+				const [p] = path ? path.split('.')[0].split('[') : [undefined]
+				if (p) {
+					const skey = `${id}-${key}-${rowContext ? $rowContext.index : 0}-${
+						iterContext ? $iterContext.index : 0
+					}`
+					$worldStore?.connect<any>(
+						{ componentId: componentId, id: p },
+						onValueChange,
+						skey,
+						previousConnectedValue
+					)
+				} else {
+					console.debug('path was invalid for connection', lastInput.connection)
+				}
+			}
 		} else if (lastInput?.type === 'static' || lastInput?.type == 'template') {
 			value = await getValue(lastInput)
 		} else if (lastInput?.type == 'eval') {
 			value = await evalExpr(lastInput as EvalAppInput)
+		} else if (lastInput?.type == 'evalv2') {
+			// console.log('evalv2', onDemandOnly, field)
+			if (onDemandOnly && exportValueFunction) {
+				value = (args?: any) => {
+					return evalExpr(lastInput as EvalV2AppInput, args)
+				}
+				return
+			}
+			const skey = `${id}-${key}-${rowContext ? $rowContext.index : 0}-${
+				iterContext ? $iterContext.index : 0
+			}`
+			const input = lastInput as EvalV2AppInput
+			for (const c of input.connections ?? []) {
+				const previousValueKey = `${c.componentId}-${c.id}`
+				$worldStore?.connect<any>(
+					c,
+					onEvalChange(previousValueKey),
+					skey,
+					previousConnectedValues[previousValueKey]
+				)
+			}
+		} else if (lastInput?.type == 'templatev2') {
+			const input = lastInput as TemplateV2Input
+			const skey = `${id}-${key}-${rowContext ? $rowContext.index : 0}-${
+				iterContext ? $iterContext.index : 0
+			}`
+			for (const c of input.connections ?? []) {
+				const previousValueKey = `${c.componentId}-${c.id}`
+				$worldStore?.connect<any>(
+					c,
+					onTemplateChange(previousValueKey),
+					skey,
+					previousConnectedValues[previousValueKey]
+				)
+			}
 		} else if (lastInput?.type == 'upload') {
 			value = (lastInput as UploadAppInput).value
 		} else {
@@ -113,59 +242,93 @@
 		dispatch('done')
 	}
 
-	async function evalExpr(input: EvalAppInput): Promise<any> {
+	function onEvalChange(previousValueKey: string) {
+		return (newValue) => {
+			previousConnectedValues[previousValueKey] = newValue
+			debounceEval()
+		}
+	}
+
+	function onTemplateChange(previousValueKey: string) {
+		return (newValue) => {
+			previousConnectedValues[previousValueKey] = newValue
+			debounceTemplate()
+		}
+	}
+
+	async function evalExpr(
+		input: EvalAppInput | EvalV2AppInput,
+		args?: Record<string, any>
+	): Promise<any> {
+		if (iterContext && $iterContext.disabled) return
 		try {
+			const context = computeGlobalContext(
+				$worldStore,
+				deepMergeWithPriority(fullContext, args ?? {})
+			)
 			const r = await eval_like(
 				input.expr,
-				computeGlobalContext($worldStore, extraContext),
-				true,
+				context,
 				$state,
 				$mode == 'dnd',
 				$componentControl,
 				$worldStore,
-				$runnableComponents
+				$runnableComponents,
+				false,
+				groupContext?.id
 			)
 			error = ''
 			return r
 		} catch (e) {
 			error = e.message
+			console.warn("Eval error in app input '" + id + "' with key '" + key + "'", e)
 			return value
 		}
 	}
 
 	async function getValue(input: AppInput) {
+		if (iterContext && $iterContext.disabled) return
+
 		if (!input) return
-		if (input.type === 'template' && isCodeInjection(input.eval)) {
+		if ((input.type === 'template' || input.type == 'templatev2') && isCodeInjection(input.eval)) {
 			try {
 				const r = await eval_like(
 					'`' + input.eval + '`',
-					computeGlobalContext($worldStore, extraContext),
-					true,
+					computeGlobalContext($worldStore, fullContext),
 					$state,
 					$mode == 'dnd',
 					$componentControl,
 					$worldStore,
-					$runnableComponents
+					$runnableComponents,
+					false,
+					groupContext?.id
 				)
 				error = ''
 				return r
 			} catch (e) {
+				console.warn("Eval error in app input '" + id + "' with key '" + key + "'", e)
 				return e.message
 			}
 		} else if (input.type === 'static') {
 			return input.value
-		} else if (input.type === 'template') {
+		} else if (input.type === 'template' || input.type == 'templatev2') {
 			return input.eval
 		}
 	}
 
 	function onValueChange(newValue: any): void {
+		if (iterContext && $iterContext.disabled) return
+
 		if (lastInput?.type === 'connected' && newValue !== undefined && newValue !== null) {
 			const { connection } = lastInput
 			if (!connection) {
 				// No connection
 				return
 			}
+
+			// console.log('onValueChange', newValue, connection, previousConnectedValue)
+
+			previousConnectedValue = newValue
 
 			let { path }: { path: string } = connection
 

@@ -16,7 +16,7 @@
 
 	export function onSuccess() {
 		if (runnable.recomputeIds) {
-			runnable.recomputeIds.forEach((id) => $runnableComponents?.[id]?.cb())
+			runnable.recomputeIds.forEach((id) => $runnableComponents?.[id]?.cb?.map((cb) => cb()))
 		}
 	}
 
@@ -28,18 +28,20 @@
 
 	let outputs = initOutput($worldStore, id, {
 		result: result,
-		loading: false
+		loading: false,
+		jobId: undefined
 	})
 </script>
 
 {#if runnable && (runnable.type == 'runnableByPath' || (runnable.type == 'runnableByName' && runnable.inlineScript != undefined))}
 	<RunnableComponent
+		hasChildrens={false}
 		render={false}
 		{id}
 		fields={runnable.fields}
 		autoRefresh={true}
 		bind:result
-		transformer={undefined}
+		transformer={runnable?.transformer}
 		recomputeOnInputChanged={runnable.recomputeOnInputChanged ?? true}
 		{runnable}
 		wrapperClass="hidden"

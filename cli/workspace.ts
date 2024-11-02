@@ -2,17 +2,9 @@
 import { GlobalOptions } from "./types.ts";
 import { getRootStore } from "./store.ts";
 import { loginInteractive, tryGetLoginInfo } from "./login.ts";
-import {
-  colors,
-  Command,
-  DelimiterStream,
-  Input,
-  log,
-  setClient,
-  Table,
-  UserService,
-  WorkspaceService,
-} from "./deps.ts";
+import { colors, Command, Input, log, setClient, Table } from "./deps.ts";
+
+import * as wmill from "./gen/services.gen.ts";
 import { requireLogin } from "./context.ts";
 
 export interface Workspace {
@@ -22,57 +14,30 @@ export interface Workspace {
   token: string;
 }
 
-function makeWorkspaceStream(
-  readable: ReadableStream<Uint8Array>
-): ReadableStream<Workspace> {
-  return readable
-    .pipeThrough(new DelimiterStream(new TextEncoder().encode("\n")))
-    .pipeThrough(new TextDecoderStream())
-    .pipeThrough(
-      new TransformStream({
-        transform(line, controller) {
-          try {
-            if (line.length <= 2) {
-              return;
-            }
-            const workspace = JSON.parse(line) as Workspace;
-            workspace.remote = new URL(workspace.remote).toString(); // add trailing slash in all cases!
-            controller.enqueue(workspace);
-          } catch {
-            /* ignore */
-          }
-        },
-      })
-    );
-}
-
-export async function getWorkspaceStream() {
-  const file = await Deno.open((await getRootStore()) + "remotes.ndjson", {
-    write: false,
-    read: true,
-  });
-  return makeWorkspaceStream(file.readable);
-}
-
 export async function allWorkspaces(): Promise<Workspace[]> {
   try {
-    const workspaceStream = await getWorkspaceStream();
-    const workspaces: Workspace[] = [];
-    for await (const workspace of workspaceStream) {
-      workspaces.push(workspace);
-    }
-
-    return workspaces;
+    const file = (await getRootStore()) + "remotes.ndjson";
+    const txt = await Deno.readTextFile(file);
+    return txt
+      .split("\n")
+      .map((line) => {
+        if (line.length <= 2) {
+          return;
+        }
+        const instance = JSON.parse(line) as Workspace;
+        return instance;
+      })
+      .filter(Boolean) as Workspace[];
   } catch (_) {
     return [];
   }
 }
 
 async function getActiveWorkspaceName(
-  opts: GlobalOptions
+  opts: GlobalOptions | undefined
 ): Promise<string | undefined> {
-  if (opts.workspace) {
-    return opts.workspace;
+  if (opts?.workspace) {
+    return opts?.workspace;
   }
   try {
     return await Deno.readTextFile((await getRootStore()) + "/activeWorkspace");
@@ -82,7 +47,7 @@ async function getActiveWorkspaceName(
 }
 
 export async function getActiveWorkspace(
-  opts: GlobalOptions
+  opts: GlobalOptions | undefined
 ): Promise<Workspace | undefined> {
   const name = await getActiveWorkspaceName(opts);
   if (!name) {
@@ -94,7 +59,7 @@ export async function getActiveWorkspace(
 export async function getWorkspaceByName(
   workspaceName: string
 ): Promise<Workspace | undefined> {
-  const workspaceStream = await getWorkspaceStream();
+  const workspaceStream = await allWorkspaces();
   for await (const workspace of workspaceStream) {
     if (workspace.name === workspaceName) {
       return workspace;
@@ -150,7 +115,12 @@ async function switchC(opts: GlobalOptions, workspaceName: string) {
     return;
   }
 
-  return await Deno.writeTextFile(
+  await setActiveWorkspace(workspaceName);
+  return;
+}
+
+export async function setActiveWorkspace(workspaceName: string) {
+  await Deno.writeTextFile(
     (await getRootStore()) + "/activeWorkspace",
     workspaceName
   );
@@ -160,7 +130,7 @@ export async function add(
   opts: GlobalOptions & {
     create: boolean;
     createWorkspaceName: string | undefined;
-    createUsername: string;
+    createUsername: string | undefined;
   },
   workspaceName: string | undefined,
   workspaceId: string | undefined,
@@ -175,8 +145,10 @@ export async function add(
     return;
   }
 
-  if (!workspaceName) {
-    workspaceName = await Input.prompt("Name this workspace:");
+  while (workspaceName === undefined) {
+    if (!workspaceName) {
+      workspaceName = await Input.prompt("Name this workspace:");
+    }
   }
 
   if (!workspaceId) {
@@ -191,8 +163,7 @@ export async function add(
     // first check whether workspaceId is actually a URL
     try {
       const url = new URL(workspaceId);
-      workspaceId = url.username;
-      url.username = "";
+      workspaceId = workspaceName;
       remote = url.toString();
     } catch {
       // not a url
@@ -208,7 +179,7 @@ export async function add(
   remote = new URL(remote).toString(); // add trailing slash in all cases!
 
   let token = await tryGetLoginInfo(opts);
-  if (!token && !Deno.isatty(Deno.stdin.rid)) {
+  if (!token && Deno.stdin.isTerminal && !Deno.stdin.isTerminal()) {
     log.info("Not a TTY, can't login interactively. Pass the token in --token");
     return;
   }
@@ -222,7 +193,7 @@ export async function add(
   );
   let alreadyExists = false;
   try {
-    alreadyExists = await WorkspaceService.existsWorkspace({
+    alreadyExists = await wmill.existsWorkspace({
       requestBody: { id: workspaceId },
     });
   } catch (e) {
@@ -238,11 +209,15 @@ export async function add(
           `Workspace at id ${workspaceId} on ${remote} does not exist. Creating...`
         )
       );
-      await WorkspaceService.createWorkspace({
+      const automateUsernameCreation: boolean =
+        ((await wmill.getGlobal({
+          key: "automate_username_creation",
+        })) as any) ?? false;
+      await wmill.createWorkspace({
         requestBody: {
           id: workspaceId,
-          name: opts.createWorkspaceName ?? workspaceId,
-          username: opts.createUsername,
+          name: opts.createWorkspaceName ?? workspaceName,
+          username: automateUsernameCreation ? undefined : opts.createUsername,
         },
       });
     }
@@ -255,7 +230,7 @@ export async function add(
     log.info(
       "On that instance and with those credentials, the workspaces that you can access are:"
     );
-    const workspaces = await WorkspaceService.listWorkspaces();
+    const workspaces = await wmill.listWorkspaces();
     for (const workspace of workspaces) {
       log.info(`- ${workspace.id} (name: ${workspace.name})`);
     }
@@ -271,10 +246,8 @@ export async function add(
     },
     opts
   );
-  await Deno.writeTextFile(
-    (await getRootStore()) + "/activeWorkspace",
-    workspaceName
-  );
+  await setActiveWorkspace(workspaceName);
+
   log.info(
     colors.green.underline(
       `Added workspace ${workspaceName} for ${workspaceId} on ${remote}!`
@@ -335,7 +308,7 @@ async function remove(_opts: GlobalOptions, name: string) {
 
 async function whoami(_opts: GlobalOptions) {
   await requireLogin(_opts);
-  log.info(await UserService.globalWhoami());
+  log.info(await wmill.globalWhoami());
   const activeName = await getActiveWorkspaceName(_opts);
   log.info("Active: " + colors.green.bold(activeName || "none"));
 }
@@ -358,7 +331,7 @@ const command = new Command()
   )
   .option(
     "--create-username <username:string>",
-    "Specify your own username in the newly created workspace. Ignored if --create is not specified or the workspace already exists.",
+    "Specify your own username in the newly created workspace. Ignored if --create is not specified, the workspace already exists or automatic username creation is enabled on the instance.",
     {
       default: "admin",
     }

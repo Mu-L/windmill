@@ -15,10 +15,9 @@ on:
 
 jobs:
   cargo_test:
-    runs-on: [self-hosted, new]
+    runs-on: ubicloud-standard-8
     container:
       image: ghcr.io/windmill-labs/backend-tests
-      options: --privileged
     services:
       postgres:
         image: postgres
@@ -27,17 +26,27 @@ jobs:
           POSTGRES_PASSWORD: changeme
 
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v3
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          workspaces: |
-            backend
-            backend -> target
+          toolchain: 1.80.0
+      # - uses: Swatinem/rust-cache@v2
+      #   with:
+      #     workspaces: |
+      #       backend
+      #       backend -> target
       - name: cargo test
-        timeout-minutes: 10
-        run: mkdir frontend/build && cd backend && touch windmill-api/openapi-deref.yaml && DATABASE_URL=postgres://postgres:changeme@postgres:5432/windmill cargo test --all -- --nocapture
+        timeout-minutes: 15
+        run:
+          /usr/bin/deno --version &&
+          /usr/bin/bun -v &&
+          go version &&
+          /usr/local/bin/python3 --version &&
+          mkdir frontend/build && cd backend && touch
+          windmill-api/openapi-deref.yaml &&
+          DATABASE_URL=postgres://postgres:changeme@postgres:5432/windmill
+          DISABLE_EMBEDDING=true RUST_LOG=info cargo test --features
+          enterprise,deno_core --all -- --nocapture

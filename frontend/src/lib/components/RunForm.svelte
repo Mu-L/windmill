@@ -1,23 +1,23 @@
 <script lang="ts">
 	import {
+		computeSharableHash as computeSharableHash,
 		defaultIfEmptyString,
-		displayDaysAgo,
 		emptyString,
-		getToday,
 		truncateHash
 	} from '$lib/utils'
 
 	import type { Schema } from '$lib/common'
-	import { runFormStore, userStore } from '$lib/stores'
-	import CliHelpBox from './CliHelpBox.svelte'
 	import { Badge, Button } from './common'
-	import InlineCodeCopy from './InlineCodeCopy.svelte'
 	import SchemaForm from './SchemaForm.svelte'
 	import SharedBadge from './SharedBadge.svelte'
-	import Toggle from './Toggle.svelte'
-	import Tooltip from './Tooltip.svelte'
-	import CollapseLink from './CollapseLink.svelte'
-	import { SCRIPT_VIEW_SHOW_RUN_FROM_CLI, SCRIPT_VIEW_SHOW_SCHEDULE_RUN_LATER } from '$lib/consts'
+
+	import TimeAgo from './TimeAgo.svelte'
+	import Popup from './common/popup/Popup.svelte'
+	import { autoPlacement } from '@floating-ui/core'
+	import { Calendar, CornerDownLeft } from 'lucide-svelte'
+	import RunFormAdvancedPopup from './RunFormAdvancedPopup.svelte'
+	import { page } from '$app/stores'
+	import { replaceState } from '$app/navigation'
 
 	export let runnable:
 		| {
@@ -37,7 +37,8 @@
 	export let runAction: (
 		scheduledForStr: string | undefined,
 		args: Record<string, any>,
-		invisible_to_owner?: boolean
+		invisible_to_owner: boolean | undefined,
+		overrideTag: string | undefined
 	) => void
 	export let buttonText = 'Run'
 	export let schedulable = true
@@ -46,28 +47,48 @@
 	export let topButton = false
 	export let loading = false
 	export let noVariablePicker = false
-	export let viewCliRun = false
-	export let isFlow: boolean
+	export let viewKeybinding = false
+
+	export let scheduledForStr: string | undefined
+	export let invisible_to_owner: boolean | undefined
+	export let overrideTag: string | undefined
 
 	export let args: Record<string, any> = {}
 
-	if ($runFormStore) {
-		args = $runFormStore
-		$runFormStore = undefined
+	let reloadArgs = 0
+	let blockPopupOpen = false
+
+	export async function setArgs(nargs: Record<string, any>) {
+		args = nargs
+		reloadArgs++
 	}
 
 	export function run() {
-		runAction(scheduledForStr, args, invisible_to_owner)
+		runAction(scheduledForStr, args, invisible_to_owner, overrideTag)
 	}
 
 	export let isValid = true
 
-	let scheduledForStr: string | undefined
-	let invisible_to_owner: false
+	$: onArgsChange(args)
+	let debounced: NodeJS.Timeout | undefined = undefined
 
-	$: cliCommand = `wmill ${isFlow ? 'flow' : 'script'} run ${runnable?.path} -d '${JSON.stringify(
-		args
-	)}'`
+	function onArgsChange(args: any) {
+		try {
+			debounced && clearTimeout(debounced)
+			debounced = setTimeout(() => {
+				const nurl = new URL(window.location.href)
+				nurl.hash = computeSharableHash(args)
+
+				try {
+					replaceState(nurl.toString(), $page.state)
+				} catch (e) {
+					console.error(e)
+				}
+			}, 200)
+		} catch (e) {
+			console.error('Impossible to set hash in args', e)
+		}
+	}
 </script>
 
 <div class="max-w-3xl">
@@ -84,9 +105,9 @@
 						{/if}
 
 						<div class="flex items-center gap-2">
-							<span class="text-sm text-gray-500">
+							<span class="text-sm text-tertiary">
 								{#if runnable}
-									Edited {displayDaysAgo(runnable.created_at || '')} by {runnable.created_by ||
+									Edited <TimeAgo agoOnlyIfRecent date={runnable.created_at || ''} /> by {runnable.created_by ||
 										'unknown'}
 								{/if}
 							</span>
@@ -117,7 +138,7 @@
 		<Button
 			btnClasses="!px-6 !py-1 w-full"
 			disabled={!isValid}
-			on:click={() => runAction(undefined, args)}
+			on:click={() => runAction(undefined, args, invisible_to_owner, overrideTag)}
 		>
 			{buttonText}
 		</Button>
@@ -125,105 +146,95 @@
 	{#if runnable?.schema}
 		<div class="my-2" />
 		{#if !runnable.schema.properties || Object.keys(runnable.schema.properties).length === 0}
-			<div class="text-sm p-4">No arguments</div>
+			<div class="text-sm py-4 italic">No arguments</div>
 		{:else}
-			<SchemaForm
-				prettifyHeader
-				{noVariablePicker}
-				{autofocus}
-				schema={runnable.schema}
-				bind:isValid
-				bind:args
-			/>
+			{#key reloadArgs}
+				<SchemaForm
+					helperScript={runnable.hash
+						? {
+								type: 'hash',
+								hash: runnable.hash
+						  }
+						: undefined}
+					prettifyHeader
+					{noVariablePicker}
+					{autofocus}
+					schema={runnable.schema}
+					bind:isValid
+					bind:args
+				/>
+			{/key}
 		{/if}
 	{:else}
-		<div class="text-xs text-gray-600">No arguments</div>
+		<div class="text-xs text-tertiary">No arguments</div>
 	{/if}
 	{#if schedulable}
 		<div class="mt-10" />
 		<div class="flex gap-2 items-start flex-wrap justify-between mt-2 md:mt-6 mb-6">
-			<div class="flex-row-reverse flex grow">
+			<div class="flex-row-reverse flex-wrap flex w-full gap-4">
 				<Button
 					{loading}
 					color="dark"
-					btnClasses="!px-6 !py-1"
+					btnClasses="!px-6 !py-1 !h-8 inline-flex gap-2"
 					disabled={!isValid}
-					on:click={() => runAction(scheduledForStr, args, invisible_to_owner)}
+					on:click={() => runAction(scheduledForStr, args, invisible_to_owner, overrideTag)}
+					shortCut={{ Icon: CornerDownLeft, hide: !viewKeybinding }}
 				>
 					{scheduledForStr ? 'Schedule to run later' : buttonText}
 				</Button>
-			</div>
-		</div>
-		<CollapseLink small text="Advanced">
-			<div class="flex flex-col gap-4 mt-2 border p-2">
-				<div class="flex flex-col gap-2">
-					{#if SCRIPT_VIEW_SHOW_SCHEDULE_RUN_LATER}
-						<div class="border rounded-md p-3 pt-4">
-							<div class="px-2 font-semibold text-sm">Schedule to run later</div>
-
-							<div class="flex flex-row items-end">
-								<div class="w-max md:w-2/3 mt-2 mb-1">
-									<label for="run-time" />
-									<input
-										class="inline-block"
-										type="datetime-local"
-										id="run-time"
-										name="run-scheduled-time"
-										bind:value={scheduledForStr}
-										min={getToday().toISOString().slice(0, 16)}
-									/>
-								</div>
-								<Button
-									variant="border"
-									color="blue"
-									size="sm"
-									btnClasses="mx-2 mb-1"
-									on:click={() => {
-										scheduledForStr = undefined
-									}}
-								>
-									Clear
-								</Button>
-							</div>
-						</div>
-					{/if}
-				</div>
-				{#if runnable?.path?.startsWith(`u/${$userStore?.username}`) != true && (runnable?.path?.split('/')?.length ?? 0) > 2}
-					<div class="flex items-center gap-1">
-						<Toggle
-							options={{
-								right: `make run invisible to others`
-							}}
-							bind:checked={invisible_to_owner}
+				<div>
+					<Popup
+						floatingConfig={{
+							middleware: [
+								autoPlacement({
+									allowedPlacements: [
+										'bottom-start',
+										'bottom-end',
+										'top-start',
+										'top-end',
+										'top',
+										'bottom'
+									]
+								})
+							]
+						}}
+						let:close
+						blockOpen={blockPopupOpen}
+					>
+						<svelte:fragment slot="button">
+							<Button nonCaptureEvent startIcon={{ icon: Calendar }} size="xs" color="light">
+								Advanced
+							</Button>
+						</svelte:fragment>
+						<RunFormAdvancedPopup
+							bind:scheduledForStr
+							bind:invisible_to_owner
+							bind:overrideTag
+							bind:runnable
+							on:close={() => close(null)}
 						/>
-						<Tooltip
-							>By default, runs are visible to the owner(s) of the script or flow being triggered</Tooltip
-						>
-					</div>
-				{/if}
+					</Popup>
+				</div>
 			</div>
-		</CollapseLink>
+			{#if overrideTag}
+				<div class="flex-row-reverse flex w-full text-primary text-sm">
+					tag override: {overrideTag}
+				</div>
+			{/if}
+			{#if invisible_to_owner}
+				<div class="flex-row-reverse flex w-full text-primary text-sm">
+					Job will be invisible to owner
+				</div>
+			{/if}
+		</div>
 	{:else if !topButton}
 		<Button
 			btnClasses="!px-6 !py-1 w-full"
 			disabled={!isValid}
-			on:click={() => runAction(undefined, args, invisible_to_owner)}
+			on:click={() => runAction(undefined, args, invisible_to_owner, overrideTag)}
+			shortCut={{ Icon: CornerDownLeft, hide: !viewKeybinding }}
 		>
 			{buttonText}
 		</Button>
-	{/if}
-
-	{#if viewCliRun}
-		<div>
-			<div class="mt-4" />
-			{#if SCRIPT_VIEW_SHOW_RUN_FROM_CLI}
-				<CollapseLink small text="Run it from CLI">
-					<div class="mt-2" />
-					<InlineCodeCopy content={cliCommand} />
-					<CliHelpBox />
-				</CollapseLink>
-			{/if}
-			<div class="mb-20" />
-		</div>
 	{/if}
 </div>

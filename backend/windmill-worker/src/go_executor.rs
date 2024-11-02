@@ -1,24 +1,27 @@
-use std::process::Stdio;
+use crate::PROXY_ENVS;
+use std::{collections::HashMap, fs::DirBuilder, process::Stdio};
 
 use itertools::Itertools;
-use tokio::{
-    fs::{DirBuilder, File},
-    io::AsyncReadExt,
-    process::Command,
-};
+use serde_json::value::RawValue;
+use tokio::{fs::File, io::AsyncReadExt, process::Command};
 use uuid::Uuid;
 use windmill_common::{
     error::{self, Error},
     jobs::QueuedJob,
     utils::calculate_hash,
+    worker::{save_cache, write_file},
 };
-use windmill_parser_go::parse_go_imports;
+use windmill_parser_go::{parse_go_imports, REQUIRE_PARSE};
+use windmill_queue::{append_logs, CanceledBy};
 
 use crate::{
-    common::{capitalize, read_result, set_logs},
-    create_args_and_out_file, get_reserved_variables, handle_child, write_file,
-    AuthedClientBackgroundTask, DISABLE_NSJAIL, DISABLE_NUSER, GOPRIVATE, GOPROXY, GO_CACHE_DIR,
-    HOME_ENV, NETRC, NSJAIL_PATH, PATH_ENV,
+    common::{
+        capitalize, create_args_and_out_file, get_reserved_variables, read_result,
+        start_child_process, OccupancyMetrics,
+    },
+    handle_child::handle_child,
+    AuthedClientBackgroundTask, DISABLE_NSJAIL, DISABLE_NUSER, GOPRIVATE, GOPROXY,
+    GO_BIN_CACHE_DIR, GO_CACHE_DIR, HOME_ENV, NSJAIL_PATH, PATH_ENV, TZ_ENV,
 };
 
 const GO_REQ_SPLITTER: &str = "//go.sum\n";
@@ -28,9 +31,11 @@ lazy_static::lazy_static! {
     static ref GO_PATH: String = std::env::var("GO_PATH").unwrap_or_else(|_| "/usr/bin/go".to_string());
 }
 
+pub const GO_OBJECT_STORE_PREFIX: &str = "gobin/";
 #[tracing::instrument(level = "trace", skip_all)]
 pub async fn handle_go_job(
-    logs: &mut String,
+    mem_peak: &mut i32,
+    canceled_by: &mut Option<CanceledBy>,
     job: &QueuedJob,
     db: &sqlx::Pool<sqlx::Postgres>,
     client: &AuthedClientBackgroundTask,
@@ -40,41 +45,61 @@ pub async fn handle_go_job(
     shared_mount: &str,
     base_internal_url: &str,
     worker_name: &str,
-) -> Result<serde_json::Value, Error> {
+    envs: HashMap<String, String>,
+    occupation_metrics: &mut OccupancyMetrics,
+) -> Result<Box<RawValue>, Error> {
     //go does not like executing modules at temp root
     let job_dir = &format!("{job_dir}/go");
-    let (skip_go_mod, skip_tidy) = if let Some(requirements) = requirements_o {
+    DirBuilder::new()
+        .recursive(true)
+        .create(&job_dir)
+        .expect("could not create go job dir");
+
+    let hash = calculate_hash(&format!(
+        "{}{}v2",
+        inner_content,
+        requirements_o
+            .as_ref()
+            .map(|x| x.to_string())
+            .unwrap_or_default()
+    ));
+    let bin_path = format!("{}/{hash}", GO_BIN_CACHE_DIR);
+    let remote_path = format!("{GO_OBJECT_STORE_PREFIX}{hash}");
+    let (cache, cache_logs) = windmill_common::worker::load_cache(&bin_path, &remote_path).await;
+
+    let (skip_go_mod, skip_tidy) = if cache {
+        (true, true)
+    } else if let Some(requirements) = requirements_o {
         gen_go_mod(inner_content, job_dir, &requirements).await?
     } else {
         (false, false)
     };
 
-    logs.push_str("\n\n--- GO DEPENDENCIES SETUP ---\n");
-    set_logs(logs, &job.id, db).await;
+    let cache_logs = if !cache {
+        let logs1 = format!("{cache_logs}\n\n--- GO DEPENDENCIES SETUP ---\n");
+        append_logs(&job.id, &job.workspace_id, logs1, db).await;
 
-    install_go_dependencies(
-        &job.id,
-        inner_content,
-        logs,
-        job_dir,
-        db,
-        true,
-        skip_go_mod,
-        skip_tidy,
-        worker_name,
-        &job.workspace_id,
-    )
-    .await?;
+        install_go_dependencies(
+            &job.id,
+            inner_content,
+            mem_peak,
+            canceled_by,
+            job_dir,
+            db,
+            true,
+            skip_go_mod,
+            skip_tidy,
+            worker_name,
+            &job.workspace_id,
+            occupation_metrics,
+        )
+        .await?;
 
-    logs.push_str("\n\n--- GO CODE EXECUTION ---\n");
-    set_logs(logs, &job.id, db).await;
-    let client = &client.get_authed().await;
-    create_args_and_out_file(client, job, job_dir).await?;
-    {
-        let sig = windmill_parser_go::parse_go_sig(&inner_content)?;
-        drop(inner_content);
+        create_args_and_out_file(client, job, job_dir, db).await?;
+        {
+            let sig = windmill_parser_go::parse_go_sig(&inner_content)?;
 
-        const WRAPPER_CONTENT: &str = r#"package main
+            const WRAPPER_CONTENT: &str = r#"package main
 
 import (
     "encoding/json"
@@ -120,29 +145,29 @@ func main() {{
     }}
 }}"#;
 
-        write_file(job_dir, "main.go", WRAPPER_CONTENT).await?;
+            write_file(job_dir, "main.go", WRAPPER_CONTENT)?;
 
-        {
-            let spread = &sig
-                .args
-                .clone()
-                .into_iter()
-                .map(|x| format!("req.{}", capitalize(&x.name)))
-                .join(", ");
-            let req_body = &sig
-                .args
-                .into_iter()
-                .map(|x| {
-                    format!(
-                        "{} {} `json:\"{}\"`",
-                        capitalize(&x.name),
-                        windmill_parser_go::otyp_to_string(x.otyp),
-                        x.name
-                    )
-                })
-                .join("\n");
-            let runner_content: String = format!(
-                r#"package inner
+            {
+                let spread = &sig
+                    .args
+                    .clone()
+                    .into_iter()
+                    .map(|x| format!("req.{}", capitalize(&x.name)))
+                    .join(", ");
+                let req_body = &sig
+                    .args
+                    .into_iter()
+                    .map(|x| {
+                        format!(
+                            "{} {} `json:\"{}\"`",
+                            capitalize(&x.name),
+                            windmill_parser_go::otyp_to_string(x.otyp),
+                            x.name
+                        )
+                    })
+                    .join("\n");
+                let runner_content: String = format!(
+                    r#"package inner
 type Req struct {{
     {req_body}
 }}
@@ -152,12 +177,77 @@ func Run(req Req) (interface{{}}, error){{
 }}
 
 "#,
-            );
-            write_file(&format!("{job_dir}/inner"), "runner.go", &runner_content).await?;
+                );
+                write_file(&format!("{job_dir}/inner"), "runner.go", &runner_content)?;
+            }
         }
-    }
-    let mut reserved_variables = get_reserved_variables(job, &client.token, db).await?;
-    reserved_variables.insert("RUST_LOG".to_string(), "info".to_string());
+
+        let mut build_go_cmd = Command::new(GO_PATH.as_str());
+        build_go_cmd
+            .current_dir(job_dir)
+            .env_clear()
+            .env("PATH", PATH_ENV.as_str())
+            .env("BASE_INTERNAL_URL", base_internal_url)
+            .env("GOPATH", GO_CACHE_DIR)
+            .env("HOME", HOME_ENV.as_str())
+            .envs(PROXY_ENVS.clone())
+            .args(vec!["build", "main.go"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let build_go_process = start_child_process(build_go_cmd, GO_PATH.as_str()).await?;
+        handle_child(
+            &job.id,
+            db,
+            mem_peak,
+            canceled_by,
+            build_go_process,
+            false,
+            worker_name,
+            &job.workspace_id,
+            "go build",
+            None,
+            false,
+            &mut Some(occupation_metrics),
+        )
+        .await?;
+
+        match save_cache(
+            &bin_path,
+            &format!("{GO_OBJECT_STORE_PREFIX}{hash}"),
+            &format!("{job_dir}/main"),
+        )
+        .await
+        {
+            Err(e) => {
+                let em = format!("could not save {bin_path} to go cache: {e:?}");
+                tracing::error!(em);
+                em
+            }
+            Ok(logs) => logs,
+        }
+    } else {
+        let target = format!("{job_dir}/main");
+        #[cfg(unix)]
+        let symlink = std::os::unix::fs::symlink(&bin_path, &target);
+        #[cfg(windows)]
+        let symlink = std::os::windows::fs::symlink_dir(&bin_path, &target);
+
+        symlink.map_err(|e| {
+            Error::ExecutionErr(format!(
+                "could not copy cached binary from {bin_path} to {job_dir}/main: {e:?}"
+            ))
+        })?;
+
+        create_args_and_out_file(client, job, job_dir, db).await?;
+        cache_logs
+    };
+
+    let logs2 = format!("{cache_logs}\n\n--- GO CODE EXECUTION ---\n");
+    append_logs(&job.id, &job.workspace_id, logs2, db).await;
+
+    let client = &client.get_authed().await;
+
+    let reserved_variables = get_reserved_variables(job, &client.token, db).await?;
 
     let child = if !*DISABLE_NSJAIL {
         let _ = write_file(
@@ -168,77 +258,60 @@ func Run(req Req) (interface{{}}, error){{
                 .replace("{CACHE_DIR}", GO_CACHE_DIR)
                 .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
                 .replace("{SHARED_MOUNT}", shared_mount),
-        )
-        .await?;
-        let build_go = Command::new(GO_PATH.as_str())
+        )?;
+        let mut nsjail_cmd = Command::new(NSJAIL_PATH.as_str());
+        nsjail_cmd
             .current_dir(job_dir)
             .env_clear()
-            .env("PATH", PATH_ENV.as_str())
-            .env("BASE_INTERNAL_URL", base_internal_url)
-            .env("GOPATH", GO_CACHE_DIR)
-            .env("HOME", HOME_ENV.as_str())
-            .args(vec!["build", "main.go"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        handle_child(
-            &job.id,
-            db,
-            logs,
-            build_go,
-            false,
-            worker_name,
-            &job.workspace_id,
-            "go build",
-        )
-        .await?;
-
-        Command::new(NSJAIL_PATH.as_str())
-            .current_dir(job_dir)
-            .env_clear()
+            .envs(envs)
             .envs(reserved_variables)
             .env("PATH", PATH_ENV.as_str())
+            .env("TZ", TZ_ENV.as_str())
             .env("BASE_INTERNAL_URL", base_internal_url)
             .args(vec!["--config", "run.config.proto", "--", "/tmp/go/main"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?
+            .stderr(Stdio::piped());
+        start_child_process(nsjail_cmd, NSJAIL_PATH.as_str()).await?
     } else {
-        if let Some(ref netrc) = *NETRC {
-            write_file(&HOME_ENV, ".netrc", netrc).await?;
-        }
-        let mut cmd = Command::new(GO_PATH.as_str());
-        cmd.current_dir(job_dir)
+        let compiled_executable_name = "./main";
+        let mut run_go = Command::new(compiled_executable_name);
+        run_go
+            .current_dir(job_dir)
             .env_clear()
+            .envs(envs)
             .envs(reserved_variables)
             .env("PATH", PATH_ENV.as_str())
+            .env("TZ", TZ_ENV.as_str())
             .env("BASE_INTERNAL_URL", base_internal_url)
             .env("GOPATH", GO_CACHE_DIR)
             .env("HOME", HOME_ENV.as_str());
 
         if let Some(ref goprivate) = *GOPRIVATE {
-            cmd.env("GOPRIVATE", goprivate);
+            run_go.env("GOPRIVATE", goprivate);
         }
         if let Some(ref goproxy) = *GOPROXY {
-            cmd.env("GOPROXY", goproxy);
+            run_go.env("GOPROXY", goproxy);
         }
 
-        cmd.args(vec!["run", "main.go"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?
+        run_go.stdout(Stdio::piped()).stderr(Stdio::piped());
+        start_child_process(run_go, compiled_executable_name).await?
     };
     handle_child(
         &job.id,
         db,
-        logs,
+        mem_peak,
+        canceled_by,
         child,
         !*DISABLE_NSJAIL,
         worker_name,
         &job.workspace_id,
         "go run",
+        job.timeout,
+        false,
+        &mut Some(occupation_metrics),
     )
     .await?;
+
     read_result(job_dir).await
 }
 
@@ -251,19 +324,23 @@ async fn gen_go_mod(
 
     let md = requirements.split_once(GO_REQ_SPLITTER);
     if let Some((req, sum)) = md {
-        write_file(job_dir, "go.mod", &req).await?;
-        write_file(job_dir, "go.sum", &sum).await?;
+        write_file(job_dir, "go.mod", &req)?;
+        write_file(job_dir, "go.sum", &sum)?;
         Ok((true, true))
     } else {
-        write_file(job_dir, "go.mod", &requirements).await?;
+        write_file(job_dir, "go.mod", &requirements)?;
         Ok((true, false))
     }
 }
 
+use std::fs::OpenOptions;
+use std::io::prelude::*;
+
 pub async fn install_go_dependencies(
     job_id: &Uuid,
     code: &str,
-    logs: &mut String,
+    mem_peak: &mut i32,
+    canceled_by: &mut Option<CanceledBy>,
     job_dir: &str,
     db: &sqlx::Pool<sqlx::Postgres>,
     non_dep_job: bool,
@@ -271,17 +348,43 @@ pub async fn install_go_dependencies(
     has_sum: bool,
     worker_name: &str,
     w_id: &str,
+    occupation_metrics: &mut OccupancyMetrics,
 ) -> error::Result<String> {
     if !skip_go_mod {
         gen_go_mymod(code, job_dir).await?;
-        let child = Command::new("go")
+        let mut child_cmd = Command::new(GO_PATH.as_str());
+        child_cmd
             .current_dir(job_dir)
             .args(vec!["mod", "init", "mymod"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        let child_process = start_child_process(child_cmd, GO_PATH.as_str()).await?;
 
-        handle_child(job_id, db, logs, child, false, worker_name, w_id, "go init").await?;
+        handle_child(
+            job_id,
+            db,
+            mem_peak,
+            canceled_by,
+            child_process,
+            false,
+            worker_name,
+            w_id,
+            "go init",
+            None,
+            false,
+            &mut Some(occupation_metrics),
+        )
+        .await?;
+
+        for x in REQUIRE_PARSE.captures_iter(code) {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(format!("{job_dir}/go.mod"))
+                .unwrap();
+
+            writeln!(file, "require {}\n", &x[1])?;
+        }
     }
 
     let mut new_lockfile = false;
@@ -291,6 +394,7 @@ pub async fn install_go_dependencies(
     } else {
         "".to_string()
     };
+    let hash = format!("go-{}", hash);
 
     let mut skip_tidy = has_sum;
 
@@ -302,7 +406,8 @@ pub async fn install_go_dependencies(
         .fetch_optional(db)
         .await?
         {
-            logs.push_str(&format!("\nfound cached resolution"));
+            let logs1 = format!("\nfound cached resolution: {}", hash);
+            append_logs(&job_id, w_id, logs1, db).await;
             gen_go_mod(code, job_dir, &cached).await?;
             skip_tidy = true;
             new_lockfile = false;
@@ -312,25 +417,30 @@ pub async fn install_go_dependencies(
     }
 
     let mod_command = if skip_tidy { "download" } else { "tidy" };
-    let child = Command::new(GO_PATH.as_str())
+    let mut child_cmd = Command::new(GO_PATH.as_str());
+    child_cmd
         .current_dir(job_dir)
         .env("GOPATH", GO_CACHE_DIR)
         .args(vec!["mod", mod_command])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let child_process = start_child_process(child_cmd, GO_PATH.as_str()).await?;
+
     handle_child(
         job_id,
         db,
-        logs,
-        child,
+        mem_peak,
+        canceled_by,
+        child_process,
         false,
         worker_name,
         &w_id,
         &format!("go {mod_command}"),
+        None,
+        false,
+        &mut Some(occupation_metrics),
     )
-    .await
-    .map_err(|e| Error::ExecutionErr(format!("Lock file generation failed: {e:?}")))?;
+    .await?;
 
     if (!new_lockfile || has_sum) && non_dep_job {
         return Ok("".to_string());
@@ -371,10 +481,9 @@ async fn gen_go_mymod(code: &str, job_dir: &str) -> error::Result<()> {
     DirBuilder::new()
         .recursive(true)
         .create(&mymod_dir)
-        .await
         .expect("could not create go's mymod dir");
 
-    write_file(&mymod_dir, "inner_main.go", &code).await?;
+    write_file(&mymod_dir, "inner_main.go", &code)?;
 
     Ok(())
 }

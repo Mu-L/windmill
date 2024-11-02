@@ -1,8 +1,7 @@
 <script lang="ts">
 	import { createEventDispatcher } from 'svelte'
-	import { FileUp } from 'lucide-svelte'
+	import { FileUp, Trash } from 'lucide-svelte'
 	import Button from '../../common/button/Button.svelte'
-	import { faTrash } from '@fortawesome/free-solid-svg-icons'
 	import { twMerge } from 'tailwind-merge'
 	import type { ReadFileAs } from './model'
 
@@ -17,9 +16,13 @@
 	export let hideIcon = false
 	export let iconSize = 36
 	export let returnFileNames = false
+	export let submittedText: string | undefined = undefined
+	export let defaultFile: string | undefined = undefined
+	export let disabled: boolean | undefined = undefined
+
 	const dispatch = createEventDispatcher()
 	let input: HTMLInputElement
-	let files: File[] | undefined = undefined
+	export let files: File[] | undefined = undefined
 
 	async function onChange(fileList: FileList | null) {
 		if (!fileList || !fileList.length) {
@@ -33,8 +36,15 @@
 		}
 		for (let i = 0; i < fileList.length; i++) {
 			const file = fileList.item(i)
-			if (file) files.push(file)
+			if (file) {
+				files.push(file)
+			}
 		}
+
+		if (!files.length) {
+			files = undefined
+		}
+
 		// Needs to be reset so the same file can be selected
 		// multiple times in a row
 		input.value = ''
@@ -68,6 +78,22 @@
 		})
 	}
 
+	function handleDragOver(event: DragEvent) {
+		event.preventDefault()
+		if (event.dataTransfer) {
+			event.dataTransfer.dropEffect = 'copy'
+		}
+	}
+
+	function handleDrop(event: DragEvent) {
+		event.preventDefault()
+		if (event.dataTransfer) {
+			if (event.dataTransfer.files && event.dataTransfer.files.length) {
+				onChange(event.dataTransfer.files)
+			}
+		}
+	}
+
 	function removeFile(index: number) {
 		if (!files) return
 		files.splice(index, 1)
@@ -77,7 +103,6 @@
 
 	async function dispatchChange() {
 		files = files
-
 		if (convertTo && files) {
 			const promises = files.map(convertFile)
 			let converted: ConvertedFile[] | { name: string; data: ConvertedFile }[] = await Promise.all(
@@ -91,17 +116,25 @@
 			dispatch('change', files)
 		}
 	}
+
+	export function clearFiles() {
+		files = undefined
+		dispatchChange()
+	}
 </script>
 
 <button
 	class={twMerge(
-		`relative center-center flex-col text-center font-medium text-gray-600 
-		border-2 border-dashed border-gray-400 hover:border-blue-500 
-		focus-within:border-blue-500 hover:bg-blue-50 focus-within:bg-blue-50 
-		duration-200 rounded-lg p-1`,
+		`relative center-center flex-col text-center font-medium text-tertiary 
+		border border-dashed border-gray-400 hover:border-blue-500 
+		focus-within:border-blue-300 hover:bg-blue-50 dark:hover:bg-frost-900  
+		duration-200 rounded-component p-1`,
 		c
 	)}
+	on:dragover={handleDragOver}
+	on:drop={handleDrop}
 	{style}
+	{disabled}
 >
 	{#if !hideIcon && !files}
 		<FileUp size={iconSize} class="mb-2" />
@@ -110,10 +143,10 @@
 		<div class="w-full max-h-full overflow-auto px-6">
 			<slot name="selected-title">
 				<div class="text-center mb-2 px-2">
-					Selected file{files.length > 1 ? 's' : ''}:
+					{submittedText ? submittedText : `Selected file${files.length > 1 ? 's' : ''}`}:
 				</div>
 			</slot>
-			<ul class="relative z-20 max-w-[250px] bg-white rounded-lg overflow-hidden mx-auto">
+			<ul class="relative z-20 max-w-[500px] bg-surface rounded-lg overflow-hidden mx-auto">
 				{#each files as { name }, i}
 					<li
 						class="flex justify-between items-center font-normal text-sm
@@ -126,7 +159,7 @@
 							variant="border"
 							iconOnly
 							btnClasses="bg-transparent"
-							startIcon={{ icon: faTrash }}
+							startIcon={{ icon: Trash }}
 							on:click={() => removeFile(i)}
 						/>
 					</li>
@@ -150,4 +183,10 @@
 		{multiple}
 		{...$$restProps}
 	/>
+
+	{#if defaultFile}
+		<div class="w-full border-dashed border-t-2 text-2xs pt-1 text-tertiary mt-2">
+			Default file: <span class="text-blue-500">{defaultFile}</span>
+		</div>
+	{/if}
 </button>

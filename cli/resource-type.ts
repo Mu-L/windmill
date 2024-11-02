@@ -6,14 +6,9 @@ import {
   removeType,
 } from "./types.ts";
 import { requireLogin, resolveWorkspace } from "./context.ts";
-import {
-  colors,
-  Command,
-  log,
-  ResourceService,
-  ResourceType,
-  Table,
-} from "./deps.ts";
+import { colors, Command, log, Table } from "./deps.ts";
+import * as wmill from "./gen/services.gen.ts";
+import { ResourceType } from "./gen/types.gen.ts";
 
 export interface ResourceTypeFile {
   schema?: any;
@@ -24,26 +19,24 @@ export async function pushResourceType(
   workspace: string,
   remotePath: string,
   resource: ResourceTypeFile | ResourceType | undefined,
-  localResource: ResourceTypeFile,
-  raw: boolean
+  localResource: ResourceTypeFile
 ): Promise<void> {
   remotePath = removeType(remotePath, "resource-type");
-  if (raw) {
-    try {
-      resource = await ResourceService.getResourceType({
-        workspace: workspace,
-        path: remotePath,
-      });
-    } catch {
-      // resource type doesn't exist
-    }
+  try {
+    resource = await wmill.getResourceType({
+      workspace: workspace,
+      path: remotePath,
+    });
+  } catch {
+    // resource type doesn't exist
   }
+
   if (resource) {
     if (isSuperset(localResource, resource)) {
       return;
     }
 
-    await ResourceService.updateResourceType({
+    await wmill.updateResourceType({
       workspace: workspace,
       path: remotePath,
       requestBody: {
@@ -52,7 +45,7 @@ export async function pushResourceType(
     });
   } else {
     log.info(colors.yellow.bold("Creating new resource type..."));
-    await ResourceService.createResourceType({
+    await wmill.createResourceType({
       workspace: workspace,
       requestBody: {
         name: remotePath,
@@ -77,8 +70,7 @@ async function push(opts: PushOptions, filePath: string, name: string) {
     workspace.workspaceId,
     name,
     undefined,
-    parseFromFile(filePath),
-    true
+    parseFromFile(filePath)
   );
   log.info(colors.bold.underline.green("Resource pushed"));
 }
@@ -86,7 +78,7 @@ async function push(opts: PushOptions, filePath: string, name: string) {
 async function list(opts: GlobalOptions) {
   const workspace = await resolveWorkspace(opts);
   await requireLogin(opts);
-  const res = await ResourceService.listResourceType({
+  const res = await wmill.listResourceType({
     workspace: workspace.workspaceId,
   });
 

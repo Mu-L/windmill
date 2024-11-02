@@ -50,7 +50,11 @@
 					summary: summary ?? '',
 					description: flow.description,
 					value: flow.value,
-					schema: flow.schema
+					schema: flow.schema,
+					tag: flow.tag,
+					dedicated_worker: flow.dedicated_worker,
+					ws_error_handler_muted: flow.ws_error_handler_muted,
+					visible_to_runner_only: flow.visible_to_runner_only
 				}
 			})
 		} else if (kind == 'script') {
@@ -64,7 +68,7 @@
 				requestBody: {
 					...script,
 					description: script.description ?? '',
-					lock: script.lock?.split('\n'),
+					lock: script.lock,
 					parent_hash: script.hash,
 					path: path ?? ''
 				}
@@ -96,9 +100,9 @@
 <Drawer bind:this={drawer}>
 	<DrawerContent title="Move/Rename {initialPath}" on:close={drawer.closeDrawer}>
 		{#if !own}
-			<Alert type="warning" title="Not owner"
-				>Since you do not own this item, you cannot move this item (you can however fork it)</Alert
-			>
+			<Alert type="warning" title="Not owner">
+				Since you do not own this item, you cannot move this item (you can however fork it)
+			</Alert>
 		{/if}
 		<h2 class="border-b pb-1 mt-2 mb-4">Summary</h2>
 		<input
@@ -111,9 +115,9 @@
 		<h2 class="border-b pb-1 mt-10 mb-4">Path</h2>
 		<div class="flex flex-col mb-2 gap-6">
 			<Path disabled={!own} {kind} {initialPath} bind:path />
-			<div class="mt-4" />
-			<Button disabled={!own} on:click={updatePath}>Move/Rename</Button>
-			<div />
 		</div>
+		<svelte:fragment slot="actions">
+			<Button disabled={!own} on:click={updatePath}>Move/Rename</Button>
+		</svelte:fragment>
 	</DrawerContent>
 </Drawer>

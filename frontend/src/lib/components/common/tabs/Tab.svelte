@@ -10,8 +10,14 @@
 	export let style = ''
 	export let selectedClass = ''
 	export let selectedStyle = ''
+	export let id: string | undefined = undefined
+	export let active: boolean | undefined = false
+	export let exact = false
 
 	export let disabled: boolean = false
+	const { selected, update, hashNavigation } = getContext<TabsContext>('Tabs')
+
+	$: isSelected = exact ? $selected == value : $selected?.startsWith(value)
 
 	const fontSizeClasses = {
 		xs: 'text-xs',
@@ -20,22 +26,20 @@
 		lg: 'text-lg',
 		xl: 'text-xl'
 	}
-
-	const { selected, update, hashNavigation } = getContext<TabsContext>('Tabs')
 </script>
 
 <button
 	class={twMerge(
-		'border-b-2 py-1 px-4 cursor-pointer transition-all z-10 ease-linear font-medium',
-		$selected?.startsWith(value)
-			? 'border-gray-600 text-gray-800 '
-			: 'border-gray-300 border-opacity-0 hover:border-opacity-100 text-gray-600',
+		'border-b-2 py-1 px-2 cursor-pointer transition-all z-10 ease-linear font-normal text-tertiary',
+		isSelected
+			? 'wm-tab-active font-main'
+			: 'border-gray-300 dark:border-gray-600 border-opacity-0 hover:border-opacity-100 ',
 		fontSizeClasses[size],
 		c,
-		$selected?.startsWith(value) ? selectedClass : '',
-		disabled ? 'cursor-not-allowed text-gray-400' : ''
+		isSelected ? selectedClass : '',
+		disabled ? 'cursor-not-allowed text-tertiary' : ''
 	)}
-	style={`${style} ${$selected?.startsWith(value) ? selectedStyle : ''}`}
+	style={`${style} ${isSelected ? selectedStyle : ''}`}
 	on:click={() => {
 		if (hashNavigation) {
 			window.location.hash = value
@@ -45,6 +49,9 @@
 	}}
 	on:pointerdown|stopPropagation
 	{disabled}
+	{id}
 >
-	<slot />
+	<div class={twMerge(active ? 'bg-blue-50 text-blue-800 rounded-md ' : '', 'px-2 ')}>
+		<slot />
+	</div>
 </button>

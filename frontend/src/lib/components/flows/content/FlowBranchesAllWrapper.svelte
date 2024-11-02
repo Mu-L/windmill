@@ -11,9 +11,15 @@
 	import FlowModuleEarlyStop from './FlowModuleEarlyStop.svelte'
 	import FlowModuleSleep from './FlowModuleSleep.svelte'
 	import FlowModuleSuspend from './FlowModuleSuspend.svelte'
+	import FlowModuleMock from './FlowModuleMock.svelte'
+	import FlowModuleDeleteAfterUse from './FlowModuleDeleteAfterUse.svelte'
+	import { enterpriseLicense } from '$lib/stores'
+	import FlowModuleSkip from './FlowModuleSkip.svelte'
 
+	export let noEditor: boolean
 	export let flowModule: FlowModule
 	export let previousModule: FlowModule | undefined
+	export let parentModule: FlowModule | undefined
 
 	let value = flowModule.value as BranchAll
 	$: value = flowModule.value as BranchAll
@@ -21,15 +27,22 @@
 	let selected = 'early-stop'
 </script>
 
-<div class="h-full flex flex-col w-full">
-	<FlowCard title={value.type == 'branchall' ? 'Run all branches' : 'Run one branch'}>
+<div class="h-full flex flex-col w-full" id="flow-editor-branch-all-wrapper">
+	<FlowCard {noEditor} title={value.type == 'branchall' ? 'Run all branches' : 'Run one branch'}>
 		<SplitPanesWrapper>
 			<Splitpanes horizontal>
 				<Pane size={flowModule ? 60 : 100}>
-					<Alert notRounded type="info" title="All branches will be run" class="m-2">
-						The result of this step is the list of the result of each branch.
-					</Alert>
-
+					{#if !noEditor}
+						<Alert
+							type="info"
+							title="All branches will be run"
+							tooltip="Branch all"
+							documentationLink="https://www.windmill.dev/docs/flows/flow_branches#branch-all"
+							class="m-4"
+						>
+							The result of this step is the list of the result of each branch.
+						</Alert>
+					{/if}
 					<div class="p-4 mt-4 w-full">
 						<h3 class="mb-4"
 							>{value.branches.length} branch{value.branches.length > 1 ? 'es' : ''}</h3
@@ -52,6 +65,7 @@
 								</div>
 							{/each}
 						</div>
+						<p class="text-sm">Add branches and steps directly on the graph.</p>
 						<div class="mt-6 mb-2 text-sm font-bold">Run in parallel</div>
 						<Toggle
 							bind:checked={value.parallel}
@@ -65,23 +79,41 @@
 					<Pane size={40}>
 						<Tabs bind:selected>
 							<Tab value="early-stop">Early Stop/Break</Tab>
-							<Tab value="suspend">Suspend</Tab>
+							<Tab value="skip">Skip</Tab>
+							<Tab value="suspend">Suspend/Approval/Prompt</Tab>
 							<Tab value="sleep">Sleep</Tab>
+							<Tab value="mock">Mock</Tab>
+							<Tab value="lifetime">Lifetime</Tab>
 							<svelte:fragment slot="content">
-								<div class="overflow-hidden bg-white">
+								<div class="overflow-hidden bg-surface">
 									<TabContent value="early-stop" class="flex flex-col flex-1 h-full">
 										<div class="p-4 overflow-y-auto">
 											<FlowModuleEarlyStop bind:flowModule />
 										</div>
 									</TabContent>
+									<TabContent value="skip" class="flex flex-col flex-1 h-full">
+										<div class="p-4 overflow-y-auto">
+											<FlowModuleSkip bind:flowModule {parentModule} {previousModule} />
+										</div>
+									</TabContent>
 									<TabContent value="suspend" class="flex flex-col flex-1 h-full">
 										<div class="p-4 overflow-y-auto">
-											<FlowModuleSuspend bind:flowModule />
+											<FlowModuleSuspend previousModuleId={previousModule?.id} bind:flowModule />
 										</div>
 									</TabContent>
 									<TabContent value="sleep" class="flex flex-col flex-1 h-full">
 										<div class="p-4 overflow-y-auto">
 											<FlowModuleSleep previousModuleId={previousModule?.id} bind:flowModule />
+										</div>
+									</TabContent>
+									<TabContent value="mock" class="flex flex-col flex-1 h-full">
+										<div class="p-4 overflow-y-auto">
+											<FlowModuleMock bind:flowModule />
+										</div>
+									</TabContent>
+									<TabContent value="lifetime" class="flex flex-col flex-1 h-full">
+										<div class="p-4 overflow-y-auto">
+											<FlowModuleDeleteAfterUse bind:flowModule disabled={!$enterpriseLicense} />
 										</div>
 									</TabContent>
 								</div>

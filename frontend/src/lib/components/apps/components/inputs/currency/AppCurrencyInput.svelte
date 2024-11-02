@@ -1,13 +1,21 @@
 <script lang="ts">
-	import { initOutput } from '$lib/components/apps/editor/appUtils'
-	import { getContext } from 'svelte'
+	import { initConfig, initOutput } from '$lib/components/apps/editor/appUtils'
+	import { getContext, onDestroy } from 'svelte'
 	import { twMerge } from 'tailwind-merge'
-	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../../types'
-	import { concatCustomCss } from '../../../utils'
+	import type {
+		AppViewerContext,
+		ComponentCustomCSS,
+		ListContext,
+		ListInputs,
+		RichConfigurations
+	} from '../../../types'
+	import { initCss } from '../../../utils'
 	import AlignWrapper from '../../helpers/AlignWrapper.svelte'
-	import InputValue from '../../helpers/InputValue.svelte'
 	import CurrencyInput from './CurrencyInput.svelte'
 	import InitializeComponent from '../../helpers/InitializeComponent.svelte'
+	import ResolveConfig from '../../helpers/ResolveConfig.svelte'
+	import { components } from '$lib/components/apps/editor/component'
+	import ResolveStyle from '../../helpers/ResolveStyle.svelte'
 
 	export let id: string
 	export let configuration: RichConfigurations
@@ -17,17 +25,23 @@
 
 	const { app, worldStore, selectedComponent, componentControl } =
 		getContext<AppViewerContext>('AppViewerContext')
+	const iterContext = getContext<ListContext>('ListWrapperContext')
+	const listInputs: ListInputs | undefined = getContext<ListInputs>('ListInputs')
 
 	const outputs = initOutput($worldStore, id, {
 		result: null as number | null
 	})
 
-	let defaultValue: number | undefined = undefined
+	onDestroy(() => {
+		listInputs?.remove(id)
+	})
 
-	let isNegativeAllowed: boolean | undefined = undefined
-	let currency: string | undefined = undefined
-	let locale: string | undefined = undefined
-	let value: number | undefined = undefined
+	let resolvedConfig = initConfig(
+		components['currencycomponent'].initialData.configuration,
+		configuration
+	)
+
+	let value: number | undefined = resolvedConfig.defaultValue
 
 	$componentControl[id] = {
 		setValue(nvalue: number) {
@@ -37,43 +51,64 @@
 
 	function handleInput() {
 		outputs?.result.set(value ?? null)
+		if (iterContext && listInputs) {
+			listInputs.set(id, value ?? null)
+		}
 	}
 
-	function handleDefault() {
-		value = defaultValue
+	function handleDefault(dflt: number | undefined) {
+		value = dflt
 		handleInput()
 	}
 
 	$: value != undefined && handleInput()
 
-	$: defaultValue != undefined && handleDefault()
+	$: handleDefault(resolvedConfig.defaultValue)
 
-	$: css = concatCustomCss($app.css?.currencycomponent, customCss)
+	let css = initCss($app.css?.currencycomponent, customCss)
 </script>
 
-<InputValue {id} input={configuration.defaultValue} bind:value={defaultValue} />
-<InputValue {id} input={configuration.isNegativeAllowed} bind:value={isNegativeAllowed} />
-<InputValue {id} input={configuration.currency} bind:value={currency} />
-<InputValue {id} input={configuration.locale} bind:value={locale} />
+{#each Object.keys(components['currencycomponent'].initialData.configuration) as key (key)}
+	<ResolveConfig
+		{id}
+		{key}
+		bind:resolvedConfig={resolvedConfig[key]}
+		configuration={configuration[key]}
+	/>
+{/each}
+
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.currencycomponent}
+	/>
+{/each}
 
 <InitializeComponent {id} />
 
 <AlignWrapper {render} {verticalAlignment}>
-	{#key isNegativeAllowed}
-		{#key locale}
-			{#key currency}
+	{#key resolvedConfig.isNegativeAllowed}
+		{#key resolvedConfig.locale}
+			{#key resolvedConfig.currency}
 				<div class="w-full" on:pointerdown|stopPropagation={() => ($selectedComponent = [id])}>
 					<CurrencyInput
 						inputClasses={{
-							formatted: twMerge('px-2 w-full py-1.5 windmillapp', css?.input?.class),
+							formatted: twMerge(
+								'px-2 text-sm w-full py-1.5 windmillapp app-editor-input',
+								css?.input?.class,
+								'wm-currency-input'
+							),
 							wrapper: 'w-full windmillapp',
-							formattedZero: twMerge('text-black windmillapp ', css?.input?.class)
+							formattedZero: twMerge('windmillapp ', css?.input?.class, 'wm-currency')
 						}}
 						style={css?.input?.style}
 						bind:value
-						{currency}
-						{locale}
-						{isNegativeAllowed}
+						currency={resolvedConfig.currency}
+						locale={resolvedConfig.locale}
+						isNegativeAllowed={resolvedConfig.isNegativeAllowed}
 					/>
 				</div>
 			{/key}

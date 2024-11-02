@@ -1,25 +1,20 @@
 import type { Schema } from './common'
 import { AppService, FlowService, type Flow, type Script } from './gen'
 import { encodeState } from './utils'
+import rawHubPaths from './hubPaths.json?raw'
 
 export function scriptToHubUrl(
 	content: string,
 	summary: string,
 	description: string,
-	kind: Script.kind,
-	language: Script.language,
+	kind: Script['kind'],
+	language: Script['language'],
 	schema: Schema | any,
-	lock: string | undefined
+	lock: string | undefined,
+	hubBaseUrl: string
 ): URL {
-	const url = new URL('https://hub.windmill.dev/scripts/add')
-
-	url.searchParams.append('content', content)
-	url.searchParams.append('summary', summary)
-	url.searchParams.append('description', description)
-	url.searchParams.append('kind', kind)
-	url.searchParams.append('language', language)
-	url.searchParams.append('schema', JSON.stringify(schema, null, 2))
-	lock && url.searchParams.append('lockfile', lock)
+	const url = new URL(hubBaseUrl + '/scripts/add')
+	url.hash = encodeState({ content, summary, description, kind, language, schema, lock })
 
 	return url
 }
@@ -44,8 +39,8 @@ export async function loadHubApps() {
 	}
 }
 
-export function flowToHubUrl(flow: Flow): URL {
-	const url = new URL('https://hub.windmill.dev/flows/add')
+export function flowToHubUrl(flow: Flow, hubBaseUrl: string): URL {
+	const url = new URL(hubBaseUrl + '/flows/add')
 	const openFlow = {
 		value: flow.value,
 		summary: flow.summary,
@@ -56,8 +51,21 @@ export function flowToHubUrl(flow: Flow): URL {
 	return url
 }
 
-export function appToHubUrl(staticApp: any): URL {
-	const url = new URL('https://hub.windmill.dev/apps/add')
+export function appToHubUrl(staticApp: any, hubBaseUrl: string): URL {
+	const url = new URL(hubBaseUrl + '/apps/add')
 	url.searchParams.append('app', encodeState(staticApp))
 	return url
 }
+
+type HubPaths = {
+	gitSync: string
+	gitSyncTest: string
+	slackErrorHandler: string
+	slackRecoveryHandler: string
+	slackSuccessHandler: string
+	slackReport: string
+	discordReport: string
+	smtpReport: string
+}
+
+export const hubPaths = JSON.parse(rawHubPaths) as HubPaths

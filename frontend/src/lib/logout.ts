@@ -1,6 +1,6 @@
-import { goto } from '$app/navigation'
+import { goto } from '$lib/navigation'
 import { UserService } from '$lib/gen'
-import { clearStores } from './stores.js'
+import { clearStores } from './storeUtils'
 import { sendUserToast } from './toast'
 
 export async function logoutWithRedirect(rd?: string): Promise<void> {
@@ -9,7 +9,6 @@ export async function logoutWithRedirect(rd?: string): Promise<void> {
 		const error = document.cookie.includes('token')
 			? `error=${encodeURIComponent('You have been logged out because your session has expired.')}&`
 			: ''
-		console.log({ rd })
 		goto(`/user/login?${error}${rd ? 'rd=' + encodeURIComponent(rd) : ''}`, { replaceState: true })
 	} else {
 		goto('/user/login', { replaceState: true })

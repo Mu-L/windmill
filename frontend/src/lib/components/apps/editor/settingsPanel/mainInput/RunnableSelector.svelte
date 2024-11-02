@@ -1,8 +1,7 @@
 <script lang="ts">
-	import { faMousePointer, faPlus } from '@fortawesome/free-solid-svg-icons'
 	import { Button, Drawer, DrawerContent, Tab, Tabs } from '$lib/components/common'
 	import PickHubScript from '$lib/components/flows/pickers/PickHubScript.svelte'
-	import { Building, Globe2 } from 'lucide-svelte'
+	import { Building, Globe2, MousePointer, Plus } from 'lucide-svelte'
 	import InlineScriptList from './InlineScriptList.svelte'
 	import type { Runnable, StaticAppInput } from '$lib/components/apps/inputType'
 	import WorkspaceScriptList from './WorkspaceScriptList.svelte'
@@ -10,8 +9,9 @@
 	import type { AppViewerContext } from '$lib/components/apps/types'
 	import { createEventDispatcher, getContext } from 'svelte'
 	import type { Schema } from '$lib/common'
-	import { getAllScriptNames, loadSchema, schemaToInputsSpec } from '$lib/components/apps/utils'
+	import { getAllScriptNames, schemaToInputsSpec } from '$lib/components/apps/utils'
 	import { defaultIfEmptyString, emptySchema } from '$lib/utils'
+	import { loadSchema } from '$lib/infer'
 
 	type Tab = 'hubscripts' | 'workspacescripts' | 'workspaceflows' | 'inlinescripts'
 
@@ -36,7 +36,11 @@
 		path: string,
 		runType: 'script' | 'flow' | 'hubscript'
 	): Promise<{ schema: Schema; summary: string | undefined }> {
-		return loadSchema(workspace, path, runType) ?? emptySchema()
+		const schema = await loadSchema(workspace, path, runType)
+		if (!schema.schema.order) {
+			schema.schema.order = Object.keys(schema.schema.properties ?? {})
+		}
+		return schema ?? { schema: emptySchema(), summary: undefined }
 	}
 
 	async function pickScript(path: string) {
@@ -46,7 +50,7 @@
 			type: 'runnableByPath',
 			path,
 			runType: 'script',
-			schema,
+			schema: schema.schema,
 			name: defaultIfEmptyString(schema.summary, path)
 		} as const
 
@@ -136,27 +140,27 @@
 					{#if !onlyFlow}
 						<Tab size="sm" value="inlinescripts">
 							<div class="flex gap-2 items-center my-1">
-								<Building size={18} />
+								<Building size={18} strokeWidth={1.5} />
 								Detached Inline Scripts
 							</div>
 						</Tab>
 						<Tab size="sm" value="workspacescripts">
 							<div class="flex gap-2 items-center my-1">
-								<Building size={18} />
+								<Building size={18} strokeWidth={1.5}/>
 								Workspace Scripts
 							</div>
 						</Tab>
 					{/if}
 					<Tab size="sm" value="workspaceflows">
 						<div class="flex gap-2 items-center my-1">
-							<Building size={18} />
+							<Building size={18} strokeWidth={1.5} />
 							Workspace Flows
 						</div>
 					</Tab>
 					{#if !onlyFlow}
 						<Tab size="sm" value="hubscripts">
 							<div class="flex gap-2 items-center my-1">
-								<Globe2 size={18} />
+								<Globe2 size={18} strokeWidth={1.5} />
 								Hub Scripts
 							</div>
 						</Tab>
@@ -193,8 +197,9 @@
 			size="xs"
 			color="light"
 			variant="border"
-			startIcon={{ icon: faPlus }}
+			startIcon={{ icon: Plus }}
 			btnClasses="truncate w-full"
+			id="app-editor-create-inline-script"
 		>
 			Create an inline script
 		</Button>
@@ -204,7 +209,7 @@
 		size="xs"
 		color="blue"
 		variant="border"
-		startIcon={{ icon: faMousePointer }}
+		startIcon={{ icon: MousePointer }}
 		btnClasses="truncate w-full"
 	>
 		{#if onlyFlow}Select a flow{:else}Select a script or flow{/if}

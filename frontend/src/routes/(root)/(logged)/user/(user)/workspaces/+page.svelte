@@ -1,26 +1,30 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
+	import { base } from '$app/paths'
 	import { page } from '$app/stores'
 	import { sendUserToast } from '$lib/toast'
 	import { logout, logoutWithRedirect } from '$lib/logout'
 	import { UserService, type WorkspaceInvite, WorkspaceService } from '$lib/gen'
 	import {
 		superadmin,
-		switchWorkspace,
 		usersWorkspaceStore,
 		userWorkspaces,
-		workspaceStore
+		workspaceStore,
+		userStore
 	} from '$lib/stores'
-	import { faCrown, faUserCog } from '@fortawesome/free-solid-svg-icons'
-	import Icon from 'svelte-awesome'
 	import { Button, Skeleton } from '$lib/components/common'
 	import Toggle from '$lib/components/Toggle.svelte'
 	import UserSettings from '$lib/components/UserSettings.svelte'
 	import SuperadminSettings from '$lib/components/SuperadminSettings.svelte'
 	import { WindmillIcon } from '$lib/components/icons'
-	import { onMount } from 'svelte'
 	import CenteredModal from '$lib/components/CenteredModal.svelte'
 	import { USER_SETTINGS_HASH } from '$lib/components/sidebar/settings'
+	import { switchWorkspace } from '$lib/storeUtils'
+	import { Cog, Crown } from 'lucide-svelte'
+	import { isCloudHosted } from '$lib/cloud'
+	import { emptyString } from '$lib/utils'
+	import { getUserExt } from '$lib/user'
+	import { refreshSuperadmin } from '$lib/refreshUser'
 
 	let invites: WorkspaceInvite[] = []
 	let list_all_as_super_admin: boolean = false
@@ -29,7 +33,7 @@
 	let userSettings: UserSettings
 	let superadminSettings: SuperadminSettings
 
-	const rd = $page.url.searchParams.get('rd')
+	$: rd = $page.url.searchParams.get('rd')
 
 	$: if (userSettings && $page.url.hash === USER_SETTINGS_HASH) {
 		userSettings.openDrawer()
@@ -42,6 +46,7 @@
 	}
 
 	async function loadWorkspaces() {
+		console.log('loading workspaces', $usersWorkspaceStore)
 		if (!$usersWorkspaceStore) {
 			try {
 				usersWorkspaceStore.set(await WorkspaceService.listUserWorkspaces())
@@ -71,15 +76,68 @@
 			workspaces = $userWorkspaces
 		}
 	}
-	$: list_all_as_super_admin != undefined && handleListWorkspaces()
+	$: list_all_as_super_admin != undefined && $userWorkspaces && handleListWorkspaces()
 
-	$: adminsInstance = workspaces?.find((x) => x.id == 'admins')
+	$: adminsInstance = workspaces?.find((x) => x.id == 'admins') || $superadmin
 
-	onMount(() => {
-		loadInvites()
-		loadWorkspaces()
-	})
+	$: nonAdminWorkspaces = (workspaces ?? []).filter((x) => x.id != 'admins')
+	$: noWorkspaces = $superadmin && nonAdminWorkspaces.length == 0
+
+	async function getCreateWorkspaceRequireSuperadmin() {
+		const r = await fetch(base + '/api/workspaces/create_workspace_require_superadmin')
+		const t = await r.text()
+		createWorkspace = t != 'true'
+	}
+
+	let createWorkspace = $superadmin || isCloudHosted()
+
+	$: if ($superadmin) {
+		createWorkspace = true
+	}
+
+	if (!createWorkspace) {
+		getCreateWorkspaceRequireSuperadmin()
+	}
+
+	refreshSuperadmin()
+	loadInvites()
+	loadWorkspaces()
+
 	let loading = false
+
+	async function speakFriendAndEnterWorkspace(workspaceId: string) {
+		loading = true
+		workspaceStore.set(undefined)
+		workspaceStore.set(workspaceId)
+		$userStore = await getUserExt($workspaceStore!)
+		if (!$userStore?.is_super_admin && $userStore?.operator) {
+			let defaultApp = await WorkspaceService.getWorkspaceDefaultApp({
+				workspace: $workspaceStore!
+			})
+			if (!emptyString(defaultApp.default_app_path)) {
+				await goto(`/apps/get/${defaultApp.default_app_path}`)
+			} else {
+				if (rd?.startsWith('http')) {
+					window.location.href = rd
+					return
+				}
+				await goto(rd ?? '/')
+			}
+		} else {
+			try {
+				if (rd?.startsWith('http')) {
+					window.location.href = rd
+				} else {
+					await goto(rd ?? '/')
+				}
+				console.log('Workspace selected, going to', rd)
+			} catch (e) {
+				console.error('Error going to', rd, e)
+				window.location.reload()
+			}
+		}
+		loading = false
+	}
 </script>
 
 {#if $superadmin}
@@ -108,6 +166,10 @@
 			on:click={async () => {
 				workspaceStore.set('admins')
 				loading = true
+				if (rd?.startsWith('http')) {
+					window.location.href = rd
+					return
+				}
 				await goto(rd ?? '/')
 				loading = false
 			}}
@@ -118,21 +180,19 @@
 
 	{#if workspaces && $usersWorkspaceStore}
 		{#if workspaces.length == 0}
-			<p class="text-sm text-gray-600 mt-2">
-				You are not a member of any workspace yet. Accept an invitation or create your own
+			<p class="text-sm text-tertiary mt-2">
+				You are not a member of any workspace yet. Accept an invitation {#if createWorkspace}or
+					create your own{/if}
 				workspace.
 			</p>
 		{/if}
-		{#each workspaces.filter((x) => x.id != 'admins') as workspace}
+		{#each nonAdminWorkspaces as workspace (workspace.id)}
 			<label class="block pb-2">
 				<button
-					class="block w-full mx-auto py-1 px-2 rounded-md border border-gray-300
+					class="block w-full mx-auto py-1 px-2 rounded-md border
 				shadow-sm text-sm font-normal mt-1 hover:ring-1 hover:ring-indigo-300"
 					on:click={async () => {
-						workspaceStore.set(workspace.id)
-						loading = true
-						await goto(rd ?? '/')
-						loading = false
+						speakFriendAndEnterWorkspace(workspace.id)
 					}}
 					><span class="font-mono">{workspace.id}</span> - {workspace.name} as
 					<span class="font-mono">{workspace.username}</span>
@@ -162,22 +222,26 @@
 		{/each}
 	{/if}
 
-	<div class="flex flex-row-reverse pt-4">
-		<Button
-			size="sm"
-			href="/user/create_workspace{rd ? `?rd=${encodeURIComponent(rd)}` : ''}"
-			variant="border"
-			>+&nbsp;Create a new workspace
-		</Button>
-	</div>
+	{#if createWorkspace}
+		<div class="flex flex-row-reverse pt-4">
+			<Button
+				size="sm"
+				btnClasses={noWorkspaces ? 'animate-bounce hover:animate-none' : ''}
+				color={noWorkspaces ? 'dark' : 'blue'}
+				href="{base}/user/create_workspace{rd ? `?rd=${encodeURIComponent(rd)}` : ''}"
+				variant={noWorkspaces ? 'contained' : 'border'}
+				>+&nbsp;Create a new workspace
+			</Button>
+		</div>
+	{/if}
 
 	<h2 class="mt-6 mb-4">Invites to join a Workspace</h2>
 	{#if invites.length == 0}
-		<p class="text-sm text-gray-500 mt-2"> You don't have new invites at the moment. </p>
+		<p class="text-sm text-tertiary mt-2"> You don't have new invites at the moment. </p>
 	{/if}
 	{#each invites as invite}
 		<div
-			class="w-full mx-auto py-1 px-2 rounded-md border border-gray-300 shadow-sm
+			class="w-full mx-auto py-1 px-2 rounded-md border shadow-sm
 			text-sm mt-1 flex flex-row justify-between items-center"
 		>
 			<div class="grow">
@@ -191,7 +255,7 @@
 			<div class="flex justify-end items-center flex-col sm:flex-row gap-1">
 				<a
 					class="font-bold p-1"
-					href="/user/accept_invite?workspace={encodeURIComponent(invite.workspace_id)}{rd
+					href="{base}/user/accept_invite?workspace={encodeURIComponent(invite.workspace_id)}{rd
 						? `&rd=${encodeURIComponent(rd)}`
 						: ''}"
 				>
@@ -215,15 +279,19 @@
 	{/each}
 	<div class="flex justify-between items-center mt-10 flex-wrap gap-2">
 		{#if $superadmin}
-			<Button variant="border" size="sm" on:click={superadminSettings.openDrawer}>
-				<Icon data={faCrown} class="mr-1" scale={1} />
+			<Button
+				variant="border"
+				size="sm"
+				on:click={superadminSettings.openDrawer}
+				startIcon={{ icon: Crown }}
+			>
 				Superadmin settings
 			</Button>
 		{/if}
-		<Button variant="border" size="sm" on:click={userSettings.openDrawer}>
-			<Icon data={faUserCog} class="mr-1" scale={1} />
+		<Button variant="border" size="sm" on:click={userSettings.openDrawer} startIcon={{ icon: Cog }}>
 			User settings
 		</Button>
+
 		<Button
 			variant="border"
 			color="blue"
@@ -232,7 +300,7 @@
 				logout()
 			}}
 		>
-			Logout
+			Log out
 		</Button>
 	</div>
 </CenteredModal>
@@ -241,7 +309,7 @@
 		class="border rounded-md shadow-md bg-white w-full max-w-[640px] p-4 sm:py-8 sm:px-10 mb-6 md:mb-20"
 	>
 		<h1 class="text-center mb-2">Select a workspace</h1>
-		<p class="text-center font-medium text-gray-600 text-xs mb-10">
+		<p class="text-center font-medium text-tertiary text-xs mb-10">
 			Logged in as {$usersWorkspaceStore?.email}
 		</p>
 	</div>

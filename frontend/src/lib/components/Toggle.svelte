@@ -3,9 +3,11 @@
 	import { createEventDispatcher } from 'svelte'
 	import { twMerge } from 'tailwind-merge'
 	import Tooltip from './Tooltip.svelte'
+	import { AlertTriangle } from 'lucide-svelte'
 
 	export let options: {
 		left?: string
+		leftTooltip?: string
 		right?: string
 		rightTooltip?: string
 	} = {}
@@ -13,73 +15,94 @@
 	export let disabled = false
 	export let textClass = ''
 	export let textStyle = ''
-	export let color: 'blue' | 'red' = 'blue'
+	export let color: 'blue' | 'red' | 'nord' = 'blue'
+	export let id = (Math.random() + 1).toString(36).substring(10)
+	export let lightMode: boolean = false
+	export let eeOnly: boolean = false
 
 	export let size: 'sm' | 'xs' = 'sm'
-	const id = (Math.random() + 1).toString(36).substring(10)
+
 	const dispatch = createEventDispatcher()
+	const bothOptions = Boolean(options.left) && Boolean(options.right)
+
+	export let textDisabled = false
 </script>
 
-<span class="{$$props.class} z-auto">
-	<label
-		for={id}
-		class="inline-flex items-center mt-2 duration-50 {disabled
-			? 'grayscale opacity-50'
-			: 'cursor-pointer'}"
-	>
-		{#if Boolean(options?.left)}
-			<span
-				class={twMerge(
-					'mr-2 font-medium duration-50',
-					disabled ? 'text-gray-500' : 'text-gray-900',
-					size === 'xs' ? 'text-xs' : 'text-sm',
-					textClass
-				)}
-				style={textStyle}
-			>
-				{options?.left}
-			</span>
-		{/if}
+<label
+	for={id}
+	class="{$$props.class || ''} z-auto inline-flex items-center duration-50 {disabled
+		? 'grayscale opacity-50'
+		: 'cursor-pointer'}"
+>
+	{#if Boolean(options?.left)}
+		<span
+			class={twMerge(
+				'mr-2 font-medium duration-50 select-none',
+				bothOptions || textDisabled ? (checked ? 'text-disabled' : 'text-primary') : 'text-primary',
+				size === 'xs' ? 'text-xs' : 'text-sm',
+				textClass
+			)}
+			style={textStyle}
+		>
+			{options?.left}
+			{#if options?.leftTooltip}
+				<Tooltip light={lightMode}>{options?.leftTooltip}</Tooltip>
+			{/if}
+		</span>
+	{/if}
 
-		<!-- svelte-ignore a11y-click-events-have-key-events -->
-		<div class="relative" on:click|stopPropagation>
-			<input
-				on:focus
-				on:click
-				{disabled}
-				type="checkbox"
-				{id}
-				class="sr-only peer"
-				bind:checked
-				on:change|stopPropagation={(e) => {
-					dispatch('change', checked)
-				}}
-			/>
-			<div
-				class={classNames(
-					"transition-all bg-gray-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute  after:bg-white after:border-white after:border after:rounded-full after:transition-all ",
-					color == 'red' ? 'peer-checked:bg-red-600' : 'peer-checked:bg-blue-600',
-					size === 'sm'
-						? 'w-11 h-6 after:top-0.5 after:left-[2px] after:h-5 after:w-5'
-						: 'w-7 h-4 after:top-0.5 after:left-[2px] after:h-3 after:w-3'
-				)}
-			/>
-		</div>
-		{#if Boolean(options?.right)}
-			<span
-				class={twMerge(
-					'ml-2 font-medium duration-50',
-					disabled ? 'text-gray-500' : 'text-gray-900',
-					size === 'xs' ? 'text-xs' : 'text-sm',
-					textClass
-				)}
-				style={textStyle}
-			>
-				{options?.right}
-				{#if options?.rightTooltip}
-					<Tooltip>{options?.rightTooltip}</Tooltip>
-				{/if}
-			</span>
-		{/if}
-	</label>
-</span>
+	<!-- svelte-ignore a11y-click-events-have-key-events -->
+	<!-- svelte-ignore a11y-no-static-element-interactions -->
+	<div class="relative" on:click|stopPropagation>
+		<input
+			on:focus
+			on:click
+			{disabled}
+			type="checkbox"
+			{id}
+			class="sr-only peer"
+			bind:checked
+			on:change|stopPropagation={(e) => {
+				dispatch('change', checked)
+			}}
+		/>
+		<div
+			class={classNames(
+				"transition-all bg-surface-selected rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute  after:bg-surface after:border-white after:border after:rounded-full after:transition-all items-center",
+				color == 'red'
+					? 'peer-checked:bg-red-600'
+					: color == 'blue'
+					? 'peer-checked:bg-blue-600 dark:peer-checked:bg-blue-500'
+					: 'peer-checked:bg-nord-950 dark:peer-checked:bg-nord-400',
+				size === 'sm'
+					? 'w-11 h-6 after:top-0.5 after:left-[2px] after:h-5 after:w-5'
+					: 'w-7 h-4 after:top-0.5 after:left-[2px] after:h-3 after:w-3'
+			)}
+		/>
+	</div>
+	{#if Boolean(options?.right)}
+		<span
+			class={twMerge(
+				'ml-2 font-medium duration-50 select-none',
+				bothOptions || textDisabled ? (checked ? 'text-primary' : 'text-disabled') : 'text-primary',
+				size === 'xs' ? 'text-xs' : 'text-sm',
+				textClass
+			)}
+			style={textStyle}
+		>
+			{options?.right}
+			{#if options?.rightTooltip}
+				<Tooltip light={lightMode}>{options?.rightTooltip}</Tooltip>
+			{/if}
+		</span>
+	{/if}
+	<slot name="right" />
+</label>
+{#if eeOnly && disabled}
+	<span
+		class="inline-flex text-xs text-primary items-center gap-1 !text-yellow-500 whitespace-nowrap ml-8"
+	>
+		<AlertTriangle size={16} />
+		EE only <Tooltip>Enterprise Edition only feature</Tooltip>
+	</span>
+{/if}

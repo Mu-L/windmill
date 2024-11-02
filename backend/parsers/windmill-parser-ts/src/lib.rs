@@ -5,26 +5,140 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-AGPL for a copy of the license.
  */
-use deno_core::{serde_v8, v8, JsRuntime, RuntimeOptions};
+// use deno_core::{serde_v8, v8, JsRuntime, RuntimeOptions};
 use serde_json::Value;
-use windmill_common::error;
-use windmill_parser::{json_to_typ, Arg, MainArgSignature, ObjectProperty, Typ};
+use std::collections::HashSet;
+use swc_ecma_visit::{noop_visit_type, Visit, VisitWith};
+use windmill_parser::{
+    json_to_typ, to_snake_case, Arg, MainArgSignature, ObjectProperty, OneOfVariant, Typ,
+};
 
 use swc_common::{sync::Lrc, FileName, SourceMap, SourceMapper, Span, Spanned};
 use swc_ecma_ast::{
-    ArrayLit, AssignPat, BigInt, BindingIdent, Bool, Decl, ExportDecl, Expr, FnDecl, Ident, Lit,
-    ModuleDecl, ModuleItem, Number, ObjectLit, Param, Pat, Str, TsArrayType, TsEntityName,
-    TsKeywordType, TsKeywordTypeKind, TsLit, TsLitType, TsOptionalType, TsPropertySignature,
-    TsType, TsTypeElement, TsTypeLit, TsTypeRef, TsUnionOrIntersectionType, TsUnionType,
+    ArrayLit, AssignPat, BigInt, BindingIdent, Bool, Decl, ExportDecl, Expr, FnDecl, Ident,
+    IdentName, Lit, MemberExpr, MemberProp, ModuleDecl, ModuleItem, Number, ObjectLit, ObjectPat,
+    Param, Pat, Str, TsArrayType, TsEntityName, TsKeywordType, TsKeywordTypeKind, TsLit, TsLitType,
+    TsOptionalType, TsParenthesizedType, TsPropertySignature, TsType, TsTypeAnn, TsTypeElement,
+    TsTypeLit, TsTypeRef, TsUnionOrIntersectionType, TsUnionType,
 };
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsConfig};
+use swc_ecma_parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 
-pub fn parse_deno_signature(code: &str, skip_dflt: bool) -> error::Result<MainArgSignature> {
+use regex::Regex;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+struct ImportsFinder {
+    imports: HashSet<String>,
+}
+
+impl Visit for ImportsFinder {
+    noop_visit_type!();
+
+    fn visit_import_decl(&mut self, n: &swc_ecma_ast::ImportDecl) {
+        if let Some(ref s) = n.src.raw {
+            let s = s.to_string();
+            if s.starts_with("'") && s.ends_with("'") {
+                self.imports.insert(s[1..s.len() - 1].to_string());
+            } else if s.starts_with("\"") && s.ends_with("\"") {
+                self.imports.insert(s[1..s.len() - 1].to_string());
+            }
+        }
+    }
+}
+
+pub fn parse_expr_for_imports(code: &str) -> anyhow::Result<Vec<String>> {
     let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(FileName::Custom("main.ts".into()), code.into());
+    let fm = cm.new_source_file(FileName::Custom("main.d.ts".into()).into(), code.into());
+    let lexer = Lexer::new(
+        Syntax::Typescript(TsSyntax::default()),
+        // EsVersion defaults to es5
+        Default::default(),
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut parser = Parser::new_from(lexer);
+
+    let mut err_s = "".to_string();
+    for e in parser.take_errors() {
+        err_s += &e.into_kind().msg().to_string();
+    }
+
+    let expr = parser.parse_module().map_err(|e| {
+        anyhow::anyhow!("Error while parsing code, it is invalid TypeScript: {err_s}, {e:?}")
+    })?;
+
+    let mut visitor = ImportsFinder { imports: HashSet::new() };
+    visitor.visit_module(&expr);
+
+    Ok(visitor.imports.into_iter().collect())
+}
+
+struct OutputFinder {
+    idents: HashSet<(String, String)>,
+}
+
+impl Visit for OutputFinder {
+    noop_visit_type!();
+
+    fn visit_member_expr(&mut self, m: &MemberExpr) {
+        m.obj.visit_with(self);
+        if let MemberProp::Computed(c) = &m.prop {
+            c.visit_with(self);
+        }
+        match m {
+            MemberExpr { obj, prop: MemberProp::Ident(IdentName { sym, .. }), .. } => {
+                match *obj.to_owned() {
+                    Expr::Ident(Ident { sym: sym_i, .. }) => {
+                        self.idents.insert((sym_i.to_string(), sym.to_string()));
+                    }
+                    _ => (),
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+pub fn parse_expr_for_ids(code: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(FileName::Custom("main.ts".into()).into(), code.into());
     let lexer = Lexer::new(
         // We want to parse ecmascript
-        Syntax::Typescript(TsConfig::default()),
+        Syntax::Es(EsSyntax { jsx: false, ..Default::default() }),
+        // EsVersion defaults to es5
+        Default::default(),
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut parser = Parser::new_from(lexer);
+
+    let mut err_s = "".to_string();
+    for e in parser.take_errors() {
+        err_s += &e.into_kind().msg().to_string();
+    }
+
+    let expr = parser.parse_module().map_err(|e| {
+        anyhow::anyhow!("Error while parsing code, it is invalid TypeScript: {err_s}, {e:?}")
+    })?;
+
+    let mut visitor = OutputFinder { idents: HashSet::new() };
+    visitor.visit_module(&expr);
+
+    Ok(visitor.idents.into_iter().collect())
+}
+
+pub fn parse_deno_signature(
+    code: &str,
+    skip_dflt: bool,
+    main_override: Option<String>,
+) -> anyhow::Result<MainArgSignature> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(FileName::Custom("main.ts".into()).into(), code.into());
+    let lexer = Lexer::new(
+        // We want to parse ecmascript
+        Syntax::Typescript(TsSyntax::default()),
         // EsVersion defaults to es5
         Default::default(),
         StringInput::from(&*fm),
@@ -40,41 +154,58 @@ pub fn parse_deno_signature(code: &str, skip_dflt: bool) -> error::Result<MainAr
 
     let ast = parser
         .parse_module()
-        .map_err(|_| {
-            error::Error::ExecutionErr(format!(
-                "Error while parsing code, it is invalid typescript"
-            ))
+        .map_err(|e| {
+            anyhow::anyhow!("Error while parsing code, it is invalid TypeScript: {err_s}, {e:?}")
         })?
         .body;
 
-    // println!("{ast:?}");
+    let has_preprocessor = ast.iter().any(|x| match x {
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
+            decl: Decl::Fn(FnDecl { ident: Ident { sym, .. }, .. }),
+            ..
+        })) => &sym.to_string() == "preprocessor",
+        _ => false,
+    });
+
+    let main_name = main_override.unwrap_or("main".to_string());
     let params = ast.into_iter().find_map(|x| match x {
         ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
             decl: Decl::Fn(FnDecl { ident: Ident { sym, .. }, function, .. }),
             ..
-        })) if &sym.to_string() == "main" => Some(function.params),
+        })) if &sym.to_string() == &main_name => Some(function.params),
         _ => None,
     });
 
+    let mut c: u16 = 0;
     if let Some(params) = params {
         let r = MainArgSignature {
             star_args: false,
             star_kwargs: false,
             args: params
                 .into_iter()
-                .map(|x| parse_param(x, &cm, skip_dflt))
-                .collect::<Result<Vec<Arg>, error::Error>>()?,
+                .map(|x| parse_param(x, &cm, skip_dflt, &mut c))
+                .collect::<anyhow::Result<Vec<Arg>>>()?,
+            no_main_func: Some(false),
+            has_preprocessor: Some(has_preprocessor),
         };
         Ok(r)
     } else {
-        Err(error::Error::ExecutionErr(
-            "main function was not findable (expected to find 'export function main(...)'"
-                .to_string(),
-        ))
+        Ok(MainArgSignature {
+            star_args: false,
+            star_kwargs: false,
+            args: vec![],
+            no_main_func: Some(true),
+            has_preprocessor: Some(has_preprocessor),
+        })
     }
 }
 
-fn parse_param(x: Param, cm: &Lrc<SourceMap>, skip_dflt: bool) -> error::Result<Arg> {
+fn parse_param(
+    x: Param,
+    cm: &Lrc<SourceMap>,
+    skip_dflt: bool,
+    counter: &mut u16,
+) -> anyhow::Result<Arg> {
     let r = match x.pat {
         Pat::Ident(ident) => {
             let (name, typ, nullable) = binding_ident_to_arg(&ident);
@@ -84,17 +215,28 @@ fn parse_param(x: Param, cm: &Lrc<SourceMap>, skip_dflt: bool) -> error::Result<
                 typ,
                 default: None,
                 has_default: ident.id.optional || nullable,
+                oidx: None,
             })
         }
+        // Pat::Object(ObjectPat { ... }) = todo!()
         Pat::Assign(AssignPat { left, right, .. }) => {
-            let (name, mut typ, _nullable) =
-                left.as_ident().map(binding_ident_to_arg).ok_or_else(|| {
-                    error::Error::ExecutionErr(format!(
-                        "parameter syntax unsupported: `{}`",
+            let (name, mut typ, _nullable) = match *left {
+                Pat::Ident(ident) => binding_ident_to_arg(&ident),
+                Pat::Object(ObjectPat { type_ann, .. }) => {
+                    let (typ, nullable) = eval_type_ann(&type_ann);
+                    *counter += 1;
+                    let name = format!("anon{}", counter);
+                    (name, typ, nullable)
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "parameter syntax unsupported: `{}`: {:#?}",
                         cm.span_to_snippet(left.span())
-                            .unwrap_or_else(|_| cm.span_to_string(left.span()))
+                            .unwrap_or_else(|_| cm.span_to_string(left.span())),
+                        *left
                     ))
-                })?;
+                }
+            };
 
             let dflt = if skip_dflt {
                 None
@@ -120,13 +262,20 @@ fn parse_param(x: Param, cm: &Lrc<SourceMap>, skip_dflt: bool) -> error::Result<
             if typ == Typ::Unknown && dflt.is_some() {
                 typ = json_to_typ(dflt.as_ref().unwrap());
             }
-            Ok(Arg { otyp: None, name, typ, default: dflt, has_default: true })
+            Ok(Arg { otyp: None, name, typ, default: dflt, has_default: true, oidx: None })
         }
-        _ => Err(error::Error::ExecutionErr(format!(
-            "parameter syntax unsupported: `{}`",
+        Pat::Object(ObjectPat { type_ann, .. }) => {
+            let (typ, nullable) = eval_type_ann(&type_ann);
+            *counter += 1;
+            let name = format!("anon{}", counter);
+            Ok(Arg { otyp: None, name, typ, default: None, has_default: nullable, oidx: None })
+        }
+        _ => Err(anyhow::anyhow!(
+            "parameter syntax unsupported: `{}`: {:#?}",
             cm.span_to_snippet(x.span())
-                .unwrap_or_else(|_| cm.span_to_string(x.span()))
-        ))),
+                .unwrap_or_else(|_| cm.span_to_string(x.span())),
+            x.pat
+        )),
     };
     r
 }
@@ -143,16 +292,45 @@ fn eval_span(span: Span, cm: &Lrc<SourceMap>) -> Option<Value> {
         None => None,
     }
 }
-fn binding_ident_to_arg(BindingIdent { id, type_ann }: &BindingIdent) -> (String, Typ, bool) {
-    let (typ, nullable) = type_ann
+
+fn eval_type_ann(type_ann: &Option<Box<TsTypeAnn>>) -> (Typ, bool) {
+    return type_ann
         .as_ref()
         .map(|x| tstype_to_typ(&*x.type_ann))
         .unwrap_or((Typ::Unknown, false));
+}
+fn binding_ident_to_arg(BindingIdent { id, type_ann }: &BindingIdent) -> (String, Typ, bool) {
+    let (typ, nullable) = eval_type_ann(type_ann);
     (id.sym.to_string(), typ, nullable)
 }
 
+lazy_static::lazy_static! {
+     static ref IMPORTS_VERSION: Regex = Regex::new(r"^((?:\@[^\/\@]+\/[^\/\@]+)|(?:[^\/\@]+))(?:\@(?:[^\/]+))?(.*)$").unwrap();
+
+}
+
+pub fn remove_pinned_imports(code: &str) -> anyhow::Result<String> {
+    let mut imports = parse_expr_for_imports(code)?;
+    imports.sort_by_key(|f| 0 - (f.len() as i32));
+    let mut content = code.to_string();
+    for import in imports {
+        let to_c = IMPORTS_VERSION.captures(&import);
+        if let Some(to) = to_c.and_then(|x| {
+            x.get(1).map(|y| {
+                format!(
+                    "{}{}",
+                    y.as_str(),
+                    x.get(2).map(|z| z.as_str()).unwrap_or("")
+                )
+            })
+        }) {
+            content = content.replace(&import, &to);
+        }
+    }
+    Ok(content)
+}
+
 fn tstype_to_typ(ts_type: &TsType) -> (Typ, bool) {
-    //println!("{:?}", ts_type);
     match ts_type {
         TsType::TsKeywordType(t) => (
             match t.kind {
@@ -188,6 +366,9 @@ fn tstype_to_typ(ts_type: &TsType) -> (Typ, bool) {
                 .collect();
             (Typ::Object(properties), false)
         }
+        TsType::TsParenthesizedType(TsParenthesizedType { type_ann, .. }) => {
+            tstype_to_typ(type_ann)
+        }
         // TODO: we can do better here and extract the inner type of array
         TsType::TsArrayType(TsArrayType { elem_type, .. }) => {
             (Typ::List(Box::new(tstype_to_typ(&**elem_type).0)), false)
@@ -201,22 +382,48 @@ fn tstype_to_typ(ts_type: &TsType) -> (Typ, bool) {
         TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(
             TsUnionType { types, .. },
         )) => {
-            if let Some(p) = if types.len() != 2 {
-                None
+            let (is_undefined_option, undefined_position) = if types.len() == 2 {
+                (true, find_undefined(types))
+            } else if types.into_iter().all(|x| {
+                x.as_ts_lit_type().is_some_and(|y| y.lit.as_str().is_some())
+                    || x.as_ts_keyword_type().is_some_and(|y| {
+                        y.kind == TsKeywordTypeKind::TsUndefinedKeyword
+                            || y.kind == TsKeywordTypeKind::TsStringKeyword
+                            || y.kind == TsKeywordTypeKind::TsNullKeyword
+                    })
+            }) {
+                (false, find_undefined(types))
             } else {
-                types.into_iter().position(|x| match **x {
-                    TsType::TsKeywordType(TsKeywordType { kind, .. }) => {
-                        kind == TsKeywordTypeKind::TsUndefinedKeyword
-                            || kind == TsKeywordTypeKind::TsNullKeyword
-                    }
-                    _ => false,
-                })
-            } {
-                let other_p = if p == 0 { 1 } else { 0 };
+                (false, None)
+            };
+
+            if is_undefined_option && undefined_position.is_some() {
+                let other_p = if undefined_position.unwrap() == 0 {
+                    1
+                } else {
+                    0
+                };
                 (tstype_to_typ(&types[other_p]).0, true)
             } else {
+                if types.len() > 1 {
+                    let one_of_values: Vec<OneOfVariant> =
+                        types.into_iter().map_while(parse_one_of_type).collect();
+
+                    if one_of_values.len() == types.len() {
+                        return (Typ::OneOf(one_of_values), false);
+                    }
+                }
+
                 let literals = types
                     .into_iter()
+                    .filter(|x| match ***x {
+                        TsType::TsKeywordType(TsKeywordType { kind, .. }) => {
+                            kind != TsKeywordTypeKind::TsStringKeyword
+                                && kind != TsKeywordTypeKind::TsUndefinedKeyword
+                                && kind != TsKeywordTypeKind::TsNullKeyword
+                        }
+                        _ => true,
+                    })
                     .map(|x| match &**x {
                         TsType::TsLitType(TsLitType {
                             lit: TsLit::Str(Str { value, .. }), ..
@@ -229,7 +436,7 @@ fn tstype_to_typ(ts_type: &TsType) -> (Typ, bool) {
                 } else {
                     (
                         Typ::Str(Some(literals.into_iter().filter_map(|x| x).collect())),
-                        false,
+                        undefined_position.is_some(),
                     )
                 }
             }
@@ -259,218 +466,104 @@ fn tstype_to_typ(ts_type: &TsType) -> (Typ, bool) {
                 "Base64" => (Typ::Bytes, false),
                 "Email" => (Typ::Email, false),
                 "Sql" => (Typ::Sql, false),
-                _ => (Typ::Unknown, false),
+                x @ _ if x.starts_with("DynSelect_") => (
+                    Typ::DynSelect(x.strip_prefix("DynSelect_").unwrap().to_string()),
+                    false,
+                ),
+                x @ _ => (Typ::Resource(to_snake_case(x)), false),
             }
         }
         _ => (Typ::Unknown, false),
     }
 }
 
-pub fn eval_sync(code: &str) -> Result<serde_json::Value, String> {
-    let mut context = JsRuntime::new(RuntimeOptions::default());
-    let code = format!("let x = {}; x", code);
-    let res = context.execute_script("<anon>", code.into());
-    match res {
-        Ok(global) => {
-            let scope = &mut context.handle_scope();
-            let local = v8::Local::new(scope, global);
-            let deserialized_value = serde_v8::from_v8::<serde_json::Value>(scope, local);
-
-            match deserialized_value {
-                Ok(value) => Ok(value),
-                Err(err) => Err(format!("Cannot deserialize value: {:?}", err)),
-            }
+fn parse_one_of_type(x: &Box<TsType>) -> Option<OneOfVariant> {
+    match &**x {
+        TsType::TsTypeLit(TsTypeLit { members, .. }) => {
+            let label = one_of_label(members)?;
+            let properties = one_of_properties(members);
+            Some(OneOfVariant { label, properties })
         }
-        Err(err) => Err(format!("Evaling error: {:?}", err)),
+        _ => None,
     }
 }
 
-#[cfg(test)]
-mod tests {
+fn one_of_label(members: &Vec<TsTypeElement>) -> Option<String> {
+    members.iter().find_map(|y| {
+        let TsTypeElement::TsPropertySignature(TsPropertySignature { key, type_ann, .. }) = y
+        else {
+            return None;
+        };
 
-    use serde_json::json;
+        let Expr::Ident(Ident { sym, .. }) = &**key else {
+            return None;
+        };
+        if sym != "label" {
+            return None;
+        }
 
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
-    use super::*;
+        let Some(type_ann) = type_ann.as_ref() else {
+            return None;
+        };
+        let TsType::TsLitType(TsLitType { lit: TsLit::Str(Str { value, .. }), .. }) =
+            &*type_ann.type_ann
+        else {
+            return None;
+        };
 
-    #[test]
-    fn test_parse_deno_sig() -> anyhow::Result<()> {
-        let code = "
-export function main(test1?: string, test2: string = \"burkina\",
-    test3: wmill.Resource<'postgres'>, b64: Base64, ls: Base64[], 
-    email: Email, literal: \"test\", literal_union: \"test\" | \"test2\",
-    opt_type?: string | null, opt_type_union: string | null, opt_type_union_union2: string | undefined,
-    min_object: {a: string, b: number}) {
-    console.log(42)
+        Some(value.to_string())
+    })
 }
-";
-        assert_eq!(
-            parse_deno_signature(code, false)?,
-            MainArgSignature {
-                star_args: false,
-                star_kwargs: false,
-                args: vec![
-                    Arg {
-                        otyp: None,
-                        name: "test1".to_string(),
-                        typ: Typ::Str(None),
-                        default: None,
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "test2".to_string(),
-                        typ: Typ::Str(None),
-                        default: Some(json!("burkina")),
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "test3".to_string(),
-                        typ: Typ::Resource("postgres".to_string()),
-                        default: None,
-                        has_default: false
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "b64".to_string(),
-                        typ: Typ::Bytes,
-                        default: None,
-                        has_default: false
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "ls".to_string(),
-                        typ: Typ::List(Box::new(Typ::Bytes)),
-                        default: None,
-                        has_default: false
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "email".to_string(),
-                        typ: Typ::Email,
-                        default: None,
-                        has_default: false
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "literal".to_string(),
-                        typ: Typ::Str(Some(vec!["test".to_string()])),
-                        default: None,
-                        has_default: false
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "literal_union".to_string(),
-                        typ: Typ::Str(Some(vec!["test".to_string(), "test2".to_string()])),
-                        default: None,
-                        has_default: false
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "opt_type".to_string(),
-                        typ: Typ::Str(None),
-                        default: None,
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "opt_type_union".to_string(),
-                        typ: Typ::Str(None),
-                        default: None,
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "opt_type_union_union2".to_string(),
-                        typ: Typ::Str(None),
-                        default: None,
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "min_object".to_string(),
-                        typ: Typ::Object(vec![
-                            ObjectProperty { key: "a".to_string(), typ: Box::new(Typ::Str(None)) },
-                            ObjectProperty { key: "b".to_string(), typ: Box::new(Typ::Float) }
-                        ]),
-                        default: None,
-                        has_default: false
-                    }
-                ]
-            }
-        );
 
-        Ok(())
-    }
+fn one_of_properties(members: &Vec<TsTypeElement>) -> Vec<ObjectProperty> {
+    members
+        .iter()
+        .filter_map(|x| {
+            let TsTypeElement::TsPropertySignature(TsPropertySignature { key, type_ann, .. }) = x
+            else {
+                return None;
+            };
 
-    #[test]
-    fn test_parse_deno_sig_implicit_types() -> anyhow::Result<()> {
-        let code = "
-export function main(test2 = \"burkina\",
-    bool = true,
-    float = 4.2,
-    int = 42,
-    ls = [\"test\"],
-    min_object = {a: \"test\", b: 42}) {
-    console.log(42)
+            let Expr::Ident(Ident { sym, .. }) = *key.to_owned() else {
+                return None;
+            };
+            let typ = type_ann
+                .as_ref()
+                .map(|typ| Box::new(tstype_to_typ(&*typ.type_ann).0))
+                .unwrap_or(Box::new(Typ::Unknown));
+
+            Some(ObjectProperty { key: sym.to_string(), typ })
+        })
+        .collect()
 }
-";
-        assert_eq!(
-            parse_deno_signature(code, false)?,
-            MainArgSignature {
-                star_args: false,
-                star_kwargs: false,
-                args: vec![
-                    Arg {
-                        otyp: None,
-                        name: "test2".to_string(),
-                        typ: Typ::Str(None),
-                        default: Some(json!("burkina")),
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "bool".to_string(),
-                        typ: Typ::Bool,
-                        default: Some(json!(true)),
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "float".to_string(),
-                        typ: Typ::Float,
-                        default: Some(json!(4.2)),
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "int".to_string(),
-                        typ: Typ::Int,
-                        default: Some(json!(42)),
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "ls".to_string(),
-                        typ: Typ::List(Box::new(Typ::Str(None))),
-                        default: Some(json!(["test"])),
-                        has_default: true
-                    },
-                    Arg {
-                        otyp: None,
-                        name: "min_object".to_string(),
-                        typ: Typ::Object(vec![
-                            ObjectProperty { key: "a".to_string(), typ: Box::new(Typ::Str(None)) },
-                            ObjectProperty { key: "b".to_string(), typ: Box::new(Typ::Int) }
-                        ]),
-                        default: Some(json!({"a": "test", "b": 42})),
-                        has_default: true
-                    }
-                ]
-            }
-        );
 
-        Ok(())
-    }
+fn find_undefined(types: &Vec<Box<TsType>>) -> Option<usize> {
+    types.into_iter().position(|x| match **x {
+        TsType::TsKeywordType(TsKeywordType { kind, .. }) => {
+            kind == TsKeywordTypeKind::TsUndefinedKeyword
+                || kind == TsKeywordTypeKind::TsNullKeyword
+        }
+        _ => false,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    pub fn eval(s: &str) -> JsValue;
+    pub fn alert(s: &str);
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn eval_sync(code: &str) -> Result<serde_json::Value, String> {
+    serde_wasm_bindgen::from_value(eval(format!("let x = {}; x", code).as_str()))
+        .map_err(|err| format!("Cannot deserialize value: {:?}", err))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn eval_sync(_code: &str) -> Result<serde_json::Value, String> {
+    panic!("eval_sync is only available in wasm32")
 }

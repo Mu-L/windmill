@@ -1,53 +1,60 @@
 <script lang="ts">
-	import { usersWorkspaceStore } from '$lib/stores'
+	import {
+		codeCompletionSessionEnabled,
+		metadataCompletionEnabled,
+		stepInputCompletionEnabled,
+		usersWorkspaceStore
+	} from '$lib/stores'
 	import type { TruncatedToken, NewToken } from '$lib/gen'
-	import { UserService, SettingsService } from '$lib/gen'
-	import { displayDate, copyToClipboard } from '$lib/utils'
-	import { faClipboard, faPlus } from '@fortawesome/free-solid-svg-icons'
+	import { UserService } from '$lib/gen'
+	import { displayDate, copyToClipboard, getLocalSetting, storeLocalSetting } from '$lib/utils'
 	import TableCustom from '$lib/components/TableCustom.svelte'
 	import { Button } from '$lib/components/common'
-	import Icon from 'svelte-awesome'
-
-	export let scopes: string[] | undefined = undefined
-
-	let newPassword: string | undefined
-	let passwordError: string | undefined
-	let version: string | undefined
-	let tokens: TruncatedToken[]
-	let newToken: string | undefined
-	let newTokenLabel: string | undefined
-	let newTokenExpiration: number | undefined
-	let displayCreateToken = scopes != undefined
-	let login_type = 'none'
-
 	import Drawer from '$lib/components/common/drawer/Drawer.svelte'
 	import DrawerContent from '$lib/components/common/drawer/DrawerContent.svelte'
 	import { page } from '$app/stores'
-	import { goto } from '$app/navigation'
+	import { goto as gotoUrl } from '$app/navigation'
 	import { sendUserToast } from '$lib/toast'
 	import Tooltip from './Tooltip.svelte'
+	import Version from './Version.svelte'
+	import { Clipboard, Plus } from 'lucide-svelte'
+	import DarkModeToggle from './sidebar/DarkModeToggle.svelte'
+	import Toggle from './Toggle.svelte'
+	import type { Writable } from 'svelte/store'
+	import { createEventDispatcher } from 'svelte'
 
+	export let scopes: string[] | undefined = undefined
+	export let newTokenLabel: string | undefined = undefined
+	export let newTokenWorkspace: string | undefined = undefined
+	export let newToken: string | undefined = undefined
+
+	let newPassword: string | undefined
+	let passwordError: string | undefined
+	let tokens: TruncatedToken[]
+	let newTokenExpiration: number | undefined
+	let displayCreateToken = scopes != undefined
+	let login_type = 'none'
 	let drawer: Drawer
 
+	const dispatch = createEventDispatcher()
+
 	export function openDrawer() {
-		loadVersion()
 		loadLoginType()
 		listTokens()
 		drawer?.openDrawer()
 	}
 
-	export function toggleDrawer() {
-		drawer?.toggleDrawer()
-	}
-
 	export function closeDrawer() {
 		drawer?.closeDrawer()
+		removeHash()
+	}
+
+	function removeHash() {
 		const index = $page.url.href.lastIndexOf('#')
 		if (index === -1) return
 		const hashRemoved = $page.url.href.slice(0, index)
-		goto(hashRemoved)
+		gotoUrl(hashRemoved)
 	}
-
 	async function setPassword(): Promise<void> {
 		if (newPassword) {
 			await UserService.setPassword({
@@ -61,9 +68,6 @@
 		}
 	}
 
-	async function loadVersion(): Promise<void> {
-		version = await SettingsService.backendVersion()
-	}
 	async function loadLoginType(): Promise<void> {
 		login_type = (await UserService.globalWhoami()).login_type
 	}
@@ -76,14 +80,21 @@
 			date.setDate(date.getDate() + newTokenExpiration)
 		}
 		newToken = await UserService.createToken({
-			requestBody: { label: newTokenLabel, expiration: date?.toISOString(), scopes } as NewToken
+			requestBody: {
+				label: newTokenLabel,
+				expiration: date?.toISOString(),
+				scopes,
+				workspace_id: newTokenWorkspace
+			} as NewToken
 		})
+		dispatch('tokenCreated', newToken)
 		listTokens()
 		displayCreateToken = false
 	}
 
+	let tokenPage = 1
 	async function listTokens(): Promise<void> {
-		tokens = await UserService.listTokens()
+		tokens = await UserService.listTokens({ excludeEphemeral: true, page: tokenPage, perPage: 100 })
 	}
 
 	async function deleteToken(tokenPrefix: string) {
@@ -91,40 +102,59 @@
 		sendUserToast('Succesfully deleted token')
 		listTokens()
 	}
+
+	function loadSettings() {
+		$codeCompletionSessionEnabled =
+			(getLocalSetting('codeCompletionSessionEnabled') ?? 'true') == 'true'
+		$metadataCompletionEnabled = (getLocalSetting('metadataCompletionEnabled') ?? 'true') == 'true'
+		$stepInputCompletionEnabled =
+			(getLocalSetting('stepInputCompletionEnabled') ?? 'true') == 'true'
+	}
+
+	function updateSetting(store: Writable<boolean>, value: boolean, setting: string) {
+		store.set(value)
+		storeLocalSetting(setting, value.toString())
+	}
+
+	loadSettings()
 </script>
 
-<Drawer bind:this={drawer} size="800px">
+<Drawer bind:this={drawer} size="800px" on:close={removeHash}>
 	<DrawerContent title="User Settings" on:close={closeDrawer}>
 		<div class="flex flex-col h-full">
 			<div>
-				<div class="text-xs pt-1 pb-2 text-gray-500">
-					Windmill {version}
-				</div>
-
 				{#if scopes == undefined}
-					<h2 class="border-b mt-4">User info</h2>
-					<div class="">
-						{#if passwordError}
-							<div class="text-red-600 text-2xs grow">{passwordError}</div>
-						{/if}
-						<div class="flex flex-col gap-2 w-full">
-							<div class="mt-4">
-								<label class="block w-60 mb-2 text-gray-500">
-									<div class="text-gray-700">email</div>
-									<input
-										type="text"
-										disabled
-										value={$usersWorkspaceStore?.email}
-										class="input mt-1"
-									/>
-								</label>
-								{#if login_type == 'password'}
-									<label class="block w-120">
-										<div class="text-gray-700">password</div>
-										<input
-											type="password"
-											bind:value={newPassword}
-											class="
+					<div class="text-xs pt-1 pb-2 text-tertiary flex-col flex">
+						Windmill <Version />
+					</div>
+					<div class="font-semibold flex items-baseline">
+						Theme: <DarkModeToggle forcedDarkMode={false} />
+					</div>
+					<div class="flex flex-wrap md:gap-40 gap-10 mt-2">
+						<div>
+							<h2 class="border-b">User info</h2>
+							<div class="">
+								{#if passwordError}
+									<div class="text-red-600 text-2xs grow">{passwordError}</div>
+								{/if}
+								<div class="flex flex-col gap-2 w-full">
+									<div class="mt-4">
+										<label class="block w-60 mb-2 text-tertiary">
+											<div class="text-secondary">email</div>
+											<input
+												type="text"
+												disabled
+												value={$usersWorkspaceStore?.email}
+												class="input mt-1"
+											/>
+										</label>
+										{#if login_type == 'password'}
+											<label class="block w-120">
+												<div class="text-secondary">password</div>
+												<input
+													type="password"
+													bind:value={newPassword}
+													class="
 							w-full
 							block
 							py-1
@@ -136,25 +166,72 @@
 							focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50
 							text-sm
 							"
-										/>
-										<Button size="sm" btnClasses="mt-4 w-min" on:click={setPassword}
-											>Set password</Button
-										>
-									</label>
-								{:else if login_type == 'github'}
-									<span>Authentified through Github OAuth2. Cannot set a password.</span>
-								{/if}
+												/>
+												<Button size="sm" btnClasses="mt-4 w-min" on:click={setPassword}
+													>Set password</Button
+												>
+											</label>
+										{:else if login_type == 'github'}
+											<span>Authentified through Github OAuth2. Cannot set a password.</span>
+										{/if}
+									</div>
+								</div>
+							</div>
+						</div>
+
+						<div>
+							<h2 class="border-b">AI user settings</h2>
+
+							<div class="flex flex-col gap-4 mt-2">
+								<Toggle
+									on:change={(e) => {
+										updateSetting(
+											codeCompletionSessionEnabled,
+											e.detail,
+											'codeCompletionSessionEnabled'
+										)
+									}}
+									checked={$codeCompletionSessionEnabled}
+									options={{
+										right: 'Code completion',
+										rightTooltip: 'AI completion in the code editors'
+									}}
+								/>
+								<Toggle
+									on:change={(e) => {
+										updateSetting(metadataCompletionEnabled, e.detail, 'metadataCompletionEnabled')
+									}}
+									checked={$metadataCompletionEnabled}
+									options={{
+										right: 'Metadata completion',
+										rightTooltip: 'AI completion for summaries and descriptions'
+									}}
+								/>
+								<Toggle
+									on:change={(e) => {
+										updateSetting(
+											stepInputCompletionEnabled,
+											e.detail,
+											'stepInputCompletionEnabled'
+										)
+									}}
+									checked={$stepInputCompletionEnabled}
+									options={{
+										right: 'Flow step input completion',
+										rightTooltip: 'AI completion for flow step inputs'
+									}}
+								/>
 							</div>
 						</div>
 					</div>
 				{/if}
 
-				<div class="grid grid-cols-2 pt-8 pb-1">
-					<h2 class="py-0 my-0 border-b">Tokens</h2>
+				<div class="grid grid-cols-2 pt-8 pb-1" class:pt-8={scopes == undefined}>
+					<h2 class="py-0 my-0 border-b pt-3">Tokens</h2>
 					<div class="flex justify-end border-b pb-1">
 						<Button
 							size="sm"
-							startIcon={{ icon: faPlus }}
+							startIcon={{ icon: Plus }}
 							btnClasses={displayCreateToken ? 'hidden' : ''}
 							on:click={() => {
 								displayCreateToken = !displayCreateToken
@@ -167,7 +244,7 @@
 						</Button>
 					</div>
 				</div>
-				<div class="text-2xs text-gray-500 italic pb-6">
+				<div class="text-2xs text-tertiary italic pb-6">
 					Authentify to the Windmill API with access tokens.
 				</div>
 
@@ -175,11 +252,15 @@
 					<div
 						class="{newToken
 							? ''
-							: 'hidden'} border rounded-md mb-6 px-2 py-2 bg-green-50 flex flex-row flex-wrap"
+							: 'hidden'} border rounded-md mb-6 px-2 py-2 bg-green-50 dark:bg-green-200 dark:text-green-800 flex flex-row flex-wrap"
 					>
 						<div>
-							Added token: <button on:click={() => copyToClipboard(newToken ?? '')} class="inline"
-								>{newToken} <Icon data={faClipboard} />
+							Added token: <button
+								on:click={() => copyToClipboard(newToken ?? '')}
+								class="inline-flex gap-2 items-center"
+							>
+								{newToken}
+								<Clipboard size={12} />
 							</button>
 						</div>
 						<div class="pt-1 text-xs ml-2">
@@ -191,7 +272,7 @@
 					<div
 						class="{displayCreateToken
 							? ''
-							: 'hidden'} py-3 px-3 border rounded-md mb-6 bg-gray-50 min-w-min"
+							: 'hidden'} py-3 px-3 border rounded-md mb-6 bg-surface-secondary min-w-min"
 					>
 						<h3 class="pb-3 font-semibold">Add a new token</h3>
 						{#if scopes != undefined}
@@ -212,13 +293,13 @@
 						<div class="flex flex-row flex-wrap gap-x-2 w-full justify-between">
 							<div class="flex flex-col">
 								<label for="label"
-									>Label <span class="text-xs text-gray-500">(optional)</span></label
+									>Label <span class="text-xs text-tertiary">(optional)</span></label
 								>
 								<input type="text" bind:value={newTokenLabel} />
 							</div>
 							<div class="flex flex-col">
 								<label for="expires"
-									>Expires In &nbsp;<span class="text-xs text-gray-500">(optional)</span>
+									>Expires In &nbsp;<span class="text-xs text-tertiary">(optional)</span>
 								</label>
 								<select bind:value={newTokenExpiration}>
 									<option value={undefined}>No expiration</option>
@@ -262,13 +343,35 @@
 								{/each}
 							{:else if tokens && tokens.length === 0}
 								<tr class="px-6"
-									><td class="text-gray-700 italic text-xs"> There are no tokens yet</td></tr
+									><td class="text-secondary italic text-xs"> There are no tokens yet</td></tr
 								>
 							{:else}
 								<tr> Loading...</tr>
 							{/if}
 						</tbody>
 					</TableCustom>
+					<div class="flex flex-row-reverse gap-2 w-full">
+						{#if tokens?.length == 100}
+							<button
+								class=" p-1 underline text-sm whitespace-nowrap text-center"
+								on:click={() => {
+									tokenPage += 1
+									listTokens()
+								}}
+								>Next
+							</button>
+						{/if}
+						{#if tokenPage > 1}
+							<button
+								class="p-1 underline text-sm whitespace-nowrap text-center"
+								on:click={() => {
+									tokenPage -= 1
+									listTokens()
+								}}
+								>Previous
+							</button>
+						{/if}
+					</div>
 				</div>
 			</div>
 		</div>

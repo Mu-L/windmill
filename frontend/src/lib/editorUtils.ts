@@ -1,19 +1,17 @@
 import { languages } from 'monaco-editor/esm/vs/editor/editor.api'
+import { ShowLightbulbIconMode } from 'vscode/vscode/vs/editor/common/config/editorOptions'
 export function editorConfig(
-	model: any,
 	code: string,
 	lang: string,
 	automaticLayout: boolean,
 	fixedOverflowWidgets: boolean
 ) {
 	return {
-		model,
 		value: code,
 		language: lang,
 		automaticLayout,
 		readOnly: false,
 		fixedOverflowWidgets,
-		autoDetectHighContrast: true,
 		//lineNumbers: 'off',
 		lineDecorationsWidth: 15,
 		lineNumbersMinChars: 2,
@@ -24,13 +22,17 @@ export function editorConfig(
 			enabled: false
 		},
 		lightbulb: {
-			enabled: true
+			enabled: ShowLightbulbIconMode.On
 		},
 		suggest: {
 			showKeywords: true
 		},
 		bracketPairColorization: {
 			enabled: true
+		},
+		'workbench.colorTheme': 'Default Dark Modern',
+		workbench: {
+			colorTheme: 'Default Dark Modern'
 		},
 		'bracketPairColorization.enabled': true,
 		matchBrackets: 'always' as 'always'
@@ -44,7 +46,9 @@ export function createHash() {
 export function langToExt(lang: string): string {
 	switch (lang) {
 		case 'javascript':
-			return 'js'
+			return 'ts'
+		case 'bunnative':
+			return 'ts'
 		case 'json':
 			return 'json'
 		case 'sql':
@@ -59,8 +63,22 @@ export function langToExt(lang: string): string {
 			return 'go'
 		case 'bash':
 			return 'sh'
+		case 'powershell':
+			return 'ps1'
+		case 'php':
+			return 'php'
+		case 'rust':
+			return 'rs'
 		case 'deno':
 			return 'ts'
+		case 'nativets':
+			return 'ts'
+		case 'graphql':
+			return 'gql'
+		case 'css':
+			return 'css'
+		case 'ansible':
+			return 'yml'
 		default:
 			return 'unknown'
 	}

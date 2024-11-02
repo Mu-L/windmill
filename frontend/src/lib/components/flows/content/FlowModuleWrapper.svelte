@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Script, type FlowModule } from '$lib/gen'
+	import { type FlowModule } from '$lib/gen'
 	import { getContext } from 'svelte'
 
 	import type { FlowEditorContext } from '../types'
@@ -17,31 +17,104 @@
 	import FlowInputsFlow from './FlowInputsFlow.svelte'
 	import FlowBranchesAllWrapper from './FlowBranchesAllWrapper.svelte'
 	import FlowBranchesOneWrapper from './FlowBranchesOneWrapper.svelte'
-
-	const { selectedId, schedule, flowStateStore } =
-		getContext<FlowEditorContext>('FlowEditorContext')
+	import FlowWhileLoop from './FlowWhileLoop.svelte'
+	import { initFlowStepWarnings } from '../utils'
+	import { dfs } from '../dfs'
+	import type { TriggerContext } from '$lib/components/triggers'
 
 	export let flowModule: FlowModule
+	export let noEditor: boolean = false
+	export let enableAi = false
+
+	const { selectedId, flowStateStore, flowInputsStore, flowStore } =
+		getContext<FlowEditorContext>('FlowEditorContext')
+
+	const { primarySchedule } = getContext<TriggerContext>('TriggerContext')
+
+	let scriptKind: 'script' | 'trigger' | 'approval' = 'script'
+	let scriptTemplate: 'pgsql' | 'mysql' | 'script' | 'docker' | 'powershell' = 'script'
 
 	// These pointers are used to easily access previewArgs of parent module, and previous module
 	// Pointer to parent module, only defined within Branches or Loops.
 	export let parentModule: FlowModule | undefined = undefined
 	// Pointer to previous module, for easy access to testing results
 	export let previousModule: FlowModule | undefined = undefined
+
+	function initializePrimaryScheduleForTriggerScript(module: FlowModule) {
+		if (!$primarySchedule) {
+			$primarySchedule = {
+				summary: 'Scheduled poll of flow',
+				args: {},
+				cron: '0 */15 * * *',
+				timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+				enabled: true
+			}
+		}
+		if (!$primarySchedule.cron) {
+			$primarySchedule.cron = '0 */15 * * *'
+		}
+		$primarySchedule.enabled = true
+
+		module.stop_after_if = {
+			expr: 'result == undefined || Array.isArray(result) && result.length == 0',
+			skip_if_stopped: true
+		}
+	}
+	async function createModuleFromScript(
+		path: string,
+		summary: string,
+		kind: string,
+		hash: string | undefined
+	) {
+		const [module, state] = await pickScript(path, summary, flowModule.id, hash)
+
+		if (kind == 'approval') {
+			module.suspend = { required_events: 1, timeout: 1800 }
+		}
+
+		if (kind == 'trigger') {
+			initializePrimaryScheduleForTriggerScript(module)
+		}
+
+		flowModule = module
+		$flowStateStore[module.id] = state
+
+		if ($flowInputsStore) {
+			$flowInputsStore[module?.id] = {
+				flowStepWarnings: await initFlowStepWarnings(
+					module?.value,
+					$flowStateStore[module?.id]?.schema,
+					dfs($flowStore.value.modules, (fm) => fm.id)
+				)
+			}
+		}
+	}
 </script>
 
 {#if flowModule.id === $selectedId}
 	{#if flowModule.value.type === 'forloopflow'}
-		<FlowLoop bind:mod={flowModule} {parentModule} {previousModule} />
+		<FlowLoop {noEditor} bind:mod={flowModule} {parentModule} {previousModule} {enableAi} />
+	{:else if flowModule.value.type === 'whileloopflow'}
+		<FlowWhileLoop {noEditor} bind:mod={flowModule} {previousModule} {parentModule} />
 	{:else if flowModule.value.type === 'branchone'}
-		<FlowBranchesOneWrapper {previousModule} bind:flowModule />
+		<FlowBranchesOneWrapper {noEditor} {previousModule} {parentModule} bind:flowModule {enableAi} />
 	{:else if flowModule.value.type === 'branchall'}
-		<FlowBranchesAllWrapper {previousModule} bind:flowModule />
+		<FlowBranchesAllWrapper {noEditor} {previousModule} {parentModule} bind:flowModule />
 	{:else if flowModule.value.type === 'identity'}
 		{#if $selectedId == 'failure'}
 			<div class="p-4">
 				<Alert type="info" title="Error handlers are triggered upon non recovered errors">
 					If defined, the error handler will take the error as input.
+				</Alert>
+			</div>
+		{:else if $selectedId == 'preprocessor'}
+			<div class="p-4">
+				<Alert
+					type="info"
+					title="Preprocessor is called when the flow is triggered by API or email"
+				>
+					It prepares arguments for the flow. Besides request arguments, the preprocessor receives a
+					`wm_trigger` argument with trigger details.
 				</Alert>
 			</div>
 		{/if}
@@ -58,79 +131,75 @@
 			/>
 		{:else}
 			<FlowInputs
+				{noEditor}
 				summary={flowModule.summary}
 				shouldDisableTriggerScripts={parentModule !== undefined ||
 					previousModule !== undefined ||
-					$selectedId == 'failure'}
+					$selectedId == 'failure' ||
+					$selectedId == 'preprocessor'}
 				on:pick={async ({ detail }) => {
 					const { path, summary, kind, hash } = detail
-					const [module, state] = await pickScript(path, summary, flowModule.id, hash)
-
-					if (kind == Script.kind.APPROVAL) {
-						module.suspend = { required_events: 1, timeout: 1800 }
-					}
-
-					if (kind == Script.kind.TRIGGER) {
-						if (!$schedule.cron) {
-							$schedule.cron = '0 */15 * * *'
-						}
-						$schedule.enabled = true
-
-						module.stop_after_if = {
-							expr: 'result == undefined || Array.isArray(result) && result.length == 0',
-							skip_if_stopped: true
-						}
-					}
-
-					flowModule = module
-					$flowStateStore[module.id] = state
+					createModuleFromScript(path, summary, kind, hash)
 				}}
 				on:new={async ({ detail }) => {
-					const { language, kind, subkind } = detail
+					const { language, kind, subkind, summary } = detail
 
 					const [module, state] = await createInlineScriptModule(
 						language,
 						kind,
 						subkind,
-						flowModule.id
+						flowModule.id,
+						summary
 					)
+					scriptKind = kind
+					scriptTemplate = subkind
 
-					if (kind == Script.kind.TRIGGER) {
-						if (!$schedule.cron) {
-							$schedule.cron = '0 */15 * * *'
-						}
-						$schedule.enabled = true
-
-						module.stop_after_if = {
-							expr: 'result == undefined || Array.isArray(result) && result.length == 0',
-							skip_if_stopped: true
-						}
+					if (kind == 'trigger') {
+						initializePrimaryScheduleForTriggerScript(module)
 					}
 
-					if (kind == Script.kind.APPROVAL) {
+					if (kind == 'approval') {
 						module.suspend = { required_events: 1, timeout: 1800 }
 					}
 
 					flowModule = module
 					$flowStateStore[module.id] = state
+
+					if ($flowInputsStore) {
+						$flowInputsStore[module.id] = {
+							flowStepWarnings: await initFlowStepWarnings(
+								module.value,
+								$flowStateStore[module.id].schema,
+								dfs($flowStore.value.modules, (fm) => fm.id)
+							)
+						}
+					}
 				}}
 				failureModule={$selectedId === 'failure'}
+				preprocessorModule={$selectedId === 'preprocessor'}
 			/>
 		{/if}
 	{:else if flowModule.value.type === 'rawscript' || flowModule.value.type === 'script' || flowModule.value.type === 'flow'}
 		<FlowModuleComponent
+			{noEditor}
 			bind:flowModule
 			{parentModule}
 			{previousModule}
 			failureModule={$selectedId === 'failure'}
+			preprocessorModule={$selectedId === 'preprocessor'}
+			{scriptKind}
+			{scriptTemplate}
+			{enableAi}
 		/>
 	{/if}
-{:else if flowModule.value.type === 'forloopflow'}
+{:else if flowModule.value.type === 'forloopflow' || flowModule.value.type == 'whileloopflow'}
 	{#each flowModule.value.modules as submodule, index (index)}
 		<svelte:self
+			{noEditor}
 			bind:flowModule={submodule}
 			bind:parentModule={flowModule}
 			previousModule={flowModule.value.modules[index - 1]}
+			{enableAi}
 		/>
 	{/each}
 {:else if flowModule.value.type === 'branchone'}
@@ -142,21 +211,31 @@
 	{:else}
 		{#each flowModule.value.default as submodule, index}
 			<svelte:self
+				{noEditor}
 				bind:flowModule={submodule}
 				bind:parentModule={flowModule}
 				previousModule={flowModule.value.default[index - 1]}
+				{enableAi}
 			/>
 		{/each}
 	{/if}
 	{#each flowModule.value.branches as branch, branchIndex (branchIndex)}
 		{#if $selectedId === `${flowModule?.id}-branch-${branchIndex}`}
-			<FlowBranchOneWrapper bind:branch parentModule={flowModule} {previousModule} />
+			<FlowBranchOneWrapper
+				{noEditor}
+				bind:branch
+				parentModule={flowModule}
+				{previousModule}
+				{enableAi}
+			/>
 		{:else}
 			{#each branch.modules as submodule, index}
 				<svelte:self
+					{noEditor}
 					bind:flowModule={submodule}
 					bind:parentModule={flowModule}
 					previousModule={flowModule.value.branches[branchIndex].modules[index - 1]}
+					{enableAi}
 				/>
 			{/each}
 		{/if}
@@ -164,13 +243,15 @@
 {:else if flowModule.value.type === 'branchall'}
 	{#each flowModule.value.branches as branch, branchIndex (branchIndex)}
 		{#if $selectedId === `${flowModule?.id}-branch-${branchIndex}`}
-			<FlowBranchAllWrapper bind:branch />
+			<FlowBranchAllWrapper {noEditor} bind:branch />
 		{:else}
 			{#each branch.modules as submodule, index}
 				<svelte:self
+					{noEditor}
 					bind:flowModule={submodule}
 					bind:parentModule={flowModule}
 					previousModule={flowModule.value.branches[branchIndex].modules[index - 1]}
+					{enableAi}
 				/>
 			{/each}
 		{/if}

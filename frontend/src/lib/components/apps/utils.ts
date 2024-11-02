@@ -1,9 +1,7 @@
 import type { Schema } from '$lib/common'
-import { FlowService, ScriptService } from '$lib/gen'
-import { inferArgs } from '$lib/infer'
-import { emptySchema } from '$lib/utils'
+
 import { twMerge } from 'tailwind-merge'
-import type { AppComponent } from './editor/component'
+import { type AppComponent } from './editor/component'
 import type { AppInput, InputType, ResultAppInput, StaticAppInput } from './inputType'
 import type { Output } from './rx'
 import type {
@@ -13,11 +11,12 @@ import type {
 	HorizontalAlignment,
 	VerticalAlignment
 } from './types'
+import { gridColumns } from './gridUtils'
 
 export const BG_PREFIX = 'bg_'
 
 export function migrateApp(app: App) {
-	app.hiddenInlineScripts.forEach((x) => {
+	;(app?.hiddenInlineScripts ?? []).forEach((x) => {
 		if (x.type == undefined) {
 			//@ts-ignore
 			x.type = 'runnableByName'
@@ -28,7 +27,16 @@ export function migrateApp(app: App) {
 			x.doNotRecomputeOnInputChanged = undefined
 		}
 	})
+
+	allItems(app.grid, app.subgrids).forEach((x) => {
+		gridColumns.forEach((column: number) => {
+			if (x?.[column]?.fullHeight === undefined) {
+				x[column].fullHeight = false
+			}
+		})
+	})
 }
+
 export function allItems(
 	grid: GridItem[],
 	subgrids: Record<string, GridItem[]> | undefined
@@ -37,42 +45,6 @@ export function allItems(
 		return grid
 	}
 	return [...grid, ...Object.values(subgrids).flat()]
-}
-
-export async function loadSchema(
-	workspace: string,
-	path: string,
-	runType: 'script' | 'flow' | 'hubscript'
-): Promise<{ schema: Schema; summary: string | undefined }> {
-	if (runType === 'script') {
-		const script = await ScriptService.getScriptByPath({
-			workspace,
-			path
-		})
-
-		return { schema: script.schema as any, summary: script.summary }
-	} else if (runType === 'flow') {
-		const flow = await FlowService.getFlowByPath({
-			workspace,
-			path
-		})
-
-		return { schema: flow.schema as any, summary: flow.summary }
-	} else {
-		const script = await ScriptService.getHubScriptByPath({
-			path
-		})
-		if (
-			script.schema == undefined ||
-			Object.keys(script.schema).length == 0 ||
-			typeof script.schema != 'object'
-		) {
-			script.schema = emptySchema()
-		}
-
-		await inferArgs(script.language, script.content, script.schema)
-		return { schema: script.schema, summary: script.summary }
-	}
 }
 
 export function schemaToInputsSpec(
@@ -86,7 +58,7 @@ export function schemaToInputsSpec(
 		const property = schema.properties[key]
 
 		accu[key] = {
-			type: defaultUserInput && !property.format?.startsWith('resource-') ? 'user' : 'static',
+			type: defaultUserInput ? 'user' : 'static',
 			value: property.default,
 			fieldType: property.type,
 			format: property.format
@@ -195,37 +167,169 @@ export function toStatic(
 export function buildExtraLib(
 	components: Record<string, Record<string, Output<any>>>,
 	idToExclude: string,
-	hasRows: boolean,
 	state: Record<string, any>,
 	goto: boolean
 ): string {
 	const cs = Object.entries(components)
-		.filter(([k, v]) => k != idToExclude)
+		.filter(([k, v]) => k != idToExclude && k != 'state')
 		.map(([k, v]) => [k, Object.fromEntries(Object.entries(v).map(([k, v]) => [k, v.peak()]))])
 		.map(
-			([k, v]) => `declare const ${k}: ${JSON.stringify(v)};
+			([k, v]) => `declare const ${k}: WidenRo<${JSON.stringify(v)}>;
 `
 		)
 		.join('\n')
 
-	return `${cs}
-${hasRows ? 'declare const row: Record<string, any>;' : ''}
+	return `
+
+type Widen<T> = T extends string
+  ? string
+  : T extends number
+  ? number
+  : T extends boolean
+  ? boolean
+  : T extends Array<infer U>
+  ? Array<Widen<U>>
+  : T extends object
+  ? Partial<{ [K in keyof T]: Widen<T[K]> } & {[key: string]: any}>
+  : T;
+
+type WidenRo<T> = T extends string
+  ? string
+  : T extends number
+  ? number
+  : T extends boolean
+  ? boolean
+  : T extends Array<infer U>
+  ? Readonly<Array<WidenRo<U>>>
+  : T extends object
+  ? Readonly<{ [K in keyof T]: WidenRo<T[K]> }>
+  : T;
+
+
+/** The mutable state of the app */
+declare const state: Widen<${JSON.stringify(state)}> & {[key: string]: any};
+
+${cs}
+
 ${
 	goto
-		? `declare async function goto(path: string, newTab?: boolean): Promise<void>;
-declare function setTab(id: string, index: string): void;
+		? `
+/** open a window or tab
+ * @param path path/url to go to
+ * @param open in a tab?
+*/
+declare async function goto(path: string, newTab?: boolean): Promise<void>;
+
+/** set tab
+ * @param id component's id
+ * @param index index of the tab to set
+*/
+declare function setTab(id: string, index: number): void;
+
+/** recompute a component's runnable or background runnable
+ * @param id component's id
+*/
 declare function recompute(id: string): void;
+
+/** get the ag grid api from an AgGridTable
+ * @param id component's id
+*/
 declare function getAgGrid(id: string): {api: any, columnApi: any} | undefined;
+
+/** set value of a component
+ * @param id component's id
+ * @param value value to set
+ */
 declare function setValue(id: string, value: any): void;
+
+/** set selected index of a table
+ * @param id component's id
+ * @param index index to set
+ */
+declare function setSelectedIndex(id: string, index: number): void;
+
+/** close a drawer or modal
+  * @param id component's id
+ */
+declare function open(id: string): void;
+
+/** close a drawer or modal
+  * @param id component's id
+ */
+declare function close(id: string): void;
+
+
+/** validate form field property 'key'
+ * @param id component's id
+ * @param key property's key to validate
+ */
+declare function validate(id: string, key: string): void;
+
+/** validate form field property 'key'
+ * @param id component's id
+ * @param key property's key to validate
+ */
+declare function invalidate(id: string, key: string, error: string): void;
+
+/** validate all form's properties
+ * @param id component's id
+ */
+declare function validateAll(id: string): void;
+
+/** Clear the files of a file input component
+ * @param id component's id
+ */
+declare function clearFiles(id: string): void;
+
+/**  Display a toast message
+ * @param message message to display
+ */
+declare function showToast(message: string, error?: boolean): void;
+
+/**
+ * Wait for a job to finish
+ * @param id job id
+ * @returns the result of the job
+ */
+declare async function waitJob(id: string): Promise<any>;
+
+
+/**
+ * ask user resource on a UserResourceComponent
+ */
+declare async function askNewResource(id: string): void;
+
+/**
+ * Download a file from a url or base64 encoded string
+ * @param input url, base64 encoded string, [dataUrl](https://developer.mozilla.org/en-US/docs/Web/URI/Schemes/data) or S3 object
+ * @param [fileName] name of the file to download (optional)
+ */
+declare function downloadFile(input: string | {s3: string, storage?: string}, fileName?: string): void;
+
 `
 		: ''
 }
-declare const state: ${JSON.stringify(state)};
+
+/** The iterator within the context of a list */
+declare const iter: {index: number, value: any};
+
+/** The row within the context of a table */
+declare const row: {index: number, value: Record<string, any>, disabled: boolean};
+
+/** The file within the s3 file input */
+declare const file: File | undefined;
+
+/** The group fields within the context of a container's group */
+declare const group: Record<string, any>;
+
+/** The result within the context of a transformer */
+declare const result: any;
+
 `
 }
 
 export function getAllScriptNames(app: App): string[] {
-	const names = app.grid.reduce((acc, gridItem: GridItem) => {
+	const names = allItems(app.grid, app?.subgrids).reduce((acc, gridItem: GridItem) => {
 		const { componentInput } = gridItem.data
 
 		if (
@@ -240,6 +344,32 @@ export function getAllScriptNames(app: App): string[] {
 				if (actionButton.componentInput?.type === 'runnable') {
 					if (actionButton.componentInput.runnable?.type === 'runnableByName') {
 						acc.push(actionButton.componentInput.runnable.name)
+					}
+				}
+			})
+		}
+
+		if (
+			gridItem.data.type === 'aggridcomponent' ||
+			gridItem.data.type === 'aggridcomponentee' ||
+			gridItem.data.type === 'dbexplorercomponent' ||
+			gridItem.data.type === 'aggridinfinitecomponent' ||
+			gridItem.data.type === 'aggridinfinitecomponentee'
+		) {
+			gridItem.data.actions?.forEach((actionButton) => {
+				if (actionButton.componentInput?.type === 'runnable') {
+					if (actionButton.componentInput.runnable?.type === 'runnableByName') {
+						acc.push(actionButton.componentInput.runnable.name)
+					}
+				}
+			})
+		}
+
+		if (gridItem.data.type === 'menucomponent') {
+			gridItem.data.menuItems.forEach((menuItem) => {
+				if (menuItem.componentInput?.type === 'runnable') {
+					if (menuItem.componentInput.runnable?.type === 'runnableByName') {
+						acc.push(menuItem.componentInput.runnable.name)
 					}
 				}
 			})
@@ -266,11 +396,11 @@ export function toKebabCase(text: string) {
 	return text.replace(/[A-Z]+(?![a-z])|[A-Z]/g, ($, ofs) => (ofs ? '-' : '') + $.toLowerCase())
 }
 
-export function concatCustomCss<T extends Record<string, ComponentCssProperty>>(
+export function initCss<T extends Record<string, ComponentCssProperty>>(
 	appCss?: Record<string, ComponentCssProperty>,
 	componentCss?: T
-): T | undefined {
-	if (!componentCss) return undefined
+): T {
+	if (!componentCss) return {} as T
 
 	return Object.fromEntries(
 		Object.entries(componentCss).map(([key, v]) => {
@@ -286,7 +416,8 @@ export function concatCustomCss<T extends Record<string, ComponentCssProperty>>(
 				key,
 				{
 					style: (appStyle + appEnding + compStyle + compEnding).trim(),
-					class: twMerge(appCss?.[key]?.class, v?.class)
+					class: twMerge(appCss?.[key]?.class, v?.class),
+					evalClass: appCss?.[key]?.evalClass || v?.evalClass
 				}
 			]
 		})
@@ -327,9 +458,31 @@ export function transformBareBase64IfNecessary(source: string | undefined) {
 	if (!source) {
 		return source
 	}
-	if (source.startsWith('data:') || !source.includes(',')) {
+	if (/^(http|https):\/\//.test(source) || source.startsWith('/')) {
+		return source
+	}
+	if (source.startsWith('data:') || source.includes(',')) {
 		return source
 	} else {
 		return `data:application/octet-stream;base64,${source}`
 	}
 }
+
+export function getImageDataURL(imageKind: string | undefined, image: string | undefined) {
+	if (!imageKind || !image) {
+		return null
+	}
+
+	switch (imageKind) {
+		case 'png encoded as base64':
+			return 'data:image/png;base64,' + image
+		case 'jpeg encoded as base64':
+			return 'data:image/jpeg;base64,' + image
+		case 'svg encoded as base64':
+			return 'data:image/svg+xml;base64,' + image
+		default:
+			return image
+	}
+}
+
+export const ctxRegex = /^ctx\.(workspace|groups|username|email|author)$/

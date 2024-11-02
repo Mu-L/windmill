@@ -5,14 +5,23 @@
 	import Drawer from '$lib/components/common/drawer/Drawer.svelte'
 	import FlowPreviewContent from '$lib/components/FlowPreviewContent.svelte'
 	import type { Job } from '$lib/gen'
-	import { faPlay } from '@fortawesome/free-solid-svg-icons'
 
 	import { getContext } from 'svelte'
 	import type { FlowEditorContext } from '../types'
+	import { Play } from 'lucide-svelte'
 	const { selectedId } = getContext<FlowEditorContext>('FlowEditorContext')
 	let previewOpen = false
 	let previewMode: 'upTo' | 'whole' = 'whole'
 
+	export async function openPreview() {
+		if (!previewOpen) {
+			previewOpen = true
+		} else {
+			flowPreviewContent?.test()
+		}
+	}
+
+	let flowPreviewContent: FlowPreviewContent
 	let jobId: string | undefined = undefined
 	let job: Job | undefined = undefined
 
@@ -25,10 +34,19 @@
 			'settings-retries',
 			'settings-same-worker',
 			'settings-graph',
+			'settings-worker-group',
+			'settings-cache',
+			'settings-concurrency',
+			'settings-early-stop',
+			'settings-early-return',
 			'inputs',
 			'schedules',
 			'failure',
-			'constants'
+			'preprocessor',
+			'constants',
+			'Result',
+			'Input',
+			'triggers'
 		].includes($selectedId) ||
 		$selectedId?.includes('branch')
 </script>
@@ -43,10 +61,10 @@
 			previewMode = 'upTo'
 			previewOpen = !previewOpen
 		}}
-		startIcon={{ icon: faPlay }}
+		startIcon={{ icon: Play }}
 	>
-		Test up to
-		<Badge baseClass="ml-1" color="indigo">
+		Test up to&nbsp;
+		<Badge baseClass="ml-1" small color="indigo" wrapperClass="max-h-[15px]">
 			{$selectedId}
 		</Badge>
 	</Button>
@@ -59,13 +77,15 @@
 		previewMode = 'whole'
 		previewOpen = !previewOpen
 	}}
-	startIcon={{ icon: faPlay }}
+	startIcon={{ icon: Play }}
+	id="flow-editor-test-flow"
 >
 	Test flow
 </Button>
 
 <Drawer bind:open={previewOpen} alwaysOpen size="75%">
 	<FlowPreviewContent
+		bind:this={flowPreviewContent}
 		open={previewOpen}
 		bind:previewMode
 		bind:job

@@ -6,18 +6,36 @@
 	import { Skeleton } from '../common'
 	import { getContext } from 'svelte'
 	import type { FlowEditorContext } from './types'
-
-	export let loading: boolean
+	import type { FlowCopilotContext } from '../copilot/flow'
+	import { classNames } from '$lib/utils'
 
 	const { flowStore } = getContext<FlowEditorContext>('FlowEditorContext')
 
-	let size = 40
+	export let loading: boolean
+	export let disableStaticInputs = false
+	export let disableTutorials = false
+	export let disableAi = false
+	export let disableSettings = false
+	export let disabledFlowInputs = false
+	export let smallErrorHandler = false
+	export let newFlow: boolean = false
+
+	let size = 50
+
+	const { currentStepStore: copilotCurrentStepStore } =
+		getContext<FlowCopilotContext>('FlowCopilotContext')
 </script>
 
-<div class="h-full overflow-hidden border-t">
+<div
+	id="flow-editor"
+	class={classNames(
+		'h-full overflow-hidden transition-colors duration-[400ms] ease-linear border-t',
+		$copilotCurrentStepStore !== undefined ? 'border-gray-500/75' : ''
+	)}
+>
 	<Splitpanes>
 		<Pane {size} minSize={15} class="h-full relative z-0">
-			<div class="grow overflow-auto bg-gray h-full bg-gray-50 relative">
+			<div class="grow overflow-hidden bg-gray h-full bg-surface-secondary relative">
 				{#if loading}
 					<div class="p-2 pt-10">
 						{#each new Array(6) as _}
@@ -25,7 +43,16 @@
 						{/each}
 					</div>
 				{:else if $flowStore.value.modules}
-					<FlowModuleSchemaMap bind:modules={$flowStore.value.modules} />
+					<FlowModuleSchemaMap
+						{disableStaticInputs}
+						{disableTutorials}
+						{disableAi}
+						{disableSettings}
+						{smallErrorHandler}
+						{newFlow}
+						bind:modules={$flowStore.value.modules}
+						on:reload
+					/>
 				{/if}
 			</div>
 		</Pane>
@@ -37,7 +64,7 @@
 					</div>
 				</div>
 			{:else}
-				<FlowEditorPanel />
+				<FlowEditorPanel {disabledFlowInputs} {newFlow} enableAi={!disableAi} />
 			{/if}
 		</Pane>
 	</Splitpanes>

@@ -10,10 +10,14 @@ env:
 
 jobs:
   build_go_and_push_to_repo:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-8
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
+      - name: install_jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install jq
       - name: generate_go
         run: |
           go install github.com/deepmap/oapi-codegen/cmd/oapi-codegen@v1.11.0
@@ -38,7 +42,7 @@ jobs:
     needs: [build_go_and_push_to_repo]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/${{ env.repo }}
           token: ${{ secrets.DENO_PAT }}

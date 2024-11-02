@@ -8,6 +8,8 @@
 	export let seconds = 0
 	export let hideDisplay = false
 	export let disabled = false
+	export let max: number | undefined = undefined
+
 	let day: TimeUnit = undefined
 	let hour: TimeUnit = undefined
 	let min: TimeUnit = undefined
@@ -38,17 +40,24 @@
 			(min || 0) * ONE_MINUTE_IN_SECONDS +
 			(sec || 0)
 		if (seconds < 0) seconds = 0
+		if (max && seconds > max) {
+			seconds = max
+		}
 	}
 </script>
 
-<div>
+<div class="flex flex-wrap gap-x-4">
 	{#if !hideDisplay}
 		<input
-			value={disabled ? '' : seconds + ' second' + (seconds === 1 ? '' : 's')}
+			value={seconds == null || seconds == undefined
+				? 'Not set'
+				: disabled
+				? ''
+				: seconds + ' second' + (seconds === 1 ? '' : 's')}
 			{disabled}
 			readonly
 			type="text"
-			class="max-w-[248px] bg-gray-50 mb-2"
+			class="max-w-[248px] bg-gray-50 mb-2 mt-6"
 		/>
 	{/if}
 	<div class="flex flex-wrap items-center gap-2 text-xs font-medium">

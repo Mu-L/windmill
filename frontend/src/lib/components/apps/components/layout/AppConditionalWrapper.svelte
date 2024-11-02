@@ -3,22 +3,32 @@
 	import { initOutput } from '../../editor/appUtils'
 	import SubGridEditor from '../../editor/SubGridEditor.svelte'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfiguration } from '../../types'
-	import { concatCustomCss } from '../../utils'
+	import { initCss } from '../../utils'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
-	import { InputValue } from '../helpers'
+	import { twMerge } from 'tailwind-merge'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
+	import InputValue from '../helpers/InputValue.svelte'
 
 	export let id: string
 	export let componentContainerHeight: number
-	export let customCss: ComponentCustomCSS<'containercomponent'> | undefined = undefined
+	export let customCss: ComponentCustomCSS<'conditionalwrapper'> | undefined = undefined
 	export let render: boolean
 	export let conditions: RichConfiguration[]
+	export let onTabChange: string[] | undefined = undefined
 
-	const { app, focusedGrid, selectedComponent, worldStore, connectingInput, componentControl } =
-		getContext<AppViewerContext>('AppViewerContext')
+	const {
+		app,
+		focusedGrid,
+		selectedComponent,
+		worldStore,
+		connectingInput,
+		componentControl,
+		runnableComponents
+	} = getContext<AppViewerContext>('AppViewerContext')
 
 	const outputs = initOutput($worldStore, id, {
 		conditions: [] as boolean[],
-		selectedConditionIndex: 0
+		selectedTabIndex: 0
 	})
 
 	function onFocus() {
@@ -28,7 +38,7 @@
 		}
 	}
 
-	$: css = concatCustomCss($app.css?.containercomponent, customCss)
+	let css = initCss($app.css?.conditionalwrapper, customCss)
 
 	let resolvedConditions: boolean[] = []
 	let selectedConditionIndex = 0
@@ -49,7 +59,8 @@
 		}
 
 		selectedConditionIndex = index
-		outputs.selectedConditionIndex.set(index)
+		outputs.selectedTabIndex.set(index)
+		onTabChange?.forEach((id) => $runnableComponents?.[id]?.cb?.forEach((cb) => cb?.()))
 	}
 
 	$: resolvedConditions && handleResolvedConditions()
@@ -66,7 +77,22 @@
 </script>
 
 {#each conditions ?? [] as condition, index}
-	<InputValue {id} input={condition} bind:value={resolvedConditions[index]} />
+	<InputValue
+		key="condition{index + 1}"
+		{id}
+		input={condition}
+		bind:value={resolvedConditions[index]}
+	/>
+{/each}
+
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.conditionalwrapper}
+	/>
 {/each}
 
 <InitializeComponent {id} />
@@ -77,11 +103,11 @@
 			<SubGridEditor
 				visible={render && i == selectedConditionIndex}
 				{id}
-				class={css?.container?.class}
+				class={twMerge(css?.container?.class, 'wm-conditional-tabs')}
 				style={css?.container?.style}
 				subGridId={`${id}-${i}`}
 				containerHeight={componentContainerHeight}
-				on:focus={() => {
+				on:focus={(e) => {
 					if (!$connectingInput.opened) {
 						$selectedComponent = [id]
 					}

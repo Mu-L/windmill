@@ -1,10 +1,14 @@
 <script lang="ts">
 	import { sendUserToast } from '$lib/toast'
 	import { createEventDispatcher } from 'svelte'
-	import { workspaceStore } from '$lib/stores'
-	import { WorkspaceService } from '$lib/gen'
-	import { Button, ToggleButton, ToggleButtonGroup } from './common'
-	import Tooltip from './Tooltip.svelte'
+	import { globalEmailInvite, superadmin, workspaceStore } from '$lib/stores'
+	import { UserService, WorkspaceService } from '$lib/gen'
+	import { Button, Popup } from './common'
+	import { isCloudHosted } from '$lib/cloud'
+	import { goto } from '$lib/navigation'
+	import ToggleButtonGroup from './common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from './common/toggleButton-v2/ToggleButton.svelte'
+	import { MailPlus } from 'lucide-svelte'
 
 	const dispatch = createEventDispatcher()
 
@@ -28,36 +32,85 @@
 			}
 		})
 		sendUserToast(`Invited ${email}`)
+		if (!(await UserService.existsEmail({ email }))) {
+			let isSuperadmin = $superadmin
+			if (!isCloudHosted()) {
+				sendUserToast(
+					`User ${email} is not registered yet on the instance. ${
+						!isSuperadmin
+							? `If not using SSO, ask an administrator to add ${email} to the instance`
+							: ''
+					}`,
+					true,
+					isSuperadmin
+						? [
+								{
+									label: 'Add user to the instance',
+									callback: () => {
+										$globalEmailInvite = email
+										goto('#superadmin-settings')
+									}
+								}
+						  ]
+						: []
+				)
+			}
+		}
 		dispatch('new')
+
+		email = ''
 	}
 
-	let selected: 'operator' | 'author' | 'admin' = 'author'
+	let selected: 'operator' | 'developer' | 'admin' = 'developer'
 </script>
 
-<div class="flex flex-row">
-	<input type="email" on:keyup={handleKeyUp} placeholder="email" bind:value={email} class="mr-4" />
-	<ToggleButtonGroup bind:selected>
-		<ToggleButton position="left" value="operator" size="sm"
-			>Operator <Tooltip
-				>An operator can only execute and view scripts/flows/apps from your workspace, and only
-				those that he has visibility on</Tooltip
-			></ToggleButton
+<Popup floatingConfig={{ strategy: 'absolute', placement: 'bottom-end' }}>
+	<svelte:fragment slot="button">
+		<Button color="dark" size="xs" nonCaptureEvent={true} startIcon={{ icon: MailPlus }}>
+			Invite
+		</Button>
+	</svelte:fragment>
+
+	<div class="flex flex-col gap-2">
+		<input
+			type="email"
+			on:keyup={handleKeyUp}
+			placeholder="email"
+			bind:value={email}
+			class="mr-4"
+		/>
+		<ToggleButtonGroup bind:selected>
+			<ToggleButton
+				value="operator"
+				size="sm"
+				label="Operator"
+				tooltip="An operator can only execute and view scripts/flows/apps from your workspace, and only those that he has visibility on."
+			/>
+
+			<ToggleButton
+				position="center"
+				value="developer"
+				size="sm"
+				label="Developer"
+				tooltip="A Developer can execute and view scripts/flows/apps, but they can also create new ones and edit those they are allowed to by their path (either u/ or Writer or Admin of their folder found at /f)."
+			/>
+
+			<ToggleButton
+				position="right"
+				value="admin"
+				size="sm"
+				label="Admin"
+				tooltip="An admin has full control over a specific Windmill workspace, including the ability to manage users, edit entities, and control permissions within the workspace."
+			/>
+		</ToggleButtonGroup>
+		<Button
+			variant="contained"
+			color="blue"
+			size="sm"
+			on:click={inviteUser}
+			disabled={email === undefined}
 		>
-		<ToggleButton position="center" value="author" size="sm"
-			>Author <Tooltip
-				>An Author can execute and view scripts/flows/apps, but he can also create new ones</Tooltip
-			></ToggleButton
-		>
-		<ToggleButton position="right" value="admin" size="sm">Admin</ToggleButton>
-	</ToggleButtonGroup>
-	<Button
-		variant="contained"
-		color="blue"
-		size="sm"
-		btnClasses="!ml-8"
-		on:click={inviteUser}
-		disabled={email === undefined}
-	>
-		Invite
-	</Button>
-</div>
+			Invite
+		</Button>
+	</div>
+</Popup>

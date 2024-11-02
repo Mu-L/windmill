@@ -1,8 +1,7 @@
 <script lang="ts">
 	import { getContext } from 'svelte'
-	import { concatCustomCss } from '../../utils'
+	import { initCss } from '../../utils'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import { InputValue } from '../helpers'
 	import { twMerge } from 'tailwind-merge'
 	import { Map, View, Feature } from 'ol'
 	import { useGeographic } from 'ol/proj'
@@ -10,9 +9,12 @@
 	import { Vector as VectorLayer, Tile as TileLayer } from 'ol/layer'
 	import { Point } from 'ol/geom'
 	import { defaults as defaultControls } from 'ol/control'
-	import { findGridItem, initOutput } from '../../editor/appUtils'
+	import { findGridItem, initConfig, initOutput } from '../../editor/appUtils'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
-
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
+	import { components } from '../../editor/component'
+	import ResolveConfig from '../helpers/ResolveConfig.svelte'
+	import { Style, Circle, Fill, Stroke, Text } from 'ol/style'
 	interface Marker {
 		lon: number
 		lat: number
@@ -31,9 +33,15 @@
 	export let configuration: RichConfigurations
 	export let customCss: ComponentCustomCSS<'mapcomponent'> | undefined = undefined
 	export let render: boolean
+	export let extraKey: string | undefined = undefined
 
 	const { app, worldStore, selectedComponent, connectingInput, focusedGrid, mode } =
 		getContext<AppViewerContext>('AppViewerContext')
+
+	const resolvedConfig = initConfig(
+		components['mapcomponent'].initialData.configuration,
+		configuration
+	)
 
 	let outputs = initOutput($worldStore, id, {
 		mapRegion: {
@@ -42,24 +50,18 @@
 		}
 	})
 
-	let map: Map
-	let mapElement: HTMLDivElement
+	let map: Map | undefined = undefined
+	let mapElement: HTMLDivElement | undefined = undefined
 
-	let longitude: number | undefined = undefined
-	let latitude: number | undefined = undefined
-	let zoom: number | undefined = undefined
-	// If string, it's a JSON file read as text
-	let markers: Marker[] | string | undefined = undefined
-
-	$: if (map && longitude && latitude) {
-		map.getView().setCenter([longitude, latitude])
+	$: if (map && resolvedConfig.longitude && resolvedConfig.latitude) {
+		map.getView().setCenter([resolvedConfig.longitude, resolvedConfig.latitude])
 	}
 
-	$: if (map && zoom) {
-		map.getView().setZoom(zoom)
+	$: if (map && resolvedConfig.zoom) {
+		map.getView().setZoom(resolvedConfig.zoom)
 	}
 
-	$: if (map && markers) {
+	$: if (map && resolvedConfig.markers) {
 		updateMarkers()
 	}
 
@@ -72,19 +74,19 @@
 
 	function getLayersByName(name: keyof typeof LAYER_NAME) {
 		return map
-			.getLayers()
-			.getArray()
-			.filter((l) => l.getProperties().name === LAYER_NAME[name])
+			?.getLayers()
+			?.getArray()
+			?.filter((l) => l.getProperties().name === LAYER_NAME[name])
 	}
 
 	function getMarkerArray(): Marker[] | undefined {
 		let array: Marker[] | undefined = undefined
 		try {
-			if (typeof markers === 'string') {
-				const json = JSON.parse(markers)
+			if (typeof resolvedConfig.markers === 'string') {
+				const json = JSON.parse(resolvedConfig.markers)
 				array = Array.isArray(json) ? json : [json]
 			} else {
-				array = markers
+				array = resolvedConfig.markers
 			}
 			return array?.filter((m) => !isNaN(+m.lat) && !isNaN(+m.lon))
 		} catch (error) {
@@ -96,34 +98,52 @@
 	function createMarkerLayers() {
 		const markerArray = getMarkerArray()
 		return markerArray?.map((m) => {
+			const feature = new Feature({
+				geometry: new Point([+m.lon, +m.lat]),
+				name: m.title
+			})
+
+			feature.setStyle(
+				new Style({
+					image: new Circle({
+						radius: m.radius ?? 7,
+						fill: new Fill({ color: m.color ?? '#dc2626' }),
+						stroke: new Stroke({ width: m.strokeWidth ?? 3, color: m.strokeColor ?? '#fca5a5' })
+					}),
+					text: new Text({
+						text: m.title,
+						font: '12px Calibri,sans-serif',
+						fill: new Fill({ color: '#000' }),
+						stroke: new Stroke({
+							color: '#fff',
+							width: 2
+						}),
+						offsetY: -15
+					})
+				})
+			)
+
 			return new VectorLayer({
 				properties: {
 					name: LAYER_NAME.MARKER
 				},
 				source: new VectorSource({
-					features: [
-						new Feature({
-							geometry: new Point([+m.lon, +m.lat]),
-							name: m.title
-						})
-					]
-				}),
-				style: {
-					'circle-radius': m.radius ?? 7,
-					'circle-fill-color': m.color ?? '#dc2626',
-					'circle-stroke-width': m.strokeWidth ?? 3,
-					'circle-stroke-color': m.strokeColor ?? '#fca5a5'
-				}
+					features: [feature]
+				})
 			})
 		})
 	}
-
 	function updateMarkers() {
 		const layers = getLayersByName('MARKER')
 		if (layers?.length) {
-			layers.forEach((l) => map.removeLayer(l))
+			layers.forEach((l) => map?.removeLayer(l))
 		}
-		createMarkerLayers()?.forEach((l) => map.addLayer(l))
+		createMarkerLayers()?.forEach((l) => map?.addLayer(l))
+	}
+
+	$: if (!render) {
+		map = undefined
+		mapElement = undefined
 	}
 
 	$: if (!map && mapElement) {
@@ -137,8 +157,8 @@
 				...(createMarkerLayers() || [])
 			],
 			view: new View({
-				center: [longitude ?? 0, latitude ?? 0],
-				zoom: zoom ?? 2
+				center: [resolvedConfig.longitude ?? 0, resolvedConfig.latitude ?? 0],
+				zoom: resolvedConfig.zoom ?? 2
 			}),
 			controls: defaultControls({
 				attribution: false
@@ -147,10 +167,28 @@
 		updateRegionOutput()
 	}
 
-	$: css = concatCustomCss($app.css?.mapcomponent, customCss)
+	let previousLock: boolean | undefined = undefined
+
+	function updateInteractions(map: Map) {
+		if (previousLock === resolvedConfig.lock) {
+			return
+		}
+
+		previousLock = resolvedConfig.lock
+
+		map.getInteractions().forEach((i) => {
+			i.setActive(!resolvedConfig.lock)
+		})
+
+		map.changed()
+	}
+
+	$: map && resolvedConfig && updateInteractions(map)
+
+	let css = initCss($app.css?.mapcomponent, customCss)
 
 	function updateRegionOutput() {
-		if (map) {
+		if (map && !resolvedConfig.lock) {
 			let extent = map.getView().calculateExtent(map.getSize())
 			const [left, bottom, right, top] = extent
 
@@ -163,7 +201,7 @@
 		}
 	}
 
-	function handleSyncRegion() {
+	async function handleSyncRegion() {
 		const gridItem = findGridItem($app, id)
 		if (!map || !gridItem) {
 			return
@@ -187,23 +225,44 @@
 			gridItem.data.configuration.longitude.value = center[0]
 			//@ts-ignore
 			gridItem.data.configuration.latitude.value = center[1]
+
+			$app = $app
 		}
 	}
 </script>
 
-<InputValue {id} input={configuration.longitude} bind:value={longitude} />
-<InputValue {id} input={configuration.latitude} bind:value={latitude} />
-<InputValue {id} input={configuration.zoom} bind:value={zoom} />
-<InputValue {id} input={configuration.markers} bind:value={markers} />
+{#each Object.entries(components['mapcomponent'].initialData.configuration) as [key, initialConfig] (key)}
+	<ResolveConfig
+		{id}
+		{extraKey}
+		{key}
+		bind:resolvedConfig={resolvedConfig[key]}
+		configuration={configuration[key]}
+		{initialConfig}
+	/>
+{/each}
 
 <InitializeComponent {id} />
 
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.mapcomponent}
+	/>
+{/each}
+
 {#if render}
-	<div class="relative h-full w-full">
+	<div class="relative h-full w-full component-wrapper">
 		<div
+			on:pointermove={updateRegionOutput}
+			on:wheel={updateRegionOutput}
+			on:touchmove={updateRegionOutput}
 			on:pointerdown|stopPropagation={selectComponent}
 			bind:this={mapElement}
-			class={twMerge(`w-full h-full`, css?.map?.class ?? '')}
+			class={twMerge(`w-full h-full`, css?.map?.class, 'wm-map')}
 			style={css?.map?.style ?? ''}
 		/>
 
@@ -217,14 +276,3 @@
 		{/if}
 	</div>
 {/if}
-
-<style global lang="postcss">
-	.ol-overlaycontainer-stopevent {
-		@apply flex flex-col justify-start items-end;
-	}
-	.ol-control button {
-		@apply w-7 h-7 center-center bg-white border border-gray-300 text-gray-700 
-		rounded mt-1 mr-1 shadow duration-200 hover:bg-gray-100 focus:bg-gray-100 
-		hover:border-gray-500 focus:border-gray-500;
-	}
-</style>

@@ -12,9 +12,9 @@ use axum::{
     Extension, Json, Router,
 };
 use windmill_audit::{AuditLog, ListAuditLogQuery};
-use windmill_common::{error::JsonResult, utils::Pagination};
+use windmill_common::{db::UserDB, error::JsonResult, utils::Pagination};
 
-use crate::{db::UserDB, users::Authed};
+use crate::db::ApiAuthed;
 
 pub fn workspaced_service() -> Router {
     Router::new()
@@ -23,22 +23,22 @@ pub fn workspaced_service() -> Router {
 }
 
 async fn get_audit(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
-    Path(id): Path<i32>,
+    Path((w_id, id)): Path<(String, i32)>,
 ) -> JsonResult<AuditLog> {
     let tx = user_db.begin(&authed).await?;
-    let audit = windmill_audit::get_audit(tx, id).await?;
+    let audit = windmill_audit::audit_ee::get_audit(tx, id, &w_id).await?;
     Ok(Json(audit))
 }
 async fn list_audit(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Query(pagination): Query<Pagination>,
     Query(lq): Query<ListAuditLogQuery>,
 ) -> JsonResult<Vec<AuditLog>> {
     let tx = user_db.begin(&authed).await?;
-    let rows = windmill_audit::list_audit(tx, w_id, pagination, lq).await?;
+    let rows = windmill_audit::audit_ee::list_audit(tx, w_id, pagination, lq).await?;
     Ok(Json(rows))
 }

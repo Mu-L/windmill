@@ -1,5 +1,15 @@
 <script lang="ts">
-	import { createEventDispatcher } from 'svelte'
+	import { createEventDispatcher, getContext, onMount } from 'svelte'
+	import type { AppEditorContext, AppViewerContext } from '../types'
+	import { writable } from 'svelte/store'
+	import { twMerge } from 'tailwind-merge'
+	import {
+		computePosition,
+		findGridItemParentGrid,
+		isContainer,
+		type GridShadow
+	} from '../editor/appUtils'
+	import { throttle } from './utils/other'
 
 	const dispatch = createEventDispatcher()
 
@@ -24,6 +34,15 @@
 	export let nativeContainer
 	export let onTop
 	export let shadow: { x: number; y: number; w: number; h: number } | undefined = undefined
+	export let overlapped: string | undefined = undefined
+	export let moveMode: 'move' | 'insert' = 'move'
+	export let type: string | undefined = undefined
+	export let fakeShadow: GridShadow | undefined = undefined
+
+	const ctx = getContext<AppEditorContext>('AppEditorContext')
+	const { mode, app } = getContext<AppViewerContext>('AppViewerContext')
+
+	const scale = ctx ? ctx.scale : writable(100)
 
 	const divId = `component-${id}`
 	let shadowElement
@@ -44,25 +63,50 @@
 
 	let anima
 
+	onMount(() => {
+		if (ctx && $mode == 'dnd') {
+			ctx.dndItem.update((x) => {
+				x[id] = (moveX, moveY, topY) => {
+					ctx.componentActive.set(true)
+					let gridItem = document.getElementById(divId)
+					let irect = gridItem?.getBoundingClientRect()
+
+					const clientX = (irect?.x ?? 0) + (irect?.width ?? 0)
+					const clientY = irect?.y ?? 0
+					initX = (clientX / $scale) * 100
+					initY = (clientY / $scale) * 100
+
+					window.addEventListener('pointermove', pointermove)
+					window.addEventListener('pointerup', pointerup)
+
+					dispatch('initmove')
+
+					const cordDiff = {
+						x: (moveX / $scale) * 100 - initX,
+						y: (moveY / $scale) * 100 - initY
+					}
+
+					dispatch('move', { cordDiff, clientY: clientY })
+				}
+				return x
+			})
+		}
+	})
+
 	export function inActivate() {
 		if (shadowElement && shadow != undefined) {
 			let subgrid = shadowElement.closest('.subgrid')
 			let irect = shadowElement.getBoundingClientRect()
 			let shadowBound
 
+			const factor = $scale / 100
+
 			if (subgrid) {
-				let subGridParent = subgrid.parentElement
-				let subGridParentRect = subGridParent.getBoundingClientRect()
 				let prect = subgrid.getBoundingClientRect()
 
-				const subGridOffset = {
-					x: subGridParentRect.x - prect.x,
-					y: subGridParentRect.y - prect.y
-				}
-
 				shadowBound = {
-					x: irect.x - prect.left - subGridOffset.x,
-					y: irect.y - prect.top - subGridOffset.y
+					x: irect.x - prect.left,
+					y: irect.y - prect.top
 				}
 			} else {
 				shadowBound = irect
@@ -71,8 +115,8 @@
 			const xdragBound = rect.left + cordDiff.x
 			const ydragBound = rect.top + cordDiff.y
 
-			cordDiff.x = shadow.x * xPerPx + gapX - (shadowBound.x - xdragBound)
-			cordDiff.y = shadow.y * yPerPx + gapY - (shadowBound.y - ydragBound)
+			cordDiff.x = shadow.x * xPerPx + gapX - (shadowBound.x - xdragBound * factor) * factor
+			cordDiff.y = shadow.y * yPerPx + gapY - (shadowBound.y - ydragBound * factor) * factor
 
 			active = false
 			trans = true
@@ -121,19 +165,13 @@
 
 		let irect = gridItem.getBoundingClientRect()
 		if (subgrid && subgrid.parentElement) {
-			let subGridParent = subgrid.parentElement
-			let subGridParentRect = subGridParent.getBoundingClientRect()
-
 			let prect = subgrid.getBoundingClientRect()
 
-			const subGridOffset = {
-				x: subGridParentRect.x - prect.x,
-				y: subGridParentRect.y - prect.y
-			}
+			const factor = $scale / 100
 
 			rect = {
-				top: irect.top - prect.top - subGridOffset.y,
-				left: irect.left - prect.left - subGridOffset.x
+				top: (irect.top - prect.top) / factor,
+				left: (irect.left - prect.left) / factor
 			}
 		} else {
 			rect = irect
@@ -144,9 +182,10 @@
 	const pointerdown = ({ clientX, clientY }) => {
 		dragClosure = () => {
 			dragClosure = undefined
+			ctx.componentActive.set(true)
 
-			initX = clientX
-			initY = clientY
+			initX = (clientX / $scale) * 100
+			initY = (clientY / $scale) * 100
 			dispatch('initmove')
 		}
 		window.addEventListener('pointermove', pointermove)
@@ -170,7 +209,7 @@
 
 	let sign = { x: 0, y: 0 }
 	let vel = { x: 0, y: 0 }
-	let intervalId: NodeJS.Timer | undefined = undefined
+	let intervalId: NodeJS.Timeout | undefined = undefined
 
 	const stopAutoscroll = () => {
 		intervalId && clearInterval(intervalId)
@@ -180,18 +219,28 @@
 	}
 
 	const update = () => {
-		const boundX = capturePos.x + cordDiff.x
-		const _newScrollTop = (scrollElement?.scrollTop ?? 0) - (_scrollTop ?? 0)
-		const boundY = capturePos.y + (cordDiff.y + _newScrollTop)
+		if (xPerPx != 0) {
+			const boundX = capturePos.x + cordDiff.x
+			const _newScrollTop = (scrollElement?.scrollTop ?? 0) - (_scrollTop ?? 0)
+			const boundY = capturePos.y + (cordDiff.y + _newScrollTop)
 
-		let gridX = Math.round(boundX / xPerPx)
-		let gridY = Math.round(boundY / yPerPx)
+			let gridX = Math.round(boundX / xPerPx)
+			let gridY = Math.round(boundY / yPerPx)
 
-		if (shadow) {
-			shadow.x = Math.max(Math.min(gridX, cols - shadow.w), 0)
-			shadow.y = Math.max(gridY, 0)
+			if (shadow) {
+				shadow.x = Math.max(Math.min(gridX, cols - shadow.w), 0)
+				shadow.y = Math.max(gridY, 0)
+			}
 		}
 	}
+
+	// Shared state for the shadow position
+	let currentShadowPosition:
+		| { x: number; y: number; xPerPx: number; yPerPx: number; h: number; w: number }
+		| undefined = undefined
+	let currentIntersectingElementId: string | undefined = undefined
+
+	let moving: boolean = false
 
 	const pointermove = (event) => {
 		dragClosure && dragClosure()
@@ -199,10 +248,31 @@
 		event.stopPropagation()
 		event.stopImmediatePropagation()
 
-		const { clientX, clientY } = event
-		const cordDiff = { x: clientX - initX, y: clientY - initY }
+		moving = true
 
-		dispatch('move', { cordDiff, clientY })
+		const { clientX, clientY } = event
+		const cordDiff = { x: (clientX / $scale) * 100 - initX, y: (clientY / $scale) * 100 - initY }
+
+		if (moveMode === 'move') {
+			dispatch('move', {
+				cordDiff,
+				clientY,
+				intersectingElement: undefined,
+				shadow: undefined
+			})
+
+			return
+		}
+
+		throttledComputeShadow(clientX, clientY)
+
+		dispatch('move', {
+			cordDiff,
+			clientY,
+			intersectingElement: currentIntersectingElementId,
+			shadow: currentShadowPosition,
+			overlapped
+		})
 	}
 
 	export function updateMove(newCoordDiff, clientY) {
@@ -244,24 +314,95 @@
 			update()
 		}
 	}
+
+	let element: HTMLElement | undefined = undefined
+
+	function computeShadow(clientX: number, clientY: number) {
+		const elementsAtPoint = document.elementsFromPoint(clientX, clientY)
+		const intersectingElement = elementsAtPoint.find(
+			(el) =>
+				el.id !== divId &&
+				el.classList.contains('svlt-grid-item') &&
+				el.getAttribute('data-iscontainer') === 'true'
+		)
+
+		const newOverlapped = intersectingElement ? intersectingElement?.id.split('-')[1] : undefined
+
+		const container = newOverlapped
+			? intersectingElement?.querySelector('.svlt-grid-container')
+			: document.getElementById('root-grid')
+
+		const xPerPxComputed = Number(container?.getAttribute('data-xperpx')) ?? xPerPx
+
+		const position = computePosition(
+			clientX,
+			clientY,
+			xPerPxComputed,
+			yPerPx,
+			newOverlapped,
+			element
+		)
+
+		if (overlapped !== newOverlapped) {
+			currentShadowPosition = undefined
+		} else {
+			// Update shared state
+			currentShadowPosition = {
+				x: position.x,
+				y: position.y,
+				xPerPx: xPerPxComputed,
+				yPerPx,
+				h: item.h,
+				w: item.w
+			}
+		}
+
+		currentIntersectingElementId = newOverlapped
+	}
+
+	const throttledComputeShadow = throttle((clientX, clientY) => {
+		computeShadow(clientX, clientY)
+	}, 50)
+
 	const pointerup = (e) => {
+		ctx.componentActive.set(false)
 		stopAutoscroll()
 
 		window.removeEventListener('pointerdown', pointerdown)
 		window.removeEventListener('pointermove', pointermove)
 		window.removeEventListener('pointerup', pointerup)
+
 		if (!dragClosure) {
 			repaint(true, true)
 		} else {
 			dragClosure = undefined
 		}
+
+		if (!moving) {
+			return
+		}
+
+		const parent = findGridItemParentGrid($app, id)
+
+		if (overlapped && (overlapped === parent || parent?.startsWith(overlapped))) {
+			return
+		}
+
+		dispatch('dropped', {
+			id,
+			overlapped,
+			x: fakeShadow?.x,
+			y: fakeShadow?.y
+		})
 	}
 
 	let resizeInitPos = { x: 0, y: 0 }
 	let initSize = { width: 0, height: 0 }
 
-	const resizePointerDown = (e) => {
+	let orientation: 'both' | 'horizontal' | 'vertical' = 'both'
+	const resizePointerDown = (e, o: 'both' | 'horizontal' | 'vertical') => {
 		e.stopPropagation()
+		orientation = o
 		const { pageX, pageY } = e
 
 		resizeInitPos = { x: pageX, y: pageY }
@@ -282,12 +423,19 @@
 
 		window.addEventListener('pointermove', resizePointerMove)
 		window.addEventListener('pointerup', resizePointerUp)
+		dispatch('resizeStart')
 	}
 
 	const resizePointerMove = ({ pageX, pageY }) => {
 		if (shadow) {
-			newSize.width = initSize.width + pageX - resizeInitPos.x
-			newSize.height = initSize.height + pageY - resizeInitPos.y
+			newSize.width =
+				orientation == 'both' || orientation == 'horizontal'
+					? initSize.width + ((pageX - resizeInitPos.x) / $scale) * 100
+					: initSize.width
+			newSize.height =
+				orientation == 'both' || orientation == 'vertical'
+					? initSize.height + ((pageY - resizeInitPos.y) / $scale) * 100
+					: initSize.height
 
 			// Get max col number
 			let maxWidth = cols - shadow.x
@@ -296,10 +444,11 @@
 			// Limit bound
 			newSize.width = Math.min(newSize.width, maxWidth * xPerPx - gapX * 2)
 
-			// Limit col & row
-			shadow.w = Math.round((newSize.width + gapX * 2) / xPerPx)
-			shadow.h = Math.round((newSize.height + gapY * 2) / yPerPx)
-
+			if (xPerPx) {
+				// Limit col & row
+				shadow.w = Math.round(Math.max((newSize.width + gapX * 2) / xPerPx, 1))
+				shadow.h = Math.round(Math.max((newSize.height + gapY * 2) / yPerPx, 1))
+			}
 			repaint(false, false)
 		}
 	}
@@ -310,31 +459,73 @@
 
 		window.removeEventListener('pointermove', resizePointerMove)
 		window.removeEventListener('pointerup', resizePointerUp)
+		dispatch('resizeEnd')
+	}
+
+	function shouldDisplayShadow(moveMode: 'insert' | 'move', overlapped: string | undefined) {
+		if (moveMode === 'move') {
+			return true
+		}
+
+		const parent = findGridItemParentGrid($app, id)
+
+		if (parent === undefined) {
+			return overlapped === undefined
+		} else if (overlapped) {
+			return parent.startsWith(overlapped)
+		}
+
+		return false
 	}
 </script>
 
 <!-- svelte-ignore a11y-click-events-have-key-events -->
+<!-- svelte-ignore a11y-no-static-element-interactions -->
 <div
+	bind:this={element}
 	draggable="false"
 	on:pointerdown|stopPropagation|preventDefault={pointerdown}
 	id={divId}
 	class="svlt-grid-item"
+	data-iscontainer={type ? isContainer(type) : false}
+	data-componenttype={type}
 	class:svlt-grid-active={active || (trans && rect)}
-	style="width: {active ? newSize.width : width}px; height:{active ? newSize.height : height}px; 
+	style="width: {xPerPx == 0 ? 0 : active ? newSize.width : width}px; height:{xPerPx == 0
+		? 0
+		: active
+		? newSize.height
+		: height}px; 
+	{xPerPx == 0 ? 'overflow: hidden;' : ''}
 	{onTop ? 'z-index: 1000;' : ''}
+	
   {active && rect
-		? `transform: translate(${cordDiff.x}px, ${cordDiff.y}px);top:${rect.top}px;left:${rect.left}px;`
+		? `transform: translate(${cordDiff.x}px, ${cordDiff.y}px);top:${rect.top}px;left:${rect.left}px;z-index:10000;`
 		: trans
 		? `transform: translate(${cordDiff.x}px, ${cordDiff.y}px); position:absolute; transition: width 0.2s, height 0.2s;`
-		: `transition: transform 0.1s, opacity 0.1s; transform: translate(${left}px, ${top}px); `} "
+		: `${
+				xPerPx > 0 ? 'transition: transform 0.1s, opacity 0.1s;' : ''
+		  } transform: translate(${left}px, ${top}px); `} "
 >
 	<slot />
-	<div class="svlt-grid-resizer" on:pointerdown={resizePointerDown} />
+	{#if moveMode === 'move'}
+		<div
+			class="svlt-grid-resizer-bottom"
+			on:pointerdown={(e) => resizePointerDown(e, 'vertical')}
+		/>
+		<div
+			class="svlt-grid-resizer-side"
+			on:pointerdown={(e) => resizePointerDown(e, 'horizontal')}
+		/>
+		<div class="svlt-grid-resizer" on:pointerdown={(e) => resizePointerDown(e, 'both')} />
+	{/if}
 </div>
 
-{#if (active || trans) && shadow}
+{#if xPerPx > 0 && (active || trans) && shadow}
 	<div
-		class="svlt-grid-shadow shadow-active"
+		class={twMerge(
+			'svlt-grid-shadow shadow-active',
+			shouldDisplayShadow(moveMode, overlapped) ? '' : 'hidden'
+		)}
 		style="width: {shadow.w * xPerPx - gapX * 2}px; height: {shadow.h * yPerPx -
 			gapY * 2}px; transform: translate({shadow.x * xPerPx + gapX}px, {shadow.y * yPerPx +
 			gapY}px); "
@@ -349,6 +540,25 @@
 		will-change: auto;
 		backface-visibility: hidden;
 		-webkit-backface-visibility: hidden;
+	}
+
+	.svlt-grid-resizer-bottom {
+		user-select: none;
+		width: 100%;
+		height: 4px;
+		position: absolute;
+		bottom: 0;
+		cursor: s-resize;
+	}
+
+	.svlt-grid-resizer-side {
+		user-select: none;
+		width: 4px;
+		height: 100%;
+		position: absolute;
+		top: 0;
+		right: 0;
+		cursor: e-resize;
 	}
 
 	.svlt-grid-resizer {
@@ -372,7 +582,7 @@
 	}
 
 	.svlt-grid-active {
-		z-index: 3;
+		z-index: 300;
 		cursor: grabbing;
 		position: fixed;
 		opacity: 0.5;
@@ -393,10 +603,9 @@
 
 	.svlt-grid-shadow {
 		position: absolute;
-		background: red;
 		will-change: transform;
-		background: pink;
 		backface-visibility: hidden;
 		-webkit-backface-visibility: hidden;
+		background: #93c4fdd0;
 	}
 </style>

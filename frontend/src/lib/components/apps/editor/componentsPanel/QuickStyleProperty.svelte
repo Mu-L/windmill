@@ -49,7 +49,7 @@
 
 <div class={inline && type !== StylePropertyType.color ? '' : 'w-full'}>
 	{#if prop.value['title']}
-		<div class="font-medium text-xs text-gray-500">
+		<div class="font-medium text-xs text-tertiary">
 			{prop.value['title']}
 		</div>
 	{/if}
@@ -91,7 +91,7 @@
 				<Menu
 					let:close
 					noMinW
-					wrapperClasses="h-full bg-white rounded-r-md border-y border-r border-gray-300 pr-0.5"
+					wrapperClasses="h-full bg-surface rounded-r-md border-y border-r pr-0.5"
 					popupClasses="!mt-0"
 				>
 					<button
@@ -101,7 +101,7 @@
 					>
 						{unit}
 					</button>
-					<ul class="bg-white rounded border py-1 overflow-auto">
+					<ul class="bg-surface rounded border py-1 overflow-auto">
 						{#each StylePropertyUnits as u}
 							<li class="w-full">
 								<Button

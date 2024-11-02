@@ -1,7 +1,7 @@
 openapi: "3.0.3"
 
 info:
-  version: 1.107.0
+  version: 1.416.2
   title: OpenFlow Spec
   contact:
     name: Ruben Fiszel
@@ -16,7 +16,7 @@ paths: {}
 
 externalDocs:
   description: documentation portal
-  url: https://docs.windmill.dev
+  url: https://windmill.dev
 
 components:
   schemas:
@@ -44,9 +44,24 @@ components:
             $ref: "#/components/schemas/FlowModule"
         failure_module:
           $ref: "#/components/schemas/FlowModule"
+        preprocessor_module:
+          $ref: "#/components/schemas/FlowModule"
         same_worker:
           type: boolean
-
+        concurrent_limit:
+          type: number
+        concurrency_key:
+          type: string
+        concurrency_time_window_s:
+          type: number
+        skip_expr:
+          type: string
+        cache_ttl:
+          type: number
+        priority:
+          type: number
+        early_return:
+          type: string
       required:
         - modules
 
@@ -69,6 +84,10 @@ components:
               type: integer
             seconds:
               type: integer
+            random_factor:
+              type: integer
+              minimum: 0
+              maximum: 100
 
     FlowModule:
       type: object
@@ -86,10 +105,38 @@ components:
               type: string
           required:
             - expr
+        stop_after_all_iters_if:
+          type: object
+          properties:
+            skip_if_stopped:
+              type: boolean
+            expr:
+              type: string
+          required:
+            - expr
+        skip_if:
+          type: object
+          properties:
+            expr:
+              type: string
+          required:
+            - expr
         sleep:
           $ref: "#/components/schemas/InputTransform"
+        cache_ttl:
+          type: number
+        timeout:
+          type: number
+        delete_after_use:
+          type: boolean
         summary:
           type: string
+        mock:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            return_value: {}
         suspend:
           type: object
           properties:
@@ -97,6 +144,25 @@ components:
               type: integer
             timeout:
               type: integer
+            resume_form:
+              type: object
+              properties:
+                schema:
+                  type: object
+            user_auth_required:
+              type: boolean
+            user_groups_required:
+              $ref: "#/components/schemas/InputTransform"
+            self_approval_disabled:
+              type: boolean
+            hide_cancel:
+              type: boolean
+            continue_on_disapprove_timeout:
+              type: boolean
+        priority:
+          type: number
+        continue_on_error:
+          type: boolean
         retry:
           $ref: "#/components/schemas/Retry"
       required:
@@ -144,6 +210,7 @@ components:
         - $ref: "#/components/schemas/PathScript"
         - $ref: "#/components/schemas/PathFlow"
         - $ref: "#/components/schemas/ForloopFlow"
+        - $ref: "#/components/schemas/WhileloopFlow"
         - $ref: "#/components/schemas/BranchOne"
         - $ref: "#/components/schemas/BranchAll"
         - $ref: "#/components/schemas/Identity"
@@ -154,6 +221,7 @@ components:
           script: "#/components/schemas/PathScript"
           flow: "#/components/schemas/PathFlow"
           forloopflow: "#/components/schemas/ForloopFlow"
+          whileloopflow: "#/components/schemas/WhileloopFlow"
           branchone: "#/components/schemas/BranchOne"
           branchall: "#/components/schemas/BranchAll"
           identity: "#/components/schemas/Identity"
@@ -172,9 +240,19 @@ components:
           type: string
           enum:
             - deno
+            - bun
             - python3
             - go
             - bash
+            - powershell
+            - postgresql
+            - mysql
+            - bigquery
+            - snowflake
+            - mssql
+            - graphql
+            - nativets
+            - php
         path:
           type: string
         lock:
@@ -184,6 +262,12 @@ components:
           enum:
             - rawscript
         tag:
+          type: string
+        concurrent_limit:
+          type: number
+        concurrency_time_window_s:
+          type: number
+        custom_concurrency_key:
           type: string
       required:
         - type
@@ -206,6 +290,8 @@ components:
           type: string
           enum:
             - script
+        tag_override:
+          type: string
       required:
         - type
         - path
@@ -246,9 +332,33 @@ components:
             - forloopflow
         parallel:
           type: boolean
+        parallelism:
+          type: integer
       required:
         - modules
         - iterator
+        - skip_failures
+        - type
+
+    WhileloopFlow:
+      type: object
+      properties:
+        modules:
+          type: array
+          items:
+            $ref: "#/components/schemas/FlowModule"
+        skip_failures:
+          type: boolean
+        type:
+          type: string
+          enum:
+            - forloopflow
+        parallel:
+          type: boolean
+        parallelism:
+          type: integer
+      required:
+        - modules
         - skip_failures
         - type
 
@@ -313,6 +423,7 @@ components:
       required:
         - branches
         - type
+
     Identity:
       type: object
       properties:
@@ -322,6 +433,7 @@ components:
             - identity
         flow:
           type: boolean
+
       required:
         - type
 
@@ -334,6 +446,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FlowStatusModule"
+        user_states:
+          additionalProperties: true
+        preprocessor_module:
+          allOf:
+            - $ref: "#/components/schemas/FlowStatusModule"
         failure_module:
           allOf:
             - $ref: "#/components/schemas/FlowStatusModule"
@@ -376,6 +493,8 @@ components:
           format: uuid
         count:
           type: integer
+        progress:
+          type: integer
         iterator:
           type: object
           properties:
@@ -389,6 +508,10 @@ components:
           type: array
           items:
             type: string
+        flow_jobs_success:
+          type: array
+          items:
+            type: boolean
         branch_chosen:
           type: object
           properties:
@@ -421,5 +544,11 @@ components:
             required:
               - resume_id
               - approver
-
+        failed_retries:
+          type: array
+          items:
+            type: string
+            format: uuid
+        skipped:
+          type: boolean
       required: [type]

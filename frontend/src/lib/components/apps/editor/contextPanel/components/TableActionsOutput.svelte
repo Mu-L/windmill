@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { GridItem } from '$lib/components/apps/types'
-	import TableActionOutput from './TableActionOutput.svelte'
+	import Output from './Output.svelte'
 
 	export let gridItem: GridItem
 </script>
@@ -9,7 +9,14 @@
 	{#if gridItem.data.type === 'tablecomponent' && gridItem.data.actionButtons.length > 0}
 		<div class="ml-2 border-l">
 			{#each gridItem.data.actionButtons as action, index}
-				<TableActionOutput id={action.id} first={index === 0} />
+				<Output id={action.id} first={index === 0} label="Table action" />
+			{/each}
+		</div>
+	{/if}
+	{#if (gridItem.data.type === 'aggridcomponent' || gridItem.data.type === 'aggridcomponentee' || gridItem.data.type === 'dbexplorercomponent' || gridItem.data.type === 'aggridinfinitecomponent' || gridItem.data.type === 'aggridinfinitecomponentee') && gridItem.data.actions?.length > 0}
+		<div class="ml-2 border-l">
+			{#each gridItem.data.actions as action, index}
+				<Output id={action.id} first={index === 0} label="Table action" />
 			{/each}
 		</div>
 	{/if}

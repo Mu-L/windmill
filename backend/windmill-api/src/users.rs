@@ -6,44 +6,59 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-use std::{sync::Arc, time::Duration};
+#![allow(non_snake_case)]
 
-use crate::{
-    db::{UserDB, DB},
-    folders::get_folders_for_user,
-    utils::require_super_admin,
-    webhook_util::{InstanceEvent, WebhookShared},
-    workspaces::invite_user_to_all_auto_invite_worspaces,
-    COOKIE_DOMAIN, IS_SECURE,
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::db::ApiAuthed;
+
+#[cfg(feature = "enterprise")]
+use crate::ee::ExternalJwks;
+use crate::oauth2_ee::InstanceEvent;
+use crate::utils::{
+    generate_instance_wide_unique_username, get_instance_username_or_create_pending,
 };
-use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use crate::{
+    db::DB, utils::require_super_admin, webhook_util::WebhookShared, COOKIE_DOMAIN, IS_SECURE,
+};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     async_trait,
     extract::{Extension, FromRequestParts, OriginalUri, Path, Query},
-    http::{self, request::Parts},
+    http::request::Parts,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use chrono::TimeZone;
 use hyper::{header::LOCATION, StatusCode};
 use lazy_static::lazy_static;
-use rand::rngs::OsRng;
+use quick_cache::sync::Cache;
 use regex::Regex;
-use retainer::Cache;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use time::OffsetDateTime;
+#[cfg(feature = "enterprise")]
+use tokio::sync::RwLock;
 use tower_cookies::{Cookie, Cookies};
 use tracing::{Instrument, Span};
-use windmill_audit::{audit_log, ActionKind};
+use windmill_audit::audit_ee::{audit_log, AuditAuthor};
+use windmill_audit::ActionKind;
+use windmill_common::auth::fetch_authed_from_permissioned_as;
+use windmill_common::global_settings::AUTOMATE_USERNAME_CREATION_SETTING;
+use windmill_common::users::{truncate_token, username_to_permissioned_as};
+use windmill_common::utils::paginate;
+use windmill_common::worker::CLOUD_HOSTED;
 use windmill_common::{
+    auth::{get_folders_for_user, get_groups_for_user, JWTAuthClaims, JWT_SECRET},
+    db::UserDB,
     error::{self, Error, JsonResult, Result},
     users::SUPERADMIN_SECRET_EMAIL,
     utils::{not_found_if_none, rd_string, require_admin, Pagination, StripPath},
 };
-use windmill_queue::CLOUD_HOSTED;
+use windmill_git_sync::handle_deployment_metadata;
 
-const TTL_TOKEN_CACHE_S: u64 = 60; // 60s
 pub const TTL_TOKEN_DB_H: u32 = 72;
 
 const COOKIE_NAME: &str = "token";
@@ -52,18 +67,22 @@ const COOKIE_PATH: &str = "/";
 pub fn workspaced_service() -> Router {
     Router::new()
         .route("/list", get(list_users))
+        .route("/list_usage", get(list_user_usage))
         .route("/list_usernames", get(list_usernames))
         .route("/exists", post(exists_username))
+        .route("/get/:user", get(get_workspace_user))
         .route("/update/:user", post(update_workspace_user))
         .route("/delete/:user", delete(delete_workspace_user))
         .route("/is_owner/*path", get(is_owner_of_path))
-        .route("/whois/:email", get(whois))
+        .route("/whois/:username", get(whois))
         .route("/whoami", get(whoami))
         .route("/leave", post(leave_workspace))
+        .route("/username_to_email/:username", get(username_to_email))
 }
 
 pub fn global_service() -> Router {
     Router::new()
+        .route("/exists/:email", get(exists_email))
         .route("/email", get(get_email))
         .route("/whoami", get(global_whoami))
         .route("/list_invites", get(list_invites))
@@ -74,12 +93,23 @@ pub fn global_service() -> Router {
         .route("/create", post(create_user))
         .route("/update/:user", post(update_user))
         .route("/delete/:user", delete(delete_user))
+        .route("/username_info/:user", get(get_instance_username_info))
+        .route("/rename/:user", post(rename_user))
         .route("/tokens/create", post(create_token))
         .route("/tokens/delete/:token_prefix", delete(delete_token))
         .route("/tokens/list", get(list_tokens))
         .route("/tokens/impersonate", post(impersonate))
         .route("/usage", get(get_usage))
         .route("/all_runnables", get(get_all_runnables))
+        .route("/refresh_token", get(refresh_token))
+        .route(
+            "/tutorial_progress",
+            post(update_tutorial_progress).get(get_tutorial_progress),
+        )
+        .route("/leave_instance", post(leave_instance))
+        .route("/export", get(export_global_users))
+        .route("/overwrite", post(overwrite_global_users))
+
     // .route("/list_invite_codes", get(list_invite_codes))
     // .route("/create_invite_code", post(create_invite_code))
     // .route("/signup", post(signup))
@@ -90,39 +120,164 @@ pub fn global_service() -> Router {
 pub fn make_unauthed_service() -> Router {
     Router::new()
         .route("/login", post(login))
-        .route("/logout", post(logout))
-        .route("/logout", get(logout))
+        .route("/logout", post(logout).get(logout))
+        .route("/is_first_time_setup", get(is_first_time_setup))
+}
+
+fn username_override_from_label(label: Option<String>) -> Option<String> {
+    match label {
+        Some(label)
+            if label.starts_with("webhook-")
+                || label.starts_with("http-")
+                || label.starts_with("email-") =>
+        {
+            Some(label)
+        }
+        Some(label) if label.starts_with("ephemeral-script-end-user-") => Some(
+            label
+                .trim_start_matches("ephemeral-script-end-user-")
+                .to_string(),
+        ),
+        Some(label) if label == "Ephemeral lsp token" => Some("lsp".to_string()),
+        Some(label) if label != "ephemeral-script" && label != "session" && !label.is_empty() => {
+            Some(format!("label-{label}"))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+pub struct ExpiringAuthCache {
+    pub authed: ApiAuthed,
+    pub expiry: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct AuthCache {
-    cache: Cache<(String, String), Authed>,
+    cache: Cache<(String, String), ExpiringAuthCache>,
     db: DB,
     superadmin_secret: Option<String>,
+    #[cfg(feature = "enterprise")]
+    ext_jwks: Option<Arc<RwLock<ExternalJwks>>>,
 }
 
 impl AuthCache {
-    pub fn new(db: DB, superadmin_secret: Option<String>) -> Self {
-        AuthCache { cache: Cache::new(), db, superadmin_secret }
+    pub fn new(
+        db: DB,
+        superadmin_secret: Option<String>,
+        #[cfg(feature = "enterprise")] ext_jwks: Option<Arc<RwLock<ExternalJwks>>>,
+    ) -> Self {
+        AuthCache {
+            cache: Cache::new(300),
+            db,
+            superadmin_secret,
+            #[cfg(feature = "enterprise")]
+            ext_jwks,
+        }
     }
 
     pub async fn invalidate(&self, w_id: &str, token: String) {
-        self.cache.remove(&(w_id.to_string(), token)).await;
+        self.cache.remove(&(w_id.to_string(), token));
     }
 
-    pub async fn get_authed(&self, w_id: Option<String>, token: &str) -> Option<Authed> {
+    pub async fn get_authed(&self, w_id: Option<String>, token: &str) -> Option<ApiAuthed> {
         let key = (
             w_id.as_ref().unwrap_or(&"".to_string()).to_string(),
             token.to_string(),
         );
-        let s = self.cache.get(&key).await.map(|c| c.to_owned());
+        let s = self.cache.get(&key).map(|c| c.to_owned());
         match s {
-            a @ Some(_) => a,
-            None => {
-                let user_o = sqlx::query_as::<_, (Option<String>, Option<String>, bool, Option<Vec<String>>)>(
+            Some(ExpiringAuthCache { authed, expiry }) if expiry > chrono::Utc::now() => {
+                Some(authed)
+            }
+            #[cfg(feature = "enterprise")]
+            _ if token.starts_with("jwt_ext_") => {
+                let authed_and_exp = match crate::ee::jwt_ext_auth(
+                    w_id.as_ref(),
+                    token.trim_start_matches("jwt_ext_"),
+                    self.ext_jwks.clone(),
+                )
+                .await
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::error!("JWT_EXT auth error: {:?}", e);
+                        None
+                    }
+                };
+
+                if let Some((authed, exp)) = authed_and_exp.clone() {
+                    self.cache.insert(
+                        key,
+                        ExpiringAuthCache {
+                            authed: authed.clone(),
+                            expiry: chrono::Utc.timestamp_nanos(exp as i64 * 1_000_000_000),
+                        },
+                    );
+
+                    Some(authed)
+                } else {
+                    None
+                }
+            }
+            _ if token.starts_with("jwt_") => {
+                let jwt_secret = JWT_SECRET.read().await;
+                if !jwt_secret.is_empty() {
+                    let jwt_token = token.trim_start_matches("jwt_");
+
+                    let jwt_result = jsonwebtoken::decode::<JWTAuthClaims>(
+                        jwt_token,
+                        &jsonwebtoken::DecodingKey::from_secret(jwt_secret.as_bytes()),
+                        &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+                    );
+
+                    match jwt_result {
+                        Ok(payload) => {
+                            if w_id.is_some_and(|w_id| w_id != payload.claims.workspace_id) {
+                                tracing::error!("JWT auth error: workspace_id mismatch");
+                                return None;
+                            }
+
+                            let username_override =
+                                username_override_from_label(payload.claims.label);
+                            let authed = crate::db::ApiAuthed {
+                                email: payload.claims.email,
+                                username: payload.claims.username,
+                                is_admin: payload.claims.is_admin,
+                                is_operator: payload.claims.is_operator,
+                                groups: payload.claims.groups,
+                                folders: payload.claims.folders,
+                                scopes: None,
+                                username_override,
+                            };
+
+                            self.cache.insert(
+                                key,
+                                ExpiringAuthCache {
+                                    authed: authed.clone(),
+                                    expiry: chrono::Utc
+                                        .timestamp_nanos(payload.claims.exp as i64 * 1_000_000_000),
+                                },
+                            );
+
+                            Some(authed)
+                        }
+                        Err(err) => {
+                            tracing::error!("JWT auth error: {:?}", err);
+                            None
+                        }
+                    }
+                } else {
+                    tracing::error!("JWT auth error: no jwt secret set");
+                    None
+                }
+            }
+            _ => {
+                let user_o = sqlx::query_as::<_, (Option<String>, Option<String>, bool, Option<Vec<String>>, Option<String>)>(
                     "UPDATE token SET last_used_at = now() WHERE token = $1 AND (expiration > NOW() \
-                     OR expiration IS NULL) RETURNING owner, email, super_admin, scopes",
+                     OR expiration IS NULL) AND (workspace_id IS NULL OR workspace_id = $2) RETURNING owner, email, super_admin, scopes, label",
                 )
                 .bind(token)
+                .bind(w_id.as_ref())
                 .fetch_optional(&self.db)
                 .await
                 .ok()
@@ -131,26 +286,35 @@ impl AuthCache {
                 if let Some(user) = user_o {
                     let authed_o = {
                         match user {
-                            (Some(owner), email, super_admin, _) if w_id.is_some() => {
+                            (Some(owner), Some(email), super_admin, _, label) if w_id.is_some() => {
+                                let username_override = username_override_from_label(label);
                                 if let Some((prefix, name)) = owner.split_once('/') {
                                     if prefix == "u" {
-                                        let is_admin = super_admin
-                                            || sqlx::query_scalar!(
-                                                "SELECT is_admin FROM usr where username = $1 AND \
+                                        let (is_admin, is_operator) = if super_admin {
+                                            (true, false)
+                                        } else {
+                                            let r = sqlx::query!(
+                                                "SELECT is_admin, operator FROM usr where username = $1 AND \
                                                  workspace_id = $2 AND disabled = false",
                                                 name,
                                                 &w_id.as_ref().unwrap()
                                             )
                                             .fetch_one(&self.db)
                                             .await
-                                            .ok()
-                                            .unwrap_or(false);
+                                            .ok();
+                                            if let Some(r) = r {
+                                                (r.is_admin, r.operator)
+                                            } else {
+                                                (false, true)
+                                            }
+                                        };
 
                                         let w_id = &w_id.unwrap();
-                                        let groups = get_groups_for_user(w_id, &name, &self.db)
-                                            .await
-                                            .ok()
-                                            .unwrap_or_default();
+                                        let groups =
+                                            get_groups_for_user(w_id, &name, &email, &self.db)
+                                                .await
+                                                .ok()
+                                                .unwrap_or_default();
 
                                         let folders =
                                             get_folders_for_user(w_id, &name, &groups, &self.db)
@@ -158,14 +322,15 @@ impl AuthCache {
                                                 .ok()
                                                 .unwrap_or_default();
 
-                                        Some(Authed {
-                                            email: email
-                                                .unwrap_or_else(|| "missing@email.xyz".to_string()),
+                                        Some(ApiAuthed {
+                                            email: email,
                                             username: name.to_string(),
                                             is_admin,
+                                            is_operator,
                                             groups,
                                             folders,
                                             scopes: None,
+                                            username_override,
                                         })
                                     } else {
                                         let groups = vec![name.to_string()];
@@ -178,47 +343,51 @@ impl AuthCache {
                                         .await
                                         .ok()
                                         .unwrap_or_default();
-                                        Some(Authed {
-                                            email: email
-                                                .unwrap_or_else(|| "missing@email.xyz".to_string()),
+                                        Some(ApiAuthed {
+                                            email: email,
                                             username: format!("group-{name}"),
                                             is_admin: false,
                                             groups,
+                                            is_operator: false,
                                             folders,
                                             scopes: None,
+                                            username_override,
                                         })
                                     }
                                 } else {
                                     let groups = vec![];
                                     let folders = vec![];
-                                    Some(Authed {
-                                        email: email
-                                            .unwrap_or_else(|| "missing@email.xyz".to_string()),
+                                    Some(ApiAuthed {
+                                        email: email,
                                         username: owner,
                                         is_admin: super_admin,
+                                        is_operator: true,
                                         groups,
                                         folders,
                                         scopes: None,
+                                        username_override,
                                     })
                                 }
                             }
-                            (_, Some(email), super_admin, scopes) => {
+                            (_, Some(email), super_admin, scopes, label) => {
+                                let username_override = username_override_from_label(label);
                                 if w_id.is_some() {
-                                    let row_o = sqlx::query_as::<_, (String, bool)>(
-                                        "SELECT username, is_admin FROM usr where email = $1 AND \
+                                    let row_o = sqlx::query_as::<_, (String, bool, bool)>(
+                                        "SELECT username, is_admin, operator FROM usr where email = $1 AND \
                                          workspace_id = $2 AND disabled = false",
                                     )
                                     .bind(&email)
                                     .bind(&w_id.as_ref().unwrap())
                                     .fetch_optional(&self.db)
                                     .await
-                                    .unwrap_or(Some(("error".to_string(), false)));
+                                    .unwrap_or(Some(("error".to_string(), false, false)));
 
                                     match row_o {
-                                        Some((username, is_admin)) => {
+                                        Some((username, is_admin, is_operator)) => {
                                             let groups = get_groups_for_user(
                                                 &w_id.as_ref().unwrap(),
                                                 &username,
+                                                &email,
                                                 &self.db,
                                             )
                                             .await
@@ -234,33 +403,39 @@ impl AuthCache {
                                             .await
                                             .ok()
                                             .unwrap_or_default();
-                                            Some(Authed {
+                                            Some(ApiAuthed {
                                                 email,
                                                 username,
                                                 is_admin: is_admin || super_admin,
+                                                is_operator,
                                                 groups,
                                                 folders,
                                                 scopes,
+                                                username_override,
                                             })
                                         }
-                                        None if super_admin => Some(Authed {
+                                        None if super_admin => Some(ApiAuthed {
                                             email: email.clone(),
                                             username: email,
                                             is_admin: super_admin,
+                                            is_operator: false,
                                             groups: vec![],
                                             folders: vec![],
                                             scopes,
+                                            username_override,
                                         }),
                                         None => None,
                                     }
                                 } else {
-                                    Some(Authed {
+                                    Some(ApiAuthed {
                                         email: email.to_string(),
                                         username: email,
                                         is_admin: super_admin,
+                                        is_operator: true,
                                         groups: Vec::new(),
                                         folders: Vec::new(),
                                         scopes,
+                                        username_override,
                                     })
                                 }
                             }
@@ -268,9 +443,14 @@ impl AuthCache {
                         }
                     };
                     if let Some(authed) = authed_o.as_ref() {
-                        self.cache
-                            .insert(key, authed.clone(), Duration::from_secs(TTL_TOKEN_CACHE_S))
-                            .await;
+                        self.cache.insert(
+                            key,
+                            ExpiringAuthCache {
+                                authed: authed.clone(),
+                                expiry: chrono::Utc::now()
+                                    + chrono::Duration::try_seconds(120).unwrap(),
+                            },
+                        );
                     }
                     authed_o
                 } else if self
@@ -279,23 +459,21 @@ impl AuthCache {
                     .map(|x| x == token)
                     .unwrap_or(false)
                 {
-                    Some(Authed {
+                    Some(ApiAuthed {
                         email: SUPERADMIN_SECRET_EMAIL.to_string(),
                         username: "superadmin_secret".to_string(),
                         is_admin: true,
+                        is_operator: false,
                         groups: Vec::new(),
                         folders: Vec::new(),
                         scopes: None,
+                        username_override: None,
                     })
                 } else {
                     None
                 }
             }
         }
-    }
-
-    pub async fn monitor(&self) {
-        self.cache.monitor(20, 0.25, Duration::from_secs(10)).await;
     }
 }
 
@@ -332,6 +510,32 @@ pub struct Tokened {
     pub token: String,
 }
 
+struct BruteForceCounter {
+    counter: AtomicU64,
+    last_reset: AtomicI64,
+}
+
+lazy_static! {
+    static ref BRUTE_FORCE_COUNTER: BruteForceCounter =
+        BruteForceCounter { last_reset: AtomicI64::new(0), counter: AtomicU64::new(0) };
+}
+
+impl BruteForceCounter {
+    async fn increment(&self) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if self.counter.fetch_add(1, Ordering::Relaxed) > 10000 {
+            tracing::error!(
+                "Brute force attack to find valid token detected, sleeping unauthorized response for 2 seconds"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if now - self.last_reset.load(Ordering::Relaxed) > 60 {
+            self.counter.store(0, Ordering::Relaxed);
+            self.last_reset.store(now, Ordering::Relaxed);
+        }
+    }
+}
+
 #[async_trait]
 impl<S> FromRequestParts<S> for Tokened
 where
@@ -343,6 +547,9 @@ where
         parts: &mut Parts,
         state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
+        if parts.method == http::Method::OPTIONS {
+            return Ok(Tokened { token: "".to_string() });
+        };
         let already_tokened = parts.extensions.get::<Tokened>();
         if let Some(tokened) = already_tokened {
             Ok(tokened.clone())
@@ -353,24 +560,19 @@ where
                 parts.extensions.insert(tokened.clone());
                 Ok(tokened)
             } else {
+                BRUTE_FORCE_COUNTER.increment().await;
                 Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_owned()))
             }
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Authed {
-    pub email: String,
-    pub username: String,
-    pub is_admin: bool,
-    pub groups: Vec<String>,
-    // (folder name, can write, is owner)
-    pub folders: Vec<(String, bool, bool)>,
-    pub scopes: Option<Vec<String>>,
-}
-
-pub async fn maybe_refresh_folders(path: &str, w_id: &str, authed: Authed, db: &DB) -> Authed {
+pub async fn maybe_refresh_folders(
+    path: &str,
+    w_id: &str,
+    authed: ApiAuthed,
+    db: &DB,
+) -> ApiAuthed {
     if authed.is_admin {
         return authed;
     }
@@ -380,7 +582,7 @@ pub async fn maybe_refresh_folders(path: &str, w_id: &str, authed: Authed, db: &
         && !authed.folders.iter().any(|(f, _, _)| f == splitted[1])
     {
         let name = &authed.username;
-        let groups = get_groups_for_user(w_id, name, db)
+        let groups = get_groups_for_user(w_id, name, &authed.email, db)
             .await
             .ok()
             .unwrap_or_default();
@@ -389,14 +591,14 @@ pub async fn maybe_refresh_folders(path: &str, w_id: &str, authed: Authed, db: &
             .await
             .ok()
             .unwrap_or_default();
-        Authed { folders, ..authed }
+        ApiAuthed { folders, ..authed }
     } else {
         authed
     }
 }
 
 #[async_trait]
-impl<S> FromRequestParts<S> for Authed
+impl<S> FromRequestParts<S> for ApiAuthed
 where
     S: Send + Sync,
 {
@@ -406,7 +608,19 @@ where
         parts: &mut Parts,
         state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
-        let already_authed = parts.extensions.get::<Authed>();
+        if parts.method == http::Method::OPTIONS {
+            return Ok(ApiAuthed {
+                email: "".to_owned(),
+                username: "".to_owned(),
+                is_admin: false,
+                is_operator: false,
+                groups: Vec::new(),
+                folders: Vec::new(),
+                scopes: None,
+                username_override: None,
+            });
+        };
+        let already_authed = parts.extensions.get::<ApiAuthed>();
         if let Some(authed) = already_authed {
             Ok(authed.clone())
         } else {
@@ -426,7 +640,15 @@ where
             let workspace_id = if path_vec.len() >= 4 && path_vec[0] == "" && path_vec[2] == "w" {
                 Some(path_vec[3].to_owned())
             } else {
-                None
+                if path_vec.len() >= 5
+                    && path_vec[0] == ""
+                    && path_vec[2] == "srch"
+                    && path_vec[3] == "w"
+                {
+                    Some(path_vec[4].to_string())
+                } else {
+                    None
+                }
             };
             if let Some(token) = token_o {
                 if let Ok(Extension(cache)) =
@@ -434,8 +656,14 @@ where
                 {
                     if let Some(authed) = cache.get_authed(workspace_id.clone(), &token).await {
                         parts.extensions.insert(authed.clone());
-                        if authed.scopes.is_some() && (path_vec.len() < 3 || path_vec[4] != "jobs")
+                        if authed.scopes.as_ref().is_some_and(|scopes| {
+                            scopes
+                                .iter()
+                                .any(|s| s.starts_with("jobs:") || s.starts_with("run:"))
+                        }) && (path_vec.len() < 3
+                            || (path_vec[4] != "jobs" && path_vec[4] != "jobs_u"))
                         {
+                            BRUTE_FORCE_COUNTER.increment().await;
                             return Err((
                                 StatusCode::UNAUTHORIZED,
                                 format!("Unauthorized scoped token: {:?}", authed.scopes),
@@ -451,26 +679,45 @@ where
                     }
                 }
             }
+            BRUTE_FORCE_COUNTER.increment().await;
             Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_owned()))
         }
     }
 }
 
-pub fn check_scopes<F>(authed: &Authed, required: F) -> error::Result<()>
+pub fn check_scopes<F>(authed: &ApiAuthed, required: F) -> error::Result<()>
 where
     F: FnOnce() -> String,
 {
-    if let Some(scopes) = &authed.scopes {
+    if authed.scopes.as_ref().is_some_and(|scopes| {
+        scopes
+            .iter()
+            .any(|s| s.starts_with("jobs:") || s.starts_with("run:"))
+    }) {
         let req = &required();
-        if !scopes.contains(req) {
+        if !authed.scopes.as_ref().unwrap().contains(req) {
             return Err(Error::BadRequest(format!("missing required scope: {req}")));
         }
     }
     Ok(())
 }
 
+pub fn get_scope_tags(authed: &ApiAuthed) -> Option<Vec<&str>> {
+    authed.scopes.as_ref()?.iter().find_map(|s| {
+        if s.starts_with("if_jobs:filter_tags:") {
+            Some(
+                s.trim_start_matches("if_jobs:filter_tags:")
+                    .split(",")
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Clone, Debug)]
-pub struct OptAuthed(pub Option<Authed>);
+pub struct OptAuthed(pub Option<ApiAuthed>);
 
 #[async_trait]
 impl<S> FromRequestParts<S> for OptAuthed
@@ -483,11 +730,33 @@ where
         parts: &mut Parts,
         state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
-        Authed::from_request_parts(parts, state)
+        ApiAuthed::from_request_parts(parts, state)
             .await
             .map(|authed| Self(Some(authed)))
             .or_else(|_| Ok(Self(None)))
     }
+}
+
+pub async fn fetch_api_authed(
+    username: String,
+    email: String,
+    w_id: &str,
+    db: &DB,
+    username_override: String,
+) -> error::Result<ApiAuthed> {
+    let permissioned_as = username_to_permissioned_as(username.as_str());
+    let authed =
+        fetch_authed_from_permissioned_as(permissioned_as, email.clone(), w_id, db).await?;
+    Ok(ApiAuthed {
+        username: username,
+        email: email,
+        is_admin: authed.is_admin,
+        is_operator: authed.is_operator,
+        groups: authed.groups,
+        folders: authed.folders,
+        scopes: authed.scopes,
+        username_override: Some(username_override),
+    })
 }
 
 #[derive(FromRow, Serialize)]
@@ -502,16 +771,10 @@ pub struct User {
     pub role: Option<String>,
 }
 
-#[derive(FromRow, Serialize)]
-pub struct Usage {
-    pub executions: i64,
-}
-
 #[derive(Serialize)]
 pub struct UserWithUsage {
-    #[serde(flatten)]
-    pub user: User,
-    pub usage: Usage,
+    pub email: String,
+    pub executions: Option<i64>,
 }
 
 #[derive(FromRow, Serialize, Debug)]
@@ -522,9 +785,12 @@ pub struct GlobalUserInfo {
     verified: bool,
     name: Option<String>,
     company: Option<String>,
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_only: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct UserInfo {
     pub workspace_id: String,
     pub email: String,
@@ -536,6 +802,7 @@ pub struct UserInfo {
     pub operator: bool,
     pub disabled: bool,
     pub role: Option<String>,
+    pub folders_read: Vec<String>,
     pub folders: Vec<String>,
     pub folders_owners: Vec<String>,
 }
@@ -548,32 +815,7 @@ pub struct WorkspaceInvite {
     pub operator: bool,
 }
 
-#[derive(FromRow, Serialize)]
-pub struct InviteCode {
-    pub code: String,
-    pub seats_left: i32,
-    pub seats_given: i32,
-}
-
-#[derive(Deserialize)]
-pub struct NewInviteCode {
-    pub code: String,
-    pub seats: i32,
-}
-
-#[derive(FromRow)]
-pub struct MagicLink {
-    pub email: String,
-    pub token: String,
-    pub expiration: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Deserialize)]
-pub struct UseMagicLink {
-    pub email: String,
-    pub token: String,
-}
-
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct NewUser {
     pub email: String,
@@ -586,7 +828,7 @@ pub struct NewUser {
 #[derive(Deserialize)]
 pub struct AcceptInvite {
     pub workspace_id: String,
-    pub username: String,
+    pub username: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -597,6 +839,7 @@ pub struct DeclineInvite {
 #[derive(Deserialize)]
 pub struct EditUser {
     pub is_super_admin: Option<bool>,
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -606,6 +849,7 @@ pub struct EditWorkspaceUser {
     pub disabled: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct EditPassword {
     pub password: String,
@@ -627,6 +871,7 @@ pub struct NewToken {
     pub expiration: Option<chrono::DateTime<chrono::Utc>>,
     pub impersonate_email: Option<String>,
     pub scopes: Option<Vec<String>>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -635,17 +880,46 @@ pub struct Login {
     pub password: String,
 }
 
-#[derive(Deserialize)]
-pub struct Signup {
-    pub email: String,
-    pub password: String,
-    pub name: Option<String>,
-    pub company: Option<String>,
+lazy_static::lazy_static! {
+    static ref FIRST_TIME_SETUP: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
 }
 
-#[derive(Deserialize)]
-pub struct LostPassword {
-    pub email: String,
+pub async fn is_first_time_setup(Extension(db): Extension<DB>) -> JsonResult<bool> {
+    if !FIRST_TIME_SETUP.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(Json(false));
+    }
+    let single_user = sqlx::query_scalar!("SELECT 1 FROM password LIMIT 2")
+        .fetch_all(&db)
+        .await
+        .ok()
+        .unwrap_or_default()
+        .len()
+        == 1;
+    if single_user {
+        let user_is_admin_and_password_changeme = sqlx::query_scalar!(
+            "SELECT 1 FROM password WHERE email = 'admin@windmill.dev' AND password_hash = '$argon2id$v=19$m=4096,t=3,p=1$oLJo/lPn/gezXCuFOEyaNw$i0T2tCkw3xUFsrBIKZwr8jVNHlIfoxQe+HfDnLtd12I'"
+        ).fetch_all(&db)
+        .await
+        .ok()
+        .unwrap_or_default()
+        .len() == 1;
+        if user_is_admin_and_password_changeme {
+            let base_url_is_not_set =
+                sqlx::query_scalar!("SELECT COUNT(*) FROM global_settings WHERE name = 'base_url'")
+                    .fetch_optional(&db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten()
+                    .unwrap_or(0)
+                    == 0;
+            if base_url_is_not_set {
+                return Ok(Json(true));
+            }
+        }
+    }
+    FIRST_TIME_SETUP.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(Json(false))
 }
 
 #[derive(Deserialize)]
@@ -654,7 +928,7 @@ struct WorkspaceUsername {
 }
 
 async fn exists_username(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
     Json(WorkspaceUsername { username }): Json<WorkspaceUsername>,
@@ -665,7 +939,7 @@ async fn exists_username(
         &w_id,
         &username
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(false);
     tx.commit().await?;
@@ -673,78 +947,142 @@ async fn exists_username(
 }
 
 async fn list_users(
-    authed: Authed,
+    authed: ApiAuthed,
+    Extension(user_db): Extension<UserDB>,
+    Path(w_id): Path<String>,
+) -> JsonResult<Vec<User>> {
+    if *CLOUD_HOSTED && w_id == "demo" {
+        require_admin(authed.is_admin, &authed.username)?;
+    }
+    let mut tx = user_db.begin(&authed).await?;
+    let rows = sqlx::query_as!(
+        User,
+        "
+        SELECT *
+          FROM usr
+         WHERE workspace_id = $1
+         ",
+        w_id
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(rows))
+}
+
+async fn list_user_usage(
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
 ) -> JsonResult<Vec<UserWithUsage>> {
+    if *CLOUD_HOSTED && w_id == "demo" {
+        require_admin(authed.is_admin, &authed.username)?;
+    }
     let mut tx = user_db.begin(&authed).await?;
-    let rows = sqlx::query(
+    let rows = sqlx::query_as!(
+        UserWithUsage,
         "
-        SELECT usr.*, usage.*
-          FROM usr
-             , LATERAL (
-                SELECT COALESCE(SUM(duration_ms + 1000)/1000 , 0) executions
-                  FROM completed_job
-                 WHERE workspace_id = usr.workspace_id
-                   AND job_kind NOT IN ('flow', 'flowpreview')
-                   AND email = usr.email
-                   AND now() - '5 week'::interval < created_at 
-               ) usage
-         WHERE workspace_id = $1
-         ",
+    SELECT usr.email, usage.executions
+        FROM usr
+            , LATERAL (
+            SELECT COALESCE(SUM(duration_ms + 1000)/1000 , 0)::BIGINT executions
+                FROM completed_job
+                WHERE workspace_id = $1
+                AND job_kind NOT IN ('flow', 'flowpreview')
+                AND email = usr.email
+                AND now() - '1 week'::interval < created_at 
+            ) usage
+        WHERE workspace_id = $1
+        ",
+        w_id
     )
-    .bind(&w_id)
-    .try_map(|row| {
-        // flatten not released yet https://github.com/launchbadge/sqlx/pull/1959
-        Ok(UserWithUsage { user: FromRow::from_row(&row)?, usage: FromRow::from_row(&row)? })
-    })
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+struct ActiveUsersOnly {
+    active_only: Option<bool>,
 }
 
 async fn list_users_as_super_admin(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Query(pagination): Query<Pagination>,
+    Query(ActiveUsersOnly { active_only }): Query<ActiveUsersOnly>,
 ) -> JsonResult<Vec<GlobalUserInfo>> {
-    let mut tx = db.begin().await?;
-    require_super_admin(&mut tx, &authed.email).await?;
+    require_super_admin(&db, &authed.email).await?;
     let per_page = pagination.per_page.unwrap_or(10000).max(1);
     let offset = (pagination.page.unwrap_or(1).max(1) - 1) * per_page;
 
-    let rows = sqlx::query_as!(
-        GlobalUserInfo,
-        "SELECT email, login_type::text, verified, super_admin, name, company from password LIMIT \
-         $1 OFFSET $2",
-        per_page as i32,
-        offset as i32
-    )
-    .fetch_all(&mut tx)
-    .await?;
-    tx.commit().await?;
+    let rows = if active_only.is_some_and(|x| x) {
+        sqlx::query_as!(
+            GlobalUserInfo,
+            "WITH active_users AS (SELECT distinct username as email FROM audit WHERE timestamp > NOW() - INTERVAL '1 month' AND (operation = 'users.login' OR operation = 'oauth.login')),
+            authors as (SELECT distinct email FROM usr WHERE usr.operator IS false)
+            SELECT email, email NOT IN (SELECT email FROM authors) as operator_only, login_type::text, verified, super_admin, name, company, username
+            FROM password
+            WHERE email IN (SELECT email FROM active_users)
+            ORDER BY super_admin DESC
+            LIMIT $1 OFFSET $2",
+            per_page as i32,
+            offset as i32
+        )
+        .fetch_all(&db)
+        .await?
+    } else {
+        sqlx::query_as!(
+            GlobalUserInfo,
+            "SELECT email, login_type::text, verified, super_admin, name, company, username, NULL::bool as operator_only FROM password ORDER BY super_admin DESC, email LIMIT \
+            $1 OFFSET $2",
+            per_page as i32,
+            offset as i32
+        )
+        .fetch_all(&db)
+        .await?
+    };
+
     Ok(Json(rows))
 }
 
-// async fn list_invite_codes(
-//     authed: Authed,
-//     Extension(db): Extension<DB>,
-//     Query(pagination): Query<Pagination>
-// ) -> JsonResult<Vec<InviteCode>> {
-//     let mut tx = db.begin().await?;
-//     require_super_admin(&mut tx, authed.email).await?;
-//     let (per_page, offset) = crate::utils::paginate(pagination);
+#[derive(Serialize, Deserialize)]
+struct Progress {
+    progress: u64,
+}
+async fn get_tutorial_progress(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+) -> JsonResult<Progress> {
+    let res = sqlx::query_scalar!(
+        "SELECT progress::bigint FROM tutorial_progress WHERE email = $1",
+        authed.email
+    )
+    .fetch_optional(&db)
+    .await?
+    .flatten()
+    .unwrap_or_default() as u64;
+    Ok(Json(Progress { progress: res }))
+}
 
-//     let rows = sqlx::query_as!(InviteCode, "SELECT * from invite_code LIMIT $1 OFFSET $2", per_page as i32, offset as i32)
-//         .fetch_all(&mut tx)
-//         .await?;
-//     tx.commit().await?;
-//     Ok(Json(rows))
-// }
+async fn update_tutorial_progress(
+    authed: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Json(progress): Json<Progress>,
+) -> Result<String> {
+    sqlx::query_scalar!(
+        "INSERT INTO tutorial_progress VALUES ($2, $1::bigint::bit(64)) ON CONFLICT (email) DO UPDATE SET progress = $1::bigint::bit(64)",
+        progress.progress as i64,
+        authed.email
+    )
+    .execute(&db)
+    .await?;
+    Ok("tutorial progress updated".to_string())
+}
 
 async fn list_usernames(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(user_db): Extension<UserDB>,
     Path(w_id): Path<String>,
 ) -> JsonResult<Vec<String>> {
@@ -756,14 +1094,14 @@ async fn list_usernames(
     }
     let mut tx = user_db.begin(&authed).await?;
     let rows = sqlx::query_scalar!("SELECT username from usr WHERE workspace_id = $1", &w_id)
-        .fetch_all(&mut tx)
+        .fetch_all(&mut *tx)
         .await?;
     tx.commit().await?;
     Ok(Json(rows))
 }
 
 async fn list_invites(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
 ) -> JsonResult<Vec<WorkspaceInvite>> {
     let mut tx = db.begin().await?;
@@ -772,7 +1110,7 @@ async fn list_invites(
         "SELECT * from workspace_invite WHERE email = $1",
         authed.email
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(Json(rows))
@@ -796,12 +1134,13 @@ async fn logout(
     cookies.remove(cookie);
     let mut tx = db.begin().await?;
     let email = sqlx::query_scalar!("DELETE FROM token WHERE token = $1 RETURNING email", token)
-        .fetch_optional(&mut tx)
+        .fetch_optional(&mut *tx)
         .await?;
     if let Some(email) = email {
+        let email = email.unwrap_or("noemail".to_string());
         audit_log(
-            &mut tx,
-            &email.unwrap_or("noemail".to_string()),
+            &mut *tx,
+            &AuditAuthor { email: email.clone(), username: email, username_override: None },
             "users.logout",
             ActionKind::Delete,
             "global",
@@ -821,7 +1160,7 @@ async fn logout(
 async fn whoami(
     Extension(db): Extension<DB>,
     Path(w_id): Path<String>,
-    Authed { username, email, is_admin, groups, folders, .. }: Authed,
+    ApiAuthed { username, email, is_admin, groups, folders, .. }: ApiAuthed,
 ) -> JsonResult<UserInfo> {
     let user = get_user(&w_id, &username, &db).await?;
     if let Some(user) = user {
@@ -838,6 +1177,7 @@ async fn whoami(
             operator: false,
             disabled: false,
             role: Some("superadmin".to_string()),
+            folders_read: folders.clone().into_iter().map(|x| x.0).collect(),
             folders: folders
                 .clone()
                 .into_iter()
@@ -853,18 +1193,18 @@ async fn whoami(
 
 async fn global_whoami(
     Extension(db): Extension<DB>,
-    Authed { email, .. }: Authed,
+    ApiAuthed { email, .. }: ApiAuthed,
     Tokened { token }: Tokened,
 ) -> JsonResult<GlobalUserInfo> {
     let user = sqlx::query_as!(
         GlobalUserInfo,
-        "SELECT email, login_type::TEXT, super_admin, verified, name, company FROM password WHERE \
+        "SELECT email, login_type::TEXT, super_admin, verified, name, company, username, NULL::bool as operator_only FROM password WHERE \
          email = $1",
         email
     )
     .fetch_one(&db)
     .await
-    .map_err(|e| Error::InternalErr(format!("fetching global identity: {e}")));
+    .map_err(|e| Error::InternalErr(format!("fetching global identity: {e:#}")));
 
     if let Ok(user) = user {
         Ok(Json(user))
@@ -876,17 +1216,33 @@ async fn global_whoami(
             verified: true,
             name: None,
             company: None,
+            username: None,
+            operator_only: None,
         }))
     } else {
         Err(user.unwrap_err())
     }
 }
 
-async fn get_email(Authed { email, .. }: Authed) -> Result<String> {
+async fn exists_email(Extension(db): Extension<DB>, Path(email): Path<String>) -> JsonResult<bool> {
+    let exists = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM password WHERE email = $1)",
+        email
+    )
+    .fetch_one(&db)
+    .await?
+    .unwrap_or(false);
+    Ok(Json(exists))
+}
+
+async fn get_email(ApiAuthed { email, .. }: ApiAuthed) -> Result<String> {
     Ok(email)
 }
 
-async fn get_usage(Extension(db): Extension<DB>, Authed { email, .. }: Authed) -> Result<String> {
+async fn get_usage(
+    Extension(db): Extension<DB>,
+    ApiAuthed { email, .. }: ApiAuthed,
+) -> Result<String> {
     let usage = sqlx::query_scalar!(
         "
     SELECT usage.usage FROM usage 
@@ -917,7 +1273,16 @@ async fn get_user(w_id: &str, username: &str, db: &DB) -> Result<Option<UserInfo
     .fetch_optional(db)
     .await?
     .unwrap_or(false);
-    let groups = get_groups_for_user(&w_id, username, db).await?;
+    let groups = get_groups_for_user(
+        &w_id,
+        username,
+        &user
+            .as_ref()
+            .map(|x| x.email.to_string())
+            .unwrap_or_else(|| "".to_string()),
+        db,
+    )
+    .await?;
     let folders = get_folders_for_user(&w_id, username, &groups, db).await?;
 
     Ok(user.map(|usr| UserInfo {
@@ -931,6 +1296,7 @@ async fn get_user(w_id: &str, username: &str, db: &DB) -> Result<Option<UserInfo
         operator: usr.operator,
         disabled: usr.disabled,
         role: usr.role,
+        folders_read: folders.clone().into_iter().map(|x| x.0).collect(),
         folders: folders
             .clone()
             .into_iter()
@@ -943,18 +1309,8 @@ async fn get_user(w_id: &str, username: &str, db: &DB) -> Result<Option<UserInfo
     }))
 }
 
-pub async fn get_groups_for_user(w_id: &str, username: &str, db: &DB) -> Result<Vec<String>> {
-    let groups = sqlx::query_scalar!(
-        "SELECT group_ FROM usr_to_group where usr = $1 AND workspace_id = $2",
-        username,
-        w_id
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(groups)
-}
 pub async fn is_owner_of_path(
-    authed: Authed,
+    authed: ApiAuthed,
     Path((_w_id, path)): Path<(String, StripPath)>,
 ) -> JsonResult<bool> {
     let path = path.to_path();
@@ -965,7 +1321,7 @@ pub async fn is_owner_of_path(
     }
 }
 
-pub fn require_owner_of_path(authed: &Authed, path: &str) -> Result<()> {
+pub fn require_owner_of_path(authed: &ApiAuthed, path: &str) -> Result<()> {
     if authed.is_admin {
         return Ok(());
     }
@@ -995,6 +1351,95 @@ pub fn require_owner_of_path(authed: &Authed, path: &str) -> Result<()> {
     }
 }
 
+pub fn get_perm_in_extra_perms_for_authed(
+    v: serde_json::Value,
+    authed: &ApiAuthed,
+) -> Option<bool> {
+    match v {
+        serde_json::Value::Object(obj) => {
+            let mut keys = vec![format!("u/{}", authed.username)];
+            for g in authed.groups.iter() {
+                keys.push(format!("g/{}", g));
+            }
+            let mut res = None;
+            for k in keys {
+                if let Some(v) = obj.get(&k) {
+                    if let Some(v) = v.as_bool() {
+                        if v {
+                            return Some(true);
+                        }
+                        res = Some(v);
+                    }
+                }
+            }
+            res
+        }
+        _ => None,
+    }
+}
+
+pub async fn require_is_writer(
+    authed: &ApiAuthed,
+    path: &str,
+    w_id: &str,
+    db: DB,
+    query: &str,
+    kind: &str,
+) -> Result<()> {
+    if authed.is_admin {
+        return Ok(());
+    }
+    if !path.is_empty() {
+        if require_owner_of_path(authed, path).is_ok() {
+            return Ok(());
+        }
+        if path.starts_with("f/") && path.split('/').count() >= 2 {
+            let folder = path.split('/').nth(1).unwrap();
+            let extra_perms = sqlx::query_scalar!(
+                "SELECT extra_perms FROM folder WHERE name = $1 AND workspace_id = $2",
+                folder,
+                w_id
+            )
+            .fetch_optional(&db)
+            .await?;
+            if let Some(perms) = extra_perms {
+                let is_folder_writer =
+                    get_perm_in_extra_perms_for_authed(perms, authed).unwrap_or(false);
+                if is_folder_writer {
+                    return Ok(());
+                }
+            }
+        }
+        let extra_perms = sqlx::query_scalar(query)
+            .bind(path)
+            .bind(w_id)
+            .fetch_optional(&db)
+            .await?;
+        if let Some(perms) = extra_perms {
+            let perm = get_perm_in_extra_perms_for_authed(perms, authed);
+            match perm {
+                Some(true) => Ok(()),
+                Some(false) => Err(Error::BadRequest(format!(
+                    "User {} is not a writer of {kind} path {path}",
+                    authed.username
+                ))),
+                None => Err(Error::BadRequest(format!(
+                    "User {} has neither read or write permission on {kind} {path}",
+                    authed.username
+                ))),
+            }
+        } else {
+            Err(Error::BadRequest(format!(
+                "{path} does not exist yet and user {} is not an owner of the parent folder",
+                authed.username
+            )))
+        }
+    } else {
+        Err(Error::BadRequest(format!(
+            "Cannot be writer of an empty path"
+        )))
+    }
+}
 async fn whois(
     Extension(db): Extension<DB>,
     Path((w_id, username)): Path<(String, String)>,
@@ -1005,7 +1450,7 @@ async fn whois(
 }
 
 // async fn create_invite_code(
-//     Authed { email, .. }: Authed,
+//     ApiAuthed { email, .. }: ApiAuthed,
 //     Extension(db): Extension<DB>,
 //     Json(nu): Json<NewInviteCode>,
 // ) -> Result<(StatusCode, String)> {
@@ -1032,7 +1477,7 @@ async fn whois(
 // }
 
 async fn decline_invite(
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Json(nu): Json<DeclineInvite>,
 ) -> Result<(StatusCode, String)> {
@@ -1041,18 +1486,18 @@ async fn decline_invite(
     let is_admin = sqlx::query_scalar!(
         "DELETE FROM workspace_invite WHERE workspace_id = $1 AND email = $2 RETURNING is_admin",
         nu.workspace_id,
-        email,
+        authed.email,
     )
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &email,
+        &mut *tx,
+        &authed,
         "users.decline_invite",
         ActionKind::Delete,
         &nu.workspace_id,
-        Some(&email),
+        Some(&authed.email),
         None,
     )
     .await?;
@@ -1063,51 +1508,63 @@ async fn decline_invite(
             StatusCode::OK,
             format!(
                 "user {} declined invite to workspace {}",
-                &email, nu.workspace_id
+                &authed.email, nu.workspace_id
             ),
         ))
     } else {
-        Err(Error::NotFound(format!("invite for {email} not found")))
+        Err(Error::NotFound(format!(
+            "invite for {} not found",
+            authed.email
+        )))
     }
 }
 
 lazy_static! {
-    pub static ref VALID_USERNAME: Regex = Regex::new(r#"^[a-zA-Z_0-9]+$"#).unwrap();
-
-    pub static ref JOB_RETENTION_SECS: u32 = std::env::var("JOB_RETENTION_SECS")
-    .ok()
-    .and_then(|x| x.parse::<u32>().ok())
-    .unwrap_or(60 * 60 * 24 * 60); // 60 days
+    pub static ref VALID_USERNAME: Regex = Regex::new(r#"^[a-zA-Z][a-zA-Z_0-9]*$"#).unwrap();
 }
 
 async fn accept_invite(
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Extension(webhook): Extension<WebhookShared>,
     Extension(db): Extension<DB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Json(nu): Json<AcceptInvite>,
 ) -> Result<(StatusCode, String)> {
-    if !VALID_USERNAME.is_match(&nu.username) {
-        return Err(windmill_common::error::Error::BadRequest(format!(
-            "Usermame can only contain alphanumeric characters and underscores"
-        )));
-    }
-
     let mut tx = db.begin().await?;
 
     let r = sqlx::query!(
         "DELETE FROM workspace_invite WHERE workspace_id = $1 AND email = $2 RETURNING is_admin, operator",
         nu.workspace_id,
-        email,
+        authed.email,
     )
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    let is_some = r.is_some();
     if let Some(r) = r {
-        tx = add_user_to_workspace(
+        let already_in_workspace = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND email = $2)",
             &nu.workspace_id,
-            &email,
-            &nu.username,
+            &authed.email,
+        )
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap_or(false);
+
+        if already_in_workspace {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::CREATED,
+                format!(
+                    "user {} accepted invite to workspace {}",
+                    &authed.email, nu.workspace_id
+                ),
+            ));
+        }
+        let username;
+        (tx, username) = join_workspace(
+            &nu.workspace_id,
+            &authed,
+            nu.username,
             r.is_admin,
             r.operator,
             tx,
@@ -1115,79 +1572,112 @@ async fn accept_invite(
         .await?;
 
         audit_log(
-            &mut tx,
-            &nu.username,
+            &mut *tx,
+            &ApiAuthed { username: username.clone(), ..authed.clone() },
             "users.accept_invite",
             ActionKind::Create,
             &nu.workspace_id,
-            Some(&email),
+            Some(&authed.email),
             None,
         )
         .await?;
         tx.commit().await?;
-    }
 
-    if is_some {
+        handle_deployment_metadata(
+            &authed.email,
+            &username,
+            &db,
+            &nu.workspace_id,
+            windmill_git_sync::DeployedObject::User { email: authed.email.clone() },
+            Some(format!("User '{}' accepted invite", &authed.email)),
+            rsmq,
+            true,
+        )
+        .await?;
         webhook.send_instance_event(InstanceEvent::UserJoinedWorkspace {
-            email: email.clone(),
+            email: authed.email.clone(),
             workspace: nu.workspace_id.clone(),
-            username: nu.username.clone(),
+            username: username,
         });
         Ok((
             StatusCode::CREATED,
             format!(
                 "user {} accepted invite to workspace {}",
-                &email, nu.workspace_id
+                &authed.email, nu.workspace_id
             ),
         ))
     } else {
-        Err(Error::NotFound(format!("invite for {email} not found")))
+        Err(Error::NotFound(format!(
+            "invite for {} not found",
+            authed.email
+        )))
     }
 }
 
-async fn add_user_to_workspace<'c>(
+async fn join_workspace<'c>(
     w_id: &str,
-    email: &str,
-    username: &str,
+    authed: &ApiAuthed,
+    username: Option<String>,
     is_admin: bool,
     operator: bool,
     mut tx: sqlx::Transaction<'c, sqlx::Postgres>,
-) -> error::Result<sqlx::Transaction<'c, sqlx::Postgres>> {
-    let already_exists_username = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND username = $2)",
-        &w_id,
-        username,
+) -> error::Result<(sqlx::Transaction<'c, sqlx::Postgres>, String)> {
+    let automate_username_creation = sqlx::query_scalar!(
+        "SELECT value FROM global_settings WHERE name = $1",
+        AUTOMATE_USERNAME_CREATION_SETTING,
     )
-    .fetch_one(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?
+    .map(|v| v.as_bool())
+    .flatten()
     .unwrap_or(false);
 
-    if already_exists_username {
-        return Err(Error::BadRequest(format!(
-            "user with username {} already exists in workspace {}",
-            username, w_id
-        )));
-    }
+    let username = if automate_username_creation {
+        if username.is_some() && username.unwrap().len() > 0 {
+            return Err(Error::BadRequest(
+                "username is not allowed when username creation is automated".to_string(),
+            ));
+        }
+        get_instance_username_or_create_pending(&mut tx, &authed.email).await?
+    } else {
+        let username = username.ok_or(Error::BadRequest("username is required".to_string()))?;
+        let already_exists_username = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND username = $2)",
+            &w_id,
+            username,
+        )
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap_or(false);
 
-    if !VALID_USERNAME.is_match(username) {
-        return Err(windmill_common::error::Error::BadRequest(format!(
-            "Usermame can only contain alphanumeric characters and underscores"
-        )));
-    }
+        if already_exists_username {
+            return Err(Error::BadRequest(format!(
+                "user with username {} already exists in workspace {}",
+                username, w_id
+            )));
+        }
+
+        if !VALID_USERNAME.is_match(&username) {
+            return Err(windmill_common::error::Error::BadRequest(format!(
+                "Usermame can only contain alphanumeric characters and underscores and must start with a letter"
+            )));
+        }
+        username.to_string()
+    };
 
     let already_exists_email = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND email = $2)",
         &w_id,
-        username,
+        authed.email,
     )
-    .fetch_one(&mut tx)
+    .fetch_one(&mut *tx)
     .await?
     .unwrap_or(false);
 
     if already_exists_email {
         return Err(Error::BadRequest(format!(
             "user with email {} already exists in workspace {}",
-            email, w_id
+            authed.email, w_id
         )));
     }
 
@@ -1196,12 +1686,12 @@ async fn add_user_to_workspace<'c>(
             (workspace_id, email, username, is_admin, operator)
             VALUES ($1, $2, $3, $4, $5)",
         &w_id,
-        email,
+        authed.email,
         username,
         is_admin,
         operator
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
     sqlx::query_as!(
         Group,
@@ -1210,30 +1700,73 @@ async fn add_user_to_workspace<'c>(
         username,
         "all",
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
     audit_log(
-        &mut tx,
-        username,
+        &mut *tx,
+        &AuditAuthor { username: username.clone(), ..authed.into() },
         "users.add_to_workspace",
         ActionKind::Create,
         &w_id,
-        Some(email),
+        Some(&authed.email),
         None,
     )
     .await?;
-    Ok(tx)
+    Ok((tx, username))
+}
+
+async fn leave_instance(Extension(db): Extension<DB>, authed: ApiAuthed) -> Result<String> {
+    let mut tx = db.begin().await?;
+    sqlx::query!("DELETE FROM password WHERE email = $1", &authed.email)
+        .execute(&mut *tx)
+        .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "workspaces.leave",
+        ActionKind::Delete,
+        "global",
+        Some(&authed.email),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(format!("Left instance",))
+}
+
+async fn get_workspace_user(
+    ApiAuthed { username, is_admin, .. }: ApiAuthed,
+    Extension(db): Extension<DB>,
+    Path((w_id, username_to_update)): Path<(String, String)>,
+) -> Result<Json<User>> {
+    require_admin(is_admin, &username)?;
+
+    let user = sqlx::query_as!(
+        User,
+        "SELECT * FROM usr WHERE username = $1 AND workspace_id = $2",
+        &username_to_update,
+        &w_id
+    )
+    .fetch_optional(&db)
+    .await?;
+
+    let user = not_found_if_none(user, "User", username_to_update)?;
+
+    Ok(Json(user))
 }
 
 async fn update_workspace_user(
-    Authed { username, is_admin, .. }: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, username_to_update)): Path<(String, String)>,
     Json(eu): Json<EditWorkspaceUser>,
 ) -> Result<String> {
     let mut tx = db.begin().await?;
 
-    require_admin(is_admin, &username)?;
+    require_admin(authed.is_admin, &authed.username)?;
 
     if let Some(a) = eu.is_admin {
         sqlx::query_scalar!(
@@ -1242,7 +1775,7 @@ async fn update_workspace_user(
             &username_to_update,
             &w_id
         )
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -1253,7 +1786,7 @@ async fn update_workspace_user(
             &username_to_update,
             &w_id
         )
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -1264,13 +1797,13 @@ async fn update_workspace_user(
             &username_to_update,
             &w_id
         )
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
     }
 
     audit_log(
-        &mut tx,
-        &username,
+        &mut *tx,
+        &authed,
         "users.update",
         ActionKind::Update,
         &w_id,
@@ -1278,19 +1811,40 @@ async fn update_workspace_user(
         None,
     )
     .await?;
+
+    let user_email = sqlx::query_scalar!(
+        "SELECT email FROM usr WHERE username = $1 AND workspace_id = $2",
+        &username_to_update,
+        &w_id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
     tx.commit().await?;
-    Ok(format!("user {username} updated"))
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        windmill_git_sync::DeployedObject::User { email: user_email.clone() },
+        Some(format!("Updated user '{}'", &user_email)),
+        rsmq,
+        true,
+    )
+    .await?;
+
+    Ok(format!("user {} updated", user_email))
 }
 
 async fn update_user(
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Path(email_to_update): Path<String>,
     Extension(db): Extension<DB>,
     Json(eu): Json<EditUser>,
 ) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
     let mut tx = db.begin().await?;
-
-    require_super_admin(&mut tx, &email).await?;
 
     if let Some(sa) = eu.is_super_admin {
         sqlx::query_scalar!(
@@ -1298,13 +1852,23 @@ async fn update_user(
             sa,
             &email_to_update
         )
-        .execute(&mut tx)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if let Some(n) = eu.name {
+        sqlx::query_scalar!(
+            "UPDATE password SET name = $1 WHERE email = $2",
+            n,
+            &email_to_update
+        )
+        .execute(&mut *tx)
         .await?;
     }
 
     audit_log(
-        &mut tx,
-        &email,
+        &mut *tx,
+        &authed,
         "users.update",
         ActionKind::Update,
         "global",
@@ -1317,44 +1881,43 @@ async fn update_user(
 }
 
 async fn delete_user(
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Path(email_to_delete): Path<String>,
     Extension(db): Extension<DB>,
 ) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
     let mut tx = db.begin().await?;
 
-    require_super_admin(&mut tx, &email).await?;
-
     sqlx::query!("DELETE FROM password WHERE email = $1", &email_to_delete)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
 
     let usernames = sqlx::query_scalar!(
         "DELETE FROM usr WHERE email = $1 RETURNING username",
         &email_to_delete
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
 
     for username in usernames {
         sqlx::query!("DELETE FROM password WHERE email = $1", &email_to_delete)
-            .execute(&mut tx)
+            .execute(&mut *tx)
             .await?;
 
         sqlx::query!("DELETE FROM usr_to_group WHERE usr = $1", &username)
-            .execute(&mut tx)
+            .execute(&mut *tx)
             .await?;
 
         sqlx::query!(
             "DELETE FROM workspace_invite WHERE email = $1",
             &email_to_delete
         )
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
     }
     audit_log(
-        &mut tx,
-        &email,
+        &mut *tx,
+        &authed,
         "users.delete",
         ActionKind::Delete,
         "global",
@@ -1368,66 +1931,29 @@ async fn delete_user(
 
 lazy_static::lazy_static! {
     pub static ref NEW_USER_WEBHOOK: Option<String> = std::env::var("NEW_USER_WEBHOOK").ok();
+
 }
 
 async fn create_user(
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Extension(webhook): Extension<WebhookShared>,
     Extension(argon2): Extension<Arc<Argon2<'_>>>,
-    Json(mut nu): Json<NewUser>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
+    Json(nu): Json<NewUser>,
 ) -> Result<(StatusCode, String)> {
-    let mut tx = db.begin().await?;
-
-    require_super_admin(&mut tx, &email).await?;
-    nu.email = nu.email.to_lowercase();
-
-    if nu.email == SUPERADMIN_SECRET_EMAIL {
-        return Err(Error::BadRequest(
-            "The superadmin email is a reserved email".into(),
-        ));
-    }
-
-    sqlx::query!(
-        "INSERT INTO password(email, verified, password_hash, login_type, super_admin, name, \
-         company)
-    VALUES ($1, $2, $3, 'password', $4, $5, $6)",
-        &nu.email,
-        true,
-        &hash_password(argon2, nu.password)?,
-        &nu.super_admin,
-        nu.name,
-        nu.company
-    )
-    .execute(&mut tx)
-    .await?;
-
-    audit_log(
-        &mut tx,
-        &email,
-        "users.add_global",
-        ActionKind::Create,
-        "global",
-        Some(&nu.email),
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-
-    invite_user_to_all_auto_invite_worspaces(&db, &nu.email).await?;
-
-    webhook.send_instance_event(InstanceEvent::UserAdded { email: nu.email.clone() });
-    Ok((StatusCode::CREATED, format!("email {} created", nu.email)))
+    crate::users_ee::create_user(authed, db, webhook, argon2, rsmq, nu).await
 }
 
 async fn delete_workspace_user(
-    Authed { username, is_admin, .. }: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
+    Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
     Path((w_id, username_to_delete)): Path<(String, String)>,
 ) -> Result<String> {
     let mut tx = db.begin().await?;
 
-    require_admin(is_admin, &username)?;
+    require_admin(authed.is_admin, &authed.username)?;
 
     let email_to_delete_o = sqlx::query_scalar!(
         "SELECT email FROM usr where username = $1 AND workspace_id = $2",
@@ -1439,20 +1965,25 @@ async fn delete_workspace_user(
 
     let email_to_delete = not_found_if_none(email_to_delete_o, "User", &username_to_delete)?;
 
-    let username = sqlx::query_scalar!(
-        "DELETE FROM usr WHERE email = $1 RETURNING username",
-        email_to_delete
+    sqlx::query_scalar!(
+        "DELETE FROM usr WHERE email = $1 AND workspace_id = $2",
+        email_to_delete,
+        &w_id
     )
-    .fetch_one(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
-    sqlx::query!("DELETE FROM usr_to_group WHERE usr = $1", &username)
-        .execute(&mut tx)
-        .await?;
+    sqlx::query!(
+        "DELETE FROM usr_to_group WHERE usr = $1 AND workspace_id = $2",
+        &username_to_delete,
+        &w_id
+    )
+    .execute(&mut *tx)
+    .await?;
 
     audit_log(
-        &mut tx,
-        &username,
+        &mut *tx,
+        &authed,
         "users.delete",
         ActionKind::Delete,
         &w_id,
@@ -1461,199 +1992,33 @@ async fn delete_workspace_user(
     )
     .await?;
     tx.commit().await?;
+
+    handle_deployment_metadata(
+        &authed.email,
+        &authed.username,
+        &db,
+        &w_id,
+        windmill_git_sync::DeployedObject::User { email: email_to_delete.clone() },
+        Some(format!(
+            "Removed user '{}' from workspace",
+            &email_to_delete
+        )),
+        rsmq,
+        true,
+    )
+    .await?;
+
     Ok(format!("username {} deleted", username_to_delete))
 }
 
 async fn set_password(
     Extension(db): Extension<DB>,
     Extension(argon2): Extension<Arc<Argon2<'_>>>,
-    Authed { username, email, .. }: Authed,
-    Json(EditPassword { password }): Json<EditPassword>,
+    authed: ApiAuthed,
+    Json(ep): Json<EditPassword>,
 ) -> Result<String> {
-    let mut tx = db.begin().await?;
-
-    let custom_type = sqlx::query_scalar!(
-        "SELECT login_type::TEXT FROM password WHERE email = $1",
-        &email
-    )
-    .fetch_one(&mut tx)
-    .await
-    .map_err(|e| Error::InternalErr(format!("setting password: {e}")))?
-    .unwrap_or("".to_string());
-
-    if custom_type != "password".to_string() {
-        return Err(Error::BadRequest(format!(
-            "login type for {email} is of type {custom_type}. Cannot set password."
-        )));
-    }
-
-    sqlx::query!(
-        "UPDATE password SET password_hash = $1 WHERE email = $2",
-        &hash_password(argon2, password)?,
-        &email,
-    )
-    .execute(&mut tx)
-    .await?;
-
-    audit_log(
-        &mut tx,
-        &username,
-        "users.setpassword",
-        ActionKind::Update,
-        "global",
-        Some(&email),
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-
-    Ok(format!("password of {} updated", email))
+    crate::users_ee::set_password(db, argon2, authed, ep).await
 }
-
-pub fn hash_password(argon2: Arc<Argon2>, password: String) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| Error::InternalErr(e.to_string()))?
-        .to_string();
-    Ok(password_hash)
-}
-
-// async fn lost_password(
-//     Extension(db): Extension<DB>,
-//     Extension(es): Extension<Arc<EmailSender>>,
-//     TypedHeader(host): TypedHeader<headers::Host>,
-//     Json(LostPassword {
-//         email
-//     }): Json<LostPassword>,
-// ) -> Result<String> {
-//     let mut tx = db.begin().await?;
-
-//     let exists = sqlx::query_scalar!(
-//             "SELECT EXISTS(SELECT 1 FROM password WHERE email = $1)",
-//         &email)
-//         .fetch_one(&mut tx)
-//         .await?
-//         .unwrap_or(false);
-
-//     if !exists {
-//         return Err(Error::NotFound(format!("no user found at email {email}")))
-//     }
-
-//     let already = sqlx::query_scalar!(
-//             "SELECT EXISTS(SELECT 1 FROM magic_link WHERE email = $1)",
-//         &email)
-//         .fetch_one(&mut tx)
-//         .await?
-//         .unwrap_or(false);
-
-//     if already {
-//         return Err(Error::BadRequest(format!("a magic link was already sent at {email}")))
-//     }
-
-//     let tx = create_magic_link(&host.hostname(), &email, &es, tx).await?;
-//     tx.commit().await?;
-
-//     Ok(format!("Magic link sent to {email}"))
-// }
-
-// async fn use_magic_link(
-//     cookies: Cookies,
-//     Extension(db): Extension<DB>,
-//     Query(UseMagicLink {
-//         email,
-//         token
-//     }): Query<UseMagicLink>,
-// ) -> Result<String> {
-//     let mut tx = db.begin().await?;
-
-//     let email_o = sqlx::query_scalar!(
-//         "DELETE FROM magic_link WHERE email = $1 AND token = $2
-//         RETURNING email", email, token
-//     )
-//     .fetch_optional(&mut tx)
-//     .await?;
-
-//     if let Some(email) = email_o {
-//         let is_super_admin = sqlx::query_scalar!("UPDATE password SET verified = true WHERE email = $1 RETURNING super_admin", email)
-//             .fetch_optional(&mut tx)
-//             .await?
-//             .unwrap_or(false);
-
-//         let token = create_session_token(&email, is_super_admin, &mut tx, cookies).await?;
-//         tx.commit().await?;
-//         Ok(token)
-//     } else {
-//         Err(Error::NotFound(format!("magic link for {email} not found")))
-//     }
-// }
-
-// async fn signup(
-//     TypedHeader(host): TypedHeader<headers::Host>,
-//     Extension(db): Extension<DB>,
-//     Extension(argon2): Extension<Arc<Argon2<'_>>>,
-//     Extension(es): Extension<Arc<EmailSender>>,
-//     Json(Signup {
-//         email,
-//         password,
-//         name,
-//         company
-//     }): Json<Signup>,
-// ) -> Result<(StatusCode, String)> {
-//     let mut tx = db.begin().await?;
-
-//     let email = sqlx::query_scalar!(
-//             "INSERT INTO password (email, password_hash, name, company) VALUES ($1, $2, $3, $4) RETURNING email",
-//         &email, &hash_password(argon2, password)?, name, company)
-//         .fetch_optional(&mut tx)
-//         .await?;
-
-//     if let Some(email) = email {
-//         let tx = create_magic_link(&host.hostname(), &email, &es, tx).await?;
-//         tx.commit().await?;
-
-//         Ok((
-//             StatusCode::CREATED,
-//             format!("user with email {} created", email),
-//         ))
-//     } else {
-//         Err(Error::BadRequest("Invalid login".to_string()))
-//     }
-// }
-
-// async fn create_magic_link<'c>(host: &str, email: &str, es: &EmailSender, mut tx: sqlx::Transaction<'c, sqlx::Postgres>) -> error::Result<sqlx::Transaction<'c, sqlx::Postgres>> {
-//     let token = gen_token();
-
-//     sqlx::query!(
-//         "INSERT INTO magic_link
-//             (email, token)
-//             VALUES ($1, $2)",
-//         email,
-//         &token
-//     )
-//     .execute(&mut tx)
-//     .await?;
-
-//     let encoded_token = urlencoding::encode(&token);
-//     let encoded_email = urlencoding::encode(email);
-//     es.send_email(Message::builder()
-//         .to(email.parse().unwrap())
-//         .subject("New magic link")
-//         .body(format!("Magic link: https://{host}/magic_link?token={encoded_token}&email={encoded_email}"))
-//         .unwrap()).await?;
-
-//     audit_log(
-//          &mut tx,
-//         email,
-//         "users.magic_link",
-//         ActionKind::Create,
-//         "global",
-//         Some(email),
-//         None,
-//     )
-//     .await?;
-//     Ok(tx)
-// }
 
 async fn login(
     cookies: Cookies,
@@ -1663,12 +2028,14 @@ async fn login(
 ) -> Result<String> {
     let mut tx = db.begin().await?;
     let email = email.to_lowercase();
+    let audit_author =
+        AuditAuthor { email: email.clone(), username: email.clone(), username_override: None };
     let email_w_h: Option<(String, String, bool, bool)> = sqlx::query_as(
         "SELECT email, password_hash, super_admin, first_time_user FROM password WHERE email = $1 AND login_type = \
          'password'",
     )
     .bind(&email)
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if let Some((email, hash, super_admin, first_time_user)) = email_w_h {
@@ -1678,6 +2045,16 @@ async fn login(
             .verify_password(password.as_bytes(), &parsed_hash)
             .is_err()
         {
+            audit_log(
+                &mut *tx,
+                &audit_author,
+                "users.login_failure",
+                ActionKind::Create,
+                "global",
+                None,
+                None,
+            )
+            .await?;
             Err(Error::BadRequest("Invalid login".to_string()))
         } else {
             if first_time_user {
@@ -1685,7 +2062,7 @@ async fn login(
                     "UPDATE password SET first_time_user = false WHERE email = $1",
                     &email
                 )
-                .execute(&mut tx)
+                .execute(&mut *tx)
                 .await?;
                 let mut c = Cookie::new("first_time", "1");
                 if let Some(domain) = COOKIE_DOMAIN.as_ref() {
@@ -1701,12 +2078,54 @@ async fn login(
 
             let token = create_session_token(&email, super_admin, &mut tx, cookies).await?;
 
+            audit_log(
+                &mut *tx,
+                &audit_author,
+                "users.login",
+                ActionKind::Create,
+                "global",
+                Some(&truncate_token(&token)),
+                None,
+            )
+            .await?;
+
             tx.commit().await?;
             Ok(token)
         }
     } else {
+        audit_log(
+            &mut *tx,
+            &audit_author,
+            "users.login_failure",
+            ActionKind::Create,
+            "global",
+            None,
+            None,
+        )
+        .await?;
         Err(Error::BadRequest("Invalid login".to_string()))
     }
+}
+
+async fn refresh_token(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+    cookies: Cookies,
+) -> Result<String> {
+    let mut tx = db.begin().await?;
+
+    let super_admin = sqlx::query_scalar!(
+        "SELECT super_admin FROM password WHERE email = $1",
+        &authed.email
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+
+    let _ = create_session_token(&authed.email, super_admin, &mut tx, cookies).await?;
+
+    tx.commit().await?;
+    Ok("token refreshed".to_string())
 }
 
 pub async fn create_session_token<'c>(
@@ -1715,7 +2134,7 @@ pub async fn create_session_token<'c>(
     tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
     cookies: Cookies,
 ) -> Result<String> {
-    let token = rd_string(30);
+    let token = rd_string(32);
     sqlx::query!(
         "INSERT INTO token
             (token, email, label, expiration, super_admin)
@@ -1726,11 +2145,11 @@ pub async fn create_session_token<'c>(
         TTL_TOKEN_DB_H.to_string(),
         super_admin
     )
-    .execute(tx)
+    .execute(&mut **tx)
     .await?;
     let mut cookie = Cookie::new(COOKIE_NAME, token.clone());
-    cookie.set_secure(*IS_SECURE);
-    cookie.set_same_site(Some(cookie::SameSite::Lax));
+    cookie.set_secure(IS_SECURE.read().await.clone());
+    cookie.set_same_site(Some(tower_cookies::cookie::SameSite::Lax));
     cookie.set_http_only(true);
     cookie.set_path(COOKIE_PATH);
     if COOKIE_DOMAIN.is_some() {
@@ -1745,41 +2164,44 @@ pub async fn create_session_token<'c>(
 
 async fn create_token(
     Extension(db): Extension<DB>,
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Json(new_token): Json<NewToken>,
 ) -> Result<(StatusCode, String)> {
-    let token = rd_string(30);
+    let token = rd_string(32);
     let mut tx = db.begin().await?;
 
-    let is_super_admin =
-        sqlx::query_scalar!("SELECT super_admin FROM password WHERE email = $1", email)
-            .fetch_optional(&mut tx)
-            .await?
-            .unwrap_or(false);
+    let is_super_admin = sqlx::query_scalar!(
+        "SELECT super_admin FROM password WHERE email = $1",
+        authed.email
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
     sqlx::query!(
         "INSERT INTO token
-            (token, email, label, expiration, super_admin, scopes)
-            VALUES ($1, $2, $3, $4, $5, $6)",
+            (token, email, label, expiration, super_admin, scopes, workspace_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)",
         token,
-        email,
+        authed.email,
         new_token.label,
         new_token.expiration,
         is_super_admin,
-        new_token.scopes.as_ref().map(|x| x.as_slice())
+        new_token.scopes.as_ref().map(|x| x.as_slice()),
+        new_token.workspace_id,
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &email,
+        &mut *tx,
+        &authed,
         "users.token.create",
-        ActionKind::Delete,
+        ActionKind::Create,
         &"global",
         Some(&token[0..10]),
         None,
     )
-    .instrument(tracing::info_span!("token", email = &email))
+    .instrument(tracing::info_span!("token", email = &authed.email))
     .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, token))
@@ -1787,12 +2209,11 @@ async fn create_token(
 
 async fn impersonate(
     Extension(db): Extension<DB>,
-    Authed { email, username, .. }: Authed,
+    authed: ApiAuthed,
     Json(new_token): Json<NewToken>,
 ) -> Result<(StatusCode, String)> {
-    let token = rd_string(30);
-    let mut tx = db.begin().await?;
-    require_super_admin(&mut tx, &email).await?;
+    let token = rd_string(32);
+    require_super_admin(&db, &authed.email).await?;
 
     if new_token.impersonate_email.is_none() {
         return Err(Error::BadRequest(
@@ -1806,9 +2227,11 @@ async fn impersonate(
         "SELECT super_admin FROM password WHERE email = $1",
         impersonated
     )
-    .fetch_optional(&mut tx)
+    .fetch_optional(&db)
     .await?
     .unwrap_or(false);
+    let mut tx = db.begin().await?;
+
     sqlx::query!(
         "INSERT INTO token
             (token, email, label, expiration, super_admin)
@@ -1819,12 +2242,12 @@ async fn impersonate(
         new_token.expiration,
         is_super_admin
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &username,
+        &mut *tx,
+        &authed,
         "users.impersonate",
         ActionKind::Delete,
         &"global",
@@ -1837,25 +2260,49 @@ async fn impersonate(
     Ok((StatusCode::CREATED, token))
 }
 
+#[derive(Deserialize)]
+struct ListTokenQuery {
+    exclude_ephemeral: Option<bool>,
+}
+
 async fn list_tokens(
     Extension(db): Extension<DB>,
-    Authed { email, .. }: Authed,
+    ApiAuthed { email, .. }: ApiAuthed,
+    Query(query): Query<ListTokenQuery>,
+    Query(pagination): Query<Pagination>,
 ) -> JsonResult<Vec<TruncatedToken>> {
-    let rows = sqlx::query_as!(
-        TruncatedToken,
-        "SELECT label, concat(substring(token for 10)) as token_prefix, expiration, created_at, \
-         last_used_at, scopes FROM token WHERE email = $1
-         ORDER BY created_at DESC",
-        email,
-    )
-    .fetch_all(&db)
-    .await?;
+    let (per_page, offset) = paginate(pagination);
+    let rows = if query.exclude_ephemeral.unwrap_or(false) {
+        sqlx::query_as!(
+            TruncatedToken,
+            "SELECT label, concat(substring(token for 10)) as token_prefix, expiration, created_at, \
+             last_used_at, scopes FROM token WHERE email = $1 AND label != 'ephemeral-script'
+             ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            email,
+            per_page as i64,
+            offset as i64,
+        )
+        .fetch_all(&db)
+        .await?
+    } else {
+        sqlx::query_as!(
+            TruncatedToken,
+            "SELECT label, concat(substring(token for 10)) as token_prefix, expiration, created_at, \
+            last_used_at, scopes FROM token WHERE email = $1
+            ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            email,
+            per_page as i64,
+            offset as i64,
+        )
+        .fetch_all(&db)
+        .await?
+    };
     Ok(Json(rows))
 }
 
 async fn delete_token(
     Extension(db): Extension<DB>,
-    Authed { email, .. }: Authed,
+    authed: ApiAuthed,
     Path(token_prefix): Path<String>,
 ) -> Result<String> {
     let mut tx = db.begin().await?;
@@ -1866,14 +2313,14 @@ async fn delete_token(
                  AND token LIKE concat($2::text, '%')
            RETURNING concat(substring(token for 10), '*****')",
     )
-    .bind(&email)
+    .bind(&authed.email)
     .bind(&token_prefix)
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &email,
+        &mut *tx,
+        &authed,
         "users.token.delete",
         ActionKind::Delete,
         &"global",
@@ -1894,20 +2341,20 @@ async fn delete_token(
 async fn leave_workspace(
     Extension(db): Extension<DB>,
     Path(w_id): Path<String>,
-    Authed { username, .. }: Authed,
+    authed: ApiAuthed,
 ) -> Result<String> {
     let mut tx = db.begin().await?;
     sqlx::query!(
         "DELETE FROM usr WHERE workspace_id = $1 AND username = $2",
         &w_id,
-        username
+        authed.username
     )
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     audit_log(
-        &mut tx,
-        &username,
+        &mut *tx,
+        &authed,
         "users.leave_workspace",
         ActionKind::Delete,
         &w_id,
@@ -1925,6 +2372,7 @@ struct Runnable {
     workspace: String,
     endpoint_async: String,
     endpoint_sync: String,
+    endpoint_openai_sync: String,
     summary: String,
     description: String,
     schema: Option<serde_json::Value>,
@@ -1934,7 +2382,7 @@ struct Runnable {
 
 async fn get_all_runnables(
     Extension(db): Extension<UserDB>,
-    authed: Authed,
+    authed: ApiAuthed,
     Tokened { token }: Tokened,
     Extension(cache): Extension<Arc<AuthCache>>,
 ) -> JsonResult<Vec<Runnable>> {
@@ -1945,7 +2393,7 @@ async fn get_all_runnables(
          usr.email = $1 AND deleted = false",
         authed.email
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
 
@@ -1958,9 +2406,13 @@ async fn get_all_runnables(
             })?;
         let mut tx = db.clone().begin(&nauthed).await?;
         let flows = sqlx::query!(
-            "SELECT workspace_id as workspace, path, summary, description, schema FROM flow WHERE workspace_id = $1", workspace
+            "SELECT flow.workspace_id as workspace, flow.path, summary, description, flow_version.schema 
+            FROM flow 
+            LEFT JOIN flow_version ON flow_version.id = flow.versions[array_upper(flow.versions, 1)]
+            WHERE flow.workspace_id = $1",
+            workspace
         )
-        .fetch_all(&mut tx)
+        .fetch_all(&mut *tx)
         .await?;
         runnables.extend(
             flows
@@ -1970,6 +2422,10 @@ async fn get_all_runnables(
                     endpoint_async: format!("/w/{}/jobs/run/f/{}", &f.workspace, &f.path),
                     endpoint_sync: format!(
                         "/w/{}/jobs/run_wait_result/f/{}",
+                        &f.workspace, &f.path
+                    ),
+                    endpoint_openai_sync: format!(
+                        "/w/{}/jobs/openai_sync/f/{}",
                         &f.workspace, &f.path
                     ),
                     summary: f.summary,
@@ -1983,7 +2439,7 @@ async fn get_all_runnables(
         let scripts = sqlx::query!(
         "SELECT workspace_id as workspace, path, summary, description, schema FROM script as o WHERE created_at = (select max(created_at) from script where o.path = path and workspace_id = $1) and workspace_id = $1", workspace
     )
-    .fetch_all(&mut tx)
+    .fetch_all(&mut *tx)
     .await?;
         runnables.extend(
             scripts
@@ -1993,6 +2449,10 @@ async fn get_all_runnables(
                     endpoint_async: format!("/w/{}/jobs/run/p/{}", &s.workspace, &s.path),
                     endpoint_sync: format!(
                         "/w/{}/jobs/run_wait_result/p/{}",
+                        &s.workspace, &s.path
+                    ),
+                    endpoint_openai_sync: format!(
+                        "/w/{}/jobs/openai_sync/p/{}",
                         &s.workspace, &s.path
                     ),
                     summary: s.summary,
@@ -2008,66 +2468,702 @@ async fn get_all_runnables(
     Ok(Json(runnables))
 }
 
-pub async fn delete_expired_items_perdiodically(
-    db: &DB,
-    mut rx: tokio::sync::broadcast::Receiver<()>,
-) -> () {
-    loop {
-        let tokens_deleted_r: std::result::Result<Vec<String>, _> = sqlx::query_scalar(
-            "DELETE FROM token WHERE expiration <= now()
-        RETURNING concat(substring(token for 10), '*****')",
-        )
-        .fetch_all(db)
-        .await;
+//used by oauth
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct LoginUserInfo {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub company: Option<String>,
 
-        match tokens_deleted_r {
-            Ok(tokens) => tracing::debug!("deleted {} tokens: {:?}", tokens.len(), tokens),
-            Err(e) => tracing::error!("Error deleting token: {}", e.to_string()),
-        }
-
-        let pip_resolution_r = sqlx::query_scalar!(
-            "DELETE FROM pip_resolution_cache WHERE expiration <= now() RETURNING hash",
-        )
-        .fetch_all(db)
-        .await;
-
-        match pip_resolution_r {
-            Ok(res) => tracing::debug!("deleted {} pip_resolution: {:?}", res.len(), res),
-            Err(e) => tracing::error!("Error deleting pip_resolution: {}", e.to_string()),
-        }
-
-        if *JOB_RETENTION_SECS > 0 {
-            let deleted_jobs = sqlx::query_scalar!(
-                "DELETE FROM completed_job WHERE started_at + ((duration_ms/1000 + $1) || ' s')::interval <= now() RETURNING id",
-                *JOB_RETENTION_SECS as i64
-            )
-            .fetch_all(db)
-            .await;
-
-            match deleted_jobs {
-                Ok(deleted_jobs) => {
-                    tracing::info!(
-                        "deleted {} jobs completed JOB_RETENTION_SECS ago: {:?}",
-                        deleted_jobs.len(),
-                        deleted_jobs
-                    )
-                }
-                Err(e) => tracing::error!("Error deleting jobs: {}", e.to_string()),
-            }
-        }
-
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(600))     => (),
-            _ = rx. recv() => {
-                 println!("received killpill for delete expired tokens");
-                 break;
-            }
-        }
-    }
+    pub displayName: Option<String>,
 }
 
-pub fn truncate_token(token: &str) -> String {
-    let mut s = token[..10].to_owned();
-    s.push_str("*****");
-    s
+#[derive(Serialize)]
+struct InstanceUsernameInfo {
+    username: String,
+    workspace_usernames: Vec<WorkspaceUsernameInfo>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceUsernameInfo {
+    workspace_id: String,
+    username: String,
+}
+async fn get_instance_username_info(
+    ApiAuthed { email, .. }: ApiAuthed,
+    Path(user_email): Path<String>,
+    Extension(db): Extension<DB>,
+) -> JsonResult<InstanceUsernameInfo> {
+    require_super_admin(&db, &email).await?;
+    let mut tx = db.begin().await?;
+    let instance_username = match sqlx::query_scalar!(
+        "SELECT username FROM password WHERE email = $1",
+        &user_email
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        Some(username) => username,
+        None => generate_instance_wide_unique_username(&mut tx, &user_email).await?,
+    };
+
+    let workspace_usernames = sqlx::query_as!(
+        WorkspaceUsernameInfo,
+        "SELECT workspace_id, username FROM usr WHERE email = $1",
+        &user_email
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    Ok(Json(InstanceUsernameInfo {
+        username: instance_username,
+        workspace_usernames: workspace_usernames,
+    }))
+}
+
+async fn username_to_email(
+    Path((w_id, username)): Path<(String, String)>,
+    Extension(db): Extension<DB>,
+) -> Result<String> {
+    let email = sqlx::query_scalar!(
+        "SELECT email FROM usr WHERE username = $1 AND workspace_id = $2",
+        &username,
+        &w_id
+    )
+    .fetch_optional(&db)
+    .await?;
+
+    let email = not_found_if_none(email, "user", username)?;
+
+    Ok(email)
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Serialize, Deserialize)]
+struct ExportedGlobalUser {
+    email: String,
+    password_hash: Option<String>,
+    login_type: String,
+    super_admin: bool,
+    verified: bool,
+    name: Option<String>,
+    company: Option<String>,
+    first_time_user: bool,
+    username: Option<String>,
+}
+
+#[cfg(feature = "enterprise")]
+async fn export_global_users(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+) -> JsonResult<Vec<ExportedGlobalUser>> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+    let users = sqlx::query_as!(
+        ExportedGlobalUser,
+        "SELECT email, password_hash, login_type, super_admin, verified, name, company, first_time_user, username FROM password"
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "users.export_export",
+        ActionKind::Execute,
+        "global",
+        None,
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(users))
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn export_global_users() -> JsonResult<String> {
+    Err(Error::BadRequest(
+        "This feature is only available in the enterprise version".to_string(),
+    ))
+}
+
+#[cfg(feature = "enterprise")]
+async fn overwrite_global_users(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+    Json(users): Json<Vec<ExportedGlobalUser>>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+    sqlx::query!("DELETE FROM password")
+        .execute(&mut *tx)
+        .await?;
+    for user in users {
+        sqlx::query!(
+            "INSERT INTO password(email, password_hash, login_type, super_admin, verified, name, company, first_time_user, username)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            user.email,
+            user.password_hash,
+            user.login_type,
+            user.super_admin,
+            user.verified,
+            user.name,
+            user.company,
+            user.first_time_user,
+            user.username
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    audit_log(
+        &mut *tx,
+        &authed,
+        "users.import_global",
+        ActionKind::Create,
+        "global",
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok("loaded global users".to_string())
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn overwrite_global_users() -> JsonResult<String> {
+    Err(Error::BadRequest(
+        "This feature is only available in the enterprise version".to_string(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RenameUser {
+    new_username: String,
+}
+
+async fn rename_user(
+    authed: ApiAuthed,
+    Path(user_email): Path<String>,
+    Extension(db): Extension<DB>,
+    Json(ru): Json<RenameUser>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+
+    let mut tx = db.begin().await?;
+
+    let username_conflict = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM usr WHERE username = $1 and email != $2 UNION SELECT 1 FROM password WHERE username = $1 UNION SELECT 1 FROM pending_user WHERE username = $1)",
+        &ru.new_username,
+        &user_email
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(false);
+
+    if username_conflict {
+        return Err(Error::BadRequest(format!(
+            "username {} already used by another user",
+            &ru.new_username
+        )));
+    }
+
+    if !VALID_USERNAME.is_match(&ru.new_username) {
+        return Err(windmill_common::error::Error::BadRequest(format!(
+            "Usermame can only contain alphanumeric characters and underscores and must start with a letter"
+        )));
+    }
+
+    sqlx::query!(
+        "UPDATE password SET username = $1 WHERE email = $2",
+        ru.new_username,
+        user_email
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    let workspace_usernames = sqlx::query!(
+        "SELECT workspace_id, username FROM usr WHERE email = $1",
+        &user_email
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for w_u in workspace_usernames {
+        if ru.new_username == w_u.username {
+            continue;
+        }
+        update_username_in_workpsace(
+            &mut tx,
+            &user_email,
+            &w_u.username,
+            &ru.new_username,
+            &w_u.workspace_id,
+        )
+        .await?;
+    }
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "users.rename",
+        ActionKind::Update,
+        "global",
+        Some(&user_email),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(format!(
+        "updated username of user {} to {}",
+        &user_email, &ru.new_username
+    ))
+}
+
+async fn update_username_in_workpsace<'c>(
+    tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+    email: &str,
+    old_username: &str,
+    new_username: &str,
+    w_id: &str,
+) -> error::Result<()> {
+    // ---- instance and workspace users ----
+    sqlx::query!(
+        "UPDATE usr SET username = $1 WHERE email = $2",
+        new_username,
+        email
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE usr_to_group SET usr = $1 WHERE usr = $2",
+        new_username,
+        old_username
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- queue ----
+    sqlx::query!(
+        r#"UPDATE queue SET script_path = REGEXP_REPLACE(script_path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE script_path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE queue SET schedule_path = REGEXP_REPLACE(schedule_path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE schedule_path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE queue SET permissioned_as = ('u/' || $1) WHERE permissioned_as = ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE queue SET canceled_by = $1 WHERE canceled_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    sqlx::query!(
+        "UPDATE queue SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    // ---- completed_job ----
+    sqlx::query!(
+        r#"UPDATE completed_job SET script_path = REGEXP_REPLACE(script_path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE script_path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE completed_job SET schedule_path = REGEXP_REPLACE(schedule_path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE schedule_path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE completed_job SET permissioned_as = ('u/' || $1) WHERE permissioned_as = ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE completed_job SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    sqlx::query!(
+        "UPDATE completed_job SET canceled_by = $1 WHERE canceled_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    // ---- resources----
+    sqlx::query!(
+        r#"UPDATE resource SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE resource_type SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE resource SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE resource SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- variables ----
+
+    sqlx::query!(
+        r#"UPDATE variable SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE variable SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- scripts ----
+    sqlx::query!(
+        r#"UPDATE script SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE script SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    sqlx::query!(
+        "UPDATE script SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- flows ----
+    sqlx::query!(
+        r#"INSERT INTO flow
+            (workspace_id, path, summary, description, archived, extra_perms, dependency_job, draft_only, tag, ws_error_handler_muted, dedicated_worker, timeout, visible_to_runner_only, concurrency_key, versions, value, schema, edited_by, edited_at) 
+        SELECT workspace_id, REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1'), summary, description, archived, extra_perms, dependency_job, draft_only, tag, ws_error_handler_muted, dedicated_worker, timeout, visible_to_runner_only, concurrency_key, versions, value, schema, edited_by, edited_at
+            FROM flow 
+            WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE flow_version SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "DELETE FROM flow WHERE path LIKE ('u/' || $1 || '/%') AND workspace_id = $2",
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE flow SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- draft ----
+    sqlx::query!(
+        r#"UPDATE draft SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE draft SET value = to_json(jsonb_set(to_jsonb(value), ARRAY['path'], to_jsonb(REGEXP_REPLACE(value->>'path','u/' || $2 || '/(.*)','u/' || $1 || '/\1')))) WHERE value->>'path' LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    // ---- app ----
+    sqlx::query!(
+        r#"UPDATE app SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE app SET policy = jsonb_set(policy, ARRAY['on_behalf_of'], to_jsonb('u/' || $1)) WHERE policy->>'on_behalf_of' = ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE app SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- app_version ----
+
+    sqlx::query!(
+        "UPDATE app_version SET created_by = $1 WHERE created_by = $2 AND EXISTS (SELECT 1 FROM app WHERE workspace_id = $3 AND app.id = app_version.app_id)",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- schedules ----
+
+    sqlx::query!(
+        r#"UPDATE schedule SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE schedule SET script_path = REGEXP_REPLACE(script_path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE script_path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE schedule SET edited_by = $1 WHERE edited_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    sqlx::query!(
+        "UPDATE schedule SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- group_ ----
+
+    sqlx::query!(
+        "UPDATE group_ SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- folders ----
+
+    sqlx::query!(
+        "UPDATE folder SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE folder SET owners = ARRAY_REPLACE(owners, 'u/' || $2, 'u/' || $1) WHERE  ('u/' || $2) = ANY(owners) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE folder SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- input ----
+
+    sqlx::query!(
+        "UPDATE input SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    // ---- favorite ----
+
+    sqlx::query!(
+        "UPDATE favorite SET usr = $1 WHERE usr = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    // ---- capture ----
+
+    sqlx::query!(
+        "UPDATE capture SET created_by = $1 WHERE created_by = $2 AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    // ---- token ----
+
+    sqlx::query!(
+        "UPDATE token SET owner = ('u/' || $1) WHERE owner = ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+
+    sqlx::query!(
+        r#"UPDATE token SET scopes = array(select regexp_replace(unnest(scopes), 'run:([^/]+)/u/' || $2 || '/(.+)', 'run:\1/u/' || $1 || '/\2')) WHERE EXISTS (SELECT 1 FROM UNNEST(scopes) scope WHERE scope LIKE ('run:%/u/' || $2 || '/%')) AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // ---- raw_app ----
+
+    sqlx::query!(
+        "UPDATE raw_app SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",
+        new_username,
+        old_username,
+        w_id
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }

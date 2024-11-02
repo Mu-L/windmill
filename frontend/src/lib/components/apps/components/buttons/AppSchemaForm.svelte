@@ -1,15 +1,23 @@
 <script lang="ts">
-	import { getContext } from 'svelte'
+	import { getContext, onDestroy } from 'svelte'
 	import { initConfig, initOutput, selectId } from '../../editor/appUtils'
 	import type { AppInput } from '../../inputType'
-	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
+	import type {
+		AppViewerContext,
+		ComponentCustomCSS,
+		ListContext,
+		ListInputs,
+		RichConfigurations
+	} from '../../types'
 	import RunnableWrapper from '../helpers/RunnableWrapper.svelte'
 	import LightweightSchemaForm from '$lib/components/LightweightSchemaForm.svelte'
 	import type { Schema } from '$lib/common'
-	import { concatCustomCss } from '../../utils'
+	import { initCss } from '../../utils'
 	import { twMerge } from 'tailwind-merge'
 	import { components } from '../../editor/component'
 	import ResolveConfig from '../helpers/ResolveConfig.svelte'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
+	import { deepEqual } from 'fast-equals'
 
 	export let id: string
 	export let componentInput: AppInput | undefined
@@ -20,6 +28,8 @@
 
 	const { worldStore, connectingInput, app, selectedComponent, componentControl } =
 		getContext<AppViewerContext>('AppViewerContext')
+	const iterContext = getContext<ListContext>('ListWrapperContext')
+	const listInputs: ListInputs | undefined = getContext<ListInputs>('ListInputs')
 
 	const outputs = initOutput($worldStore, id, {
 		result: undefined,
@@ -41,11 +51,29 @@
 		}
 
 		outputs.values.set(newArgs, true)
+		if (iterContext && listInputs) {
+			listInputs.set(id, newArgs)
+		}
 	}
+
+	onDestroy(() => {
+		listInputs?.remove(id)
+	})
+
+	let schemaForm: LightweightSchemaForm
 
 	$componentControl[id] = {
 		setValue(nvalue: any) {
 			args = nvalue
+		},
+		invalidate(key: string, error: string) {
+			schemaForm?.invalidate(key, error)
+		},
+		validateAll() {
+			schemaForm?.validateAll()
+		},
+		validate(key: string) {
+			schemaForm?.validate(key)
 		}
 	}
 
@@ -53,7 +81,7 @@
 
 	$: outputs.valid.set(valid)
 
-	$: css = concatCustomCss($app.css?.schemaformcomponent, customCss)
+	let css = initCss($app.css?.schemaformcomponent, customCss)
 
 	const resolvedConfig = initConfig(
 		components['schemaformcomponent'].initialData.configuration,
@@ -61,6 +89,17 @@
 	)
 
 	let valid = true
+
+	let previousDefault = resolvedConfig.defaultValues
+
+	$: resolvedConfig.defaultValues &&
+		!deepEqual(previousDefault, resolvedConfig.defaultValues) &&
+		onDefaultChange()
+
+	function onDefaultChange() {
+		previousDefault = structuredClone(resolvedConfig.defaultValues)
+		args = previousDefault ?? {}
+	}
 </script>
 
 {#each Object.keys(components['schemaformcomponent'].initialData.configuration) as key (key)}
@@ -72,24 +111,40 @@
 	/>
 {/each}
 
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.schemaformcomponent}
+	/>
+{/each}
+
 <RunnableWrapper {outputs} {render} autoRefresh {componentInput} {id} bind:initializing bind:result>
 	{#if result && Object.keys(result?.properties ?? {}).length > 0}
 		<div
-			class={twMerge('p-2 overflow-auto h-full', css?.container?.class)}
+			class={twMerge('p-2 overflow-auto h-full', css?.container?.class, 'wm-schema-form')}
 			style={css?.container?.style}
-			on:pointerdown|stopPropagation={(e) =>
-				!$connectingInput.opened && selectId(e, id, selectedComponent, $app)}
 		>
-			<LightweightSchemaForm
-				schema={result}
-				bind:isValid={valid}
-				bind:args
-				displayType={Boolean(resolvedConfig.displayType)}
-				largeGap={Boolean(resolvedConfig.largeGap)}
-				{css}
-			/>
+			<div
+				on:pointerdown|stopPropagation={(e) =>
+					!$connectingInput.opened && selectId(e, id, selectedComponent, $app)}
+			>
+				<LightweightSchemaForm
+					defaultValues={resolvedConfig.defaultValues}
+					dynamicEnums={resolvedConfig.dynamicEnums}
+					schema={result}
+					bind:isValid={valid}
+					bind:args
+					bind:this={schemaForm}
+					displayType={Boolean(resolvedConfig.displayType)}
+					largeGap={Boolean(resolvedConfig.largeGap)}
+					{css}
+				/>
+			</div>
 		</div>
 	{:else}
-		<p class="m-2 italic">Empty form (no propertie)</p>
+		<p class="m-2 italic">Empty form (no property)</p>
 	{/if}
 </RunnableWrapper>

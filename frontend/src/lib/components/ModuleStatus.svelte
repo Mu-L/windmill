@@ -1,35 +1,39 @@
 <script lang="ts">
-	import { FlowStatusModule } from '$lib/gen'
-	import { faHourglassHalf } from '@fortawesome/free-solid-svg-icons'
-	import { Icon } from 'svelte-awesome'
+	import type { FlowStatusModule } from '$lib/gen'
 	import { Badge } from './common'
+	import { forLater } from '$lib/forLater'
+	import { displayDate } from '$lib/utils'
+	import { Hourglass } from 'lucide-svelte'
 
-	export let type: FlowStatusModule.type
-	export let scheduled_for: string | undefined
+	export let type: FlowStatusModule['type']
+	export let scheduled_for: Date | undefined
+	export let skipped: boolean = false
 </script>
 
-{#if type == FlowStatusModule.type.WAITING_FOR_EVENTS}
+{#if type == 'WaitingForEvents'}
 	<span class="italic text-waiting">
-		<Icon class=" mr-2" data={faHourglassHalf} />
+		<Hourglass />
 		Waiting to be resumed by resume events such as approvals
 	</span>
-{:else if type == FlowStatusModule.type.WAITING_FOR_PRIOR_STEPS}
-	<span class="italic text-gray-600">
-		<Icon data={faHourglassHalf} class="mr-2" />
+{:else if type == 'WaitingForPriorSteps'}
+	<span class="italic text-tertiary">
+		<Hourglass />
 		Waiting for prior steps to complete
 	</span>
-{:else if type == FlowStatusModule.type.WAITING_FOR_EXECUTOR}
-	<span class="italic text-gray-600">
-		<Icon data={faHourglassHalf} class="mr-2" />
-		{#if scheduled_for}
-			Job has been {scheduled_for} and will be executed after that time
+{:else if type == 'WaitingForExecutor'}
+	<span class="italic text-tertiary">
+		<Hourglass />
+		{#if scheduled_for && forLater(scheduled_for.toString())}
+			Job is scheduled to be executed at {displayDate(scheduled_for, true)}
 		{:else}
-			Job is waiting to be executed
+			Job is waiting for an executor
 		{/if}
 	</span>
-{:else if type == FlowStatusModule.type.SUCCESS}
+{:else if skipped}
+	<Badge color="blue">Skipped</Badge>
+{:else if type == 'Success'}
 	<Badge color="green">Success</Badge>
-{:else if type == FlowStatusModule.type.FAILURE}
+{:else if type == 'Failure'}
 	<Badge color="red">Failure</Badge>
 {/if}
 

@@ -1,25 +1,19 @@
 <script lang="ts">
-	import { isCodeInjection } from '$lib/components/flows/utils'
 	import Tooltip from '$lib/components/Tooltip.svelte'
 	import { Clipboard } from 'lucide-svelte'
 	import { getContext } from 'svelte'
-	import { get } from 'svelte/store'
 	import { twMerge } from 'tailwind-merge'
-	import { copyToClipboard } from '../../../../utils'
+	import { copyToClipboard, isCodeInjection } from '../../../../utils'
 	import Button from '../../../common/button/Button.svelte'
-	import Popover from '../../../Popover.svelte'
 	import { initConfig, initOutput } from '../../editor/appUtils'
 	import { components } from '../../editor/component'
 	import type { AppInput } from '../../inputType'
-	import type {
-		AppEditorContext,
-		AppViewerContext,
-		ComponentCustomCSS,
-		RichConfigurations
-	} from '../../types'
+	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
 	import AlignWrapper from '../helpers/AlignWrapper.svelte'
 	import ResolveConfig from '../helpers/ResolveConfig.svelte'
 	import RunnableWrapper from '../helpers/RunnableWrapper.svelte'
+	import { initCss } from '../../utils'
+	import ResolveStyle from '../helpers/ResolveStyle.svelte'
 
 	export let id: string
 	export let componentInput: AppInput | undefined
@@ -36,14 +30,23 @@
 		configuration
 	)
 
+	$: editorMode && onEditorMode()
+
+	function onEditorMode() {
+		autosize()
+		setTimeout(() => autosize(), 50)
+	}
 	const { app, worldStore, mode, componentControl } =
 		getContext<AppViewerContext>('AppViewerContext')
 
-	const editorcontext = getContext<AppEditorContext>('AppEditorContext')
+	let css = initCss($app.css?.textcomponent, customCss)
 
 	let result: string | undefined = undefined
 
-	if (componentInput?.type == 'template' && !isCodeInjection(componentInput.eval)) {
+	if (
+		componentInput?.type == 'template' ||
+		(componentInput?.type == 'templatev2' && !isCodeInjection(componentInput.eval))
+	) {
 		result = componentInput.eval
 		initializing = false
 	}
@@ -80,7 +83,7 @@
 	function getClasses() {
 		switch (resolvedConfig.style) {
 			case 'Caption':
-				return 'text-sm italic text-gray-500'
+				return 'text-sm italic text-tertiary'
 			case 'Label':
 				return 'font-semibold text-sm'
 			default:
@@ -108,24 +111,12 @@
 	let component = 'p'
 	let classes = ''
 
-	function getHorizontalAlignement() {
-		if (horizontalAlignment) {
-			switch (horizontalAlignment) {
-				case 'left':
-					return '!text-left'
-				case 'center':
-					return '!text-center'
-				case 'right':
-					return '!text-right'
-				default:
-					return '!text-left'
-			}
-		}
-	}
-
 	$: resolvedConfig.style && (component = getComponent())
 	$: resolvedConfig.style && (classes = getClasses())
-	$: initialValue = componentInput?.type == 'template' ? componentInput.eval : ''
+	$: initialValue =
+		componentInput?.type == 'template' || componentInput?.type == 'templatev2'
+			? componentInput.eval
+			: ''
 	$: editableValue = initialValue ?? ''
 
 	let rows = 1
@@ -133,7 +124,7 @@
 	function onInput(e: Event) {
 		const target = e.target as HTMLTextAreaElement
 
-		if (target.value) {
+		if (target.value != undefined) {
 			$componentControl[id]?.setCode?.(target.value)
 			autosize()
 		}
@@ -146,6 +137,7 @@
 				el.style.cssText = 'height:auto; padding:0'
 				el.style.cssText = 'height:' + el.scrollHeight + 'px'
 			}
+			// console.log(el, el?.scrollHeight)
 		}, 0)
 	}
 </script>
@@ -159,32 +151,47 @@
 	/>
 {/each}
 
+{#each Object.keys(css ?? {}) as key (key)}
+	<ResolveStyle
+		{id}
+		{customCss}
+		{key}
+		bind:css={css[key]}
+		componentStyle={$app.css?.textcomponent}
+	/>
+{/each}
+
 <RunnableWrapper {outputs} {render} {componentInput} {id} bind:initializing bind:result>
+	<!-- svelte-ignore a11y-no-static-element-interactions -->
 	<div
-		class="h-full w-full overflow-hidden"
+		class={twMerge('h-full w-full overflow-hidden', css.container?.class, 'wm-text-container')}
+		style={css?.container?.style}
 		on:dblclick={() => {
 			if (!editorMode) {
 				editorMode = true
 				document.getElementById(`text-${id}`)?.focus()
-				autosize()
 			}
 		}}
 		on:keydown|stopPropagation
 	>
-		{#if $mode == 'dnd' && editorMode && componentInput?.type == 'template'}
-			<AlignWrapper {horizontalAlignment} {verticalAlignment}>
+		{#if $mode == 'dnd' && editorMode && (componentInput?.type == 'template' || componentInput?.type == 'templatev2')}
+			<AlignWrapper {verticalAlignment}>
 				<textarea
 					class={twMerge(
-						'whitespace-pre-wrap !outline-none !border-0 !bg-transparent !resize-none !overflow-hidden !ring-0 !p-0 text-center',
-						$app.css?.['textcomponent']?.['text']?.class,
-						customCss?.text?.class,
+						'whitespace-pre-wrap !outline-none !border-0 !bg-transparent !resize-none !ring-0 !p-0',
+						css?.text?.class,
+						'wm-text',
 						classes,
 						getClasses(),
 						getClassesByType(),
-						getHorizontalAlignement()
+						horizontalAlignment === 'center'
+							? 'text-center'
+							: horizontalAlignment === 'right'
+							? 'text-right'
+							: 'text-left'
 					)}
 					on:pointerdown|stopPropagation
-					style={[$app.css?.['textcomponent']?.['text']?.style, customCss?.text?.style].join(';')}
+					style={css?.text?.style}
 					id={`text-${id}`}
 					on:pointerenter={() => {
 						const elem = document.getElementById(`text-${id}`)
@@ -198,58 +205,58 @@
 				/>
 			</AlignWrapper>
 		{:else}
-			<AlignWrapper {horizontalAlignment} {verticalAlignment}>
+			<AlignWrapper {verticalAlignment}>
 				{#if !result || result === ''}
-					<div class="text-gray-400 bg-gray-100 flex justify-center items-center h-full w-full">
-						No text
+					<div
+						class="text-ternary bg-surface-primary flex justify-center items-center h-full w-full"
+					>
+						{#if resolvedConfig?.disableNoText === false}
+							No text
+						{/if}
 					</div>
 				{:else}
 					<!-- svelte-ignore a11y-click-events-have-key-events -->
 					<div
-						class="flex flex-wrap gap-2 pb-0.5 {$mode === 'dnd' &&
-						componentInput?.type == 'template'
+						class="flex flex-wrap gap-2 pb-0.5 w-full {$mode === 'dnd' &&
+						(componentInput?.type == 'template' || componentInput?.type == 'templatev2')
 							? 'cursor-text'
-							: ''}"
-						on:click={() => {
-							if ($mode === 'dnd' && componentInput?.type == 'template') {
-								let ontextfocus = editorcontext?.ontextfocus
-								if (ontextfocus) {
-									get(ontextfocus)?.()
-								}
-							}
-						}}
+							: 'overflow-auto'}"
 					>
 						<svelte:element
 							this={component}
 							class={twMerge(
-								'whitespace-pre-wrap',
-								$app.css?.['textcomponent']?.['text']?.class,
-								customCss?.text?.class,
-								classes
+								'whitespace-pre-wrap w-full',
+
+								css?.text?.class,
+								classes,
+								horizontalAlignment === 'center'
+									? 'text-center'
+									: horizontalAlignment === 'right'
+									? 'text-right'
+									: 'text-left'
 							)}
-							style={[$app.css?.['textcomponent']?.['text']?.style, customCss?.text?.style].join(
-								';'
-							)}
+							style={css?.text?.style}
 						>
 							{String(result)}
 							{#if resolvedConfig.tooltip && resolvedConfig.tooltip != ''}
 								<Tooltip>{resolvedConfig.tooltip}</Tooltip>
 							{/if}
-							{#if resolvedConfig.copyButton && result}
-								<Popover notClickable>
-									<Button
-										variant="border"
-										size="xs"
-										color="dark"
-										btnClasses="!p-1"
-										on:click={() => copyToClipboard(result)}
-									>
-										<Clipboard size={14} strokeWidth={2} />
-									</Button>
-									<svelte:fragment slot="text">Copy to clipboard</svelte:fragment>
-								</Popover>
-							{/if}
 						</svelte:element>
+
+						{#if resolvedConfig.copyButton && result}
+							<div class="flex">
+								<Button
+									title="Copy to clipboard"
+									variant="border"
+									size="xs"
+									color="light"
+									btnClasses="!p-1"
+									on:click={() => copyToClipboard(result)}
+								>
+									<Clipboard size={14} strokeWidth={2} />
+								</Button>
+							</div>
+						{/if}
 					</div>
 				{/if}
 			</AlignWrapper>

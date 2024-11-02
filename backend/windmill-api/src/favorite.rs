@@ -6,7 +6,7 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-use crate::{db::DB, users::Authed};
+use crate::db::{ApiAuthed, DB};
 use axum::{
     extract::{Extension, Path},
     routing::post,
@@ -39,7 +39,7 @@ pub struct Favorite {
 }
 
 async fn star(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Path(w_id): Path<String>,
     Json(Favorite { favorite_kind, path }): Json<Favorite>,
@@ -49,7 +49,7 @@ async fn star(
         &w_id,
         authed.username,
         path,
-        favorite_kind: FavoriteKind,
+        favorite_kind as FavoriteKind,
     )
     .execute(&db)
     .await?;
@@ -58,7 +58,7 @@ async fn star(
 }
 
 async fn unstar(
-    authed: Authed,
+    authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Path(w_id): Path<String>,
     Json(Favorite { favorite_kind, path }): Json<Favorite>,
@@ -68,7 +68,7 @@ async fn unstar(
         &w_id,
         authed.username,
         path,
-        favorite_kind: FavoriteKind,
+        favorite_kind as FavoriteKind,
     )
     .execute(&db)
     .await?;

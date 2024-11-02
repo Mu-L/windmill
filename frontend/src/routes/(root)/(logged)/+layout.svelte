@@ -1,24 +1,36 @@
 <script lang="ts">
 	import { BROWSER } from 'esm-env'
-	import { faArrowLeft } from '@fortawesome/free-solid-svg-icons'
-	import Icon from 'svelte-awesome'
 
-	import UserMenu from '$lib/components/sidebar/UserMenu.svelte'
 	import {
 		AppService,
 		FlowService,
 		OpenAPI,
 		RawAppService,
 		ScriptService,
-		UserService
+		SettingService,
+		UserService,
+		WorkspaceService
 	} from '$lib/gen'
-	import { classNames } from '$lib/utils'
-
+	import { classNames, getModifierKey } from '$lib/utils'
 	import WorkspaceMenu from '$lib/components/sidebar/WorkspaceMenu.svelte'
 	import SidebarContent from '$lib/components/sidebar/SidebarContent.svelte'
-	import { starStore, superadmin, usageStore, userStore, workspaceStore } from '$lib/stores'
+	import {
+		copilotInfo,
+		isPremiumStore,
+		starStore,
+		superadmin,
+		usageStore,
+		workspaceUsageStore,
+		userStore,
+		workspaceStore,
+		type UserExt,
+		defaultScripts,
+		hubBaseUrlStore,
+		usedTriggerKinds
+	} from '$lib/stores'
 	import CenteredModal from '$lib/components/CenteredModal.svelte'
-	import { afterNavigate, beforeNavigate, goto } from '$app/navigation'
+	import { afterNavigate, beforeNavigate } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import UserSettings from '$lib/components/UserSettings.svelte'
 	import SuperadminSettings from '$lib/components/SuperadminSettings.svelte'
 	import WindmillIcon from '$lib/components/icons/WindmillIcon.svelte'
@@ -26,28 +38,73 @@
 	import FavoriteMenu from '$lib/components/sidebar/FavoriteMenu.svelte'
 	import { SUPERADMIN_SETTINGS_HASH, USER_SETTINGS_HASH } from '$lib/components/sidebar/settings'
 	import { isCloudHosted } from '$lib/cloud'
+	import { syncTutorialsTodos } from '$lib/tutorialUtils'
+	import { ArrowLeft, Search } from 'lucide-svelte'
+	import { getUserExt } from '$lib/user'
+	import { workspacedOpenai } from '$lib/components/copilot/lib'
+	import { twMerge } from 'tailwind-merge'
+	import OperatorMenu from '$lib/components/sidebar/OperatorMenu.svelte'
+	import GlobalSearchModal from '$lib/components/search/GlobalSearchModal.svelte'
+	import MenuButton from '$lib/components/sidebar/MenuButton.svelte'
+	import { setContext } from 'svelte'
+	import { base } from '$app/paths'
 
 	OpenAPI.WITH_CREDENTIALS = true
 	let menuOpen = false
+	let globalSearchModal: GlobalSearchModal | undefined = undefined
 	let isCollapsed = false
 	let userSettings: UserSettings
 	let superadminSettings: SuperadminSettings
+	let menuHidden = false
 
 	if ($page.status == 404) {
 		goto('/user/login')
 	}
 
-	$: {
+	$: $page.url && userSettings != undefined && onQueryChangeUserSettings()
+	$: $page.url && superadminSettings != undefined && onQueryChangeAdminSettings()
+	$: $page.url && onQueryChange()
+
+	function onQueryChangeUserSettings() {
+		if (userSettings && $page.url.hash === USER_SETTINGS_HASH) {
+			userSettings.openDrawer()
+		}
+	}
+
+	function onQueryChangeAdminSettings() {
+		if (superadminSettings && $page.url.hash === SUPERADMIN_SETTINGS_HASH) {
+			superadminSettings.openDrawer()
+		}
+	}
+
+	function onQueryChange() {
 		let queryWorkspace = $page.url.searchParams.get('workspace')
 		if (queryWorkspace) {
 			$workspaceStore = queryWorkspace
 		}
+
+		menuHidden =
+			$page.url.searchParams.get('nomenubar') === 'true' ||
+			$page.url.pathname.startsWith('/oauth/callback/')
 	}
 
-	$: if (userSettings && $page.url.hash === USER_SETTINGS_HASH) {
-		userSettings.openDrawer()
-	} else if (superadminSettings && $page.url.hash === SUPERADMIN_SETTINGS_HASH) {
-		superadminSettings.openDrawer()
+	$: updateUserStore($workspaceStore)
+
+	async function updateUserStore(workspace: string | undefined) {
+		if (workspace) {
+			try {
+				localStorage.setItem('workspace', String(workspace))
+			} catch (e) {
+				console.error('Could not persist workspace to local storage', e)
+			}
+			const user = await getUserExt(workspace)
+			userStore.set(user)
+			if (isCloudHosted() && user?.is_admin) {
+				isPremiumStore.set(await WorkspaceService.getIsPremium({ workspace }))
+			}
+		} else {
+			userStore.set(undefined)
+		}
 	}
 
 	beforeNavigate(() => {
@@ -66,18 +123,32 @@
 	function onLoad() {
 		loadFavorites()
 		loadUsage()
+		syncTutorialsTodos()
+		loadHubBaseUrl()
+		loadUsedTriggerKinds()
 	}
 
 	async function loadUsage() {
 		if (isCloudHosted()) {
 			$usageStore = await UserService.getUsage()
+			$workspaceUsageStore = await WorkspaceService.getWorkspaceUsage({
+				workspace: $workspaceStore!
+			})
 		}
+	}
+
+	async function loadHubBaseUrl() {
+		$hubBaseUrlStore =
+			((await SettingService.getGlobal({ key: 'hub_accessible_url' })) as string) ||
+			((await SettingService.getGlobal({ key: 'hub_base_url' })) as string) ||
+			'https://hub.windmill.dev'
 	}
 
 	async function loadFavorites() {
 		const scripts = await ScriptService.listScripts({
 			workspace: $workspaceStore ?? '',
-			starredOnly: true
+			starredOnly: true,
+			includeWithoutMain: true
 		})
 		const flows = await FlowService.listFlows({
 			workspace: $workspaceStore ?? '',
@@ -94,35 +165,49 @@
 		favoriteLinks = [
 			...scripts.map((s) => ({
 				label: s.summary || s.path,
-				href: `/scripts/run/${s.hash}`,
+				href: `${base}/scripts/get/${s.hash}`,
 				kind: 'script' as 'script'
 			})),
 			...flows.map((f) => ({
 				label: f.summary || f.path,
-				href: `/flows/run/${f.path}`,
+				href: `${base}/flows/get/${f.path}`,
 				kind: 'flow' as 'flow'
 			})),
 			...apps.map((f) => ({
 				label: f.summary || f.path,
-				href: `/apps/get/${f.path}`,
+				href: `${base}/apps/get/${f.path}`,
 				kind: 'app' as 'app'
 			})),
 			...raw_apps.map((f) => ({
 				label: f.summary || f.path,
-				href: `/apps/get_raw/${f.version}/${f.path}`,
+				href: `${base}/apps/get_raw/${f.version}/${f.path}`,
 				kind: 'raw_app' as 'raw_app'
 			}))
 		]
 	}
 
+	async function loadUsedTriggerKinds() {
+		let usedKinds: string[] = []
+		const { http_routes_used, websocket_used } = await WorkspaceService.getUsedTriggers({
+			workspace: $workspaceStore ?? ''
+		})
+		if (http_routes_used) {
+			usedKinds.push('http')
+		}
+		if (websocket_used) {
+			usedKinds.push('ws')
+		}
+		$usedTriggerKinds = usedKinds
+	}
+
 	function pathInAppMode(pathname: string | undefined): boolean {
 		if (!pathname) return false
 		return (
-			pathname.startsWith('/apps') ||
-			pathname.startsWith('/flows/add') ||
-			pathname.startsWith('/flows/edit') ||
-			pathname.startsWith('/scripts/add') ||
-			pathname.startsWith('/scripts/edit')
+			pathname.startsWith(base + '/apps') ||
+			pathname.startsWith(base + '/flows/add') ||
+			pathname.startsWith(base + '/flows/edit') ||
+			pathname.startsWith(base + '/scripts/add') ||
+			pathname.startsWith(base + '/scripts/edit')
 		)
 	}
 	afterNavigate((n) => {
@@ -134,15 +219,66 @@
 	$: innerWidth && changeCollapsed()
 
 	function changeCollapsed() {
-		if (innerWidth < 1248 && innerWidth >= 768) {
+		if (innerWidth < 1248 && innerWidth >= 768 && !isCollapsed) {
 			isCollapsed = true
-		} else if ((innerWidth >= 1248 || innerWidth < 768) && !pathInAppMode($page.url.pathname)) {
-			isCollapsed = false
 		}
 	}
+
+	let devOnly = $page.url.pathname.startsWith(base + '/scripts/dev')
+
+	async function loadCopilot(workspace: string) {
+		workspacedOpenai.init(workspace)
+		try {
+			copilotInfo.set(await WorkspaceService.getCopilotInfo({ workspace }))
+		} catch (err) {
+			copilotInfo.set({
+				exists_openai_resource_path: false,
+				code_completion_enabled: false
+			})
+			console.error('Could not get copilot info')
+		}
+	}
+
+	workspaceStore.subscribe(async (workspace) => {
+		if (workspace) {
+			loadCopilot(workspace)
+		}
+	})
+
+	$: onUserStore($userStore)
+	$: $workspaceStore && $userStore && loadDefaultScripts($workspaceStore, $userStore)
+	async function loadDefaultScripts(workspace: string, user: UserExt | undefined) {
+		if (!user?.operator) {
+			$defaultScripts = await WorkspaceService.getDefaultScripts({ workspace })
+		}
+	}
+	let timeout: NodeJS.Timeout | undefined
+	async function onUserStore(u: UserExt | undefined) {
+		if (u && timeout) {
+			clearTimeout(timeout)
+			timeout = undefined
+		} else if (!u) {
+			timeout = setTimeout(async () => {
+				if (!$userStore && $workspaceStore) {
+					$userStore = await getUserExt($workspaceStore)
+				}
+			}, 5000)
+		}
+	}
+
+	$: if (isCollapsed && $userStore?.operator) {
+		isCollapsed = false
+	}
+
+	function openSearchModal(text?: string): void {
+		globalSearchModal?.openSearchWithPrefilledText(text)
+	}
+
+	setContext('openSearchWithPrefilledText', openSearchModal)
 </script>
 
 <svelte:window bind:innerWidth />
+
 <UserSettings bind:this={userSettings} />
 {#if $page.status == 404}
 	<CenteredModal title="Page not found, redirecting you to login">
@@ -153,136 +289,252 @@
 		</div>
 	</CenteredModal>
 {:else if $userStore}
+	<GlobalSearchModal bind:this={globalSearchModal} />
 	{#if $superadmin}
 		<SuperadminSettings bind:this={superadminSettings} />
 	{/if}
 	<div>
-		<div
-			class={classNames('relative md:hidden', menuOpen ? 'z-40' : 'pointer-events-none')}
-			role="dialog"
-			aria-modal="true"
-		>
-			<div
-				class={classNames(
-					'fixed inset-0 bg-[#2e3440] bg-opacity-75 transition-opacity ease-linear duration-300 z-40',
-					menuOpen ? 'opacity-100' : 'opacity-0'
-				)}
-			/>
-
-			<div class="fixed inset-0 flex z-40">
-				<div
-					class={classNames(
-						'relative flex-1 flex flex-col max-w-min w-full bg-white transition ease-in-out duration-300 transform',
-						menuOpen ? 'translate-x-0' : '-translate-x-full'
-					)}
-				>
+		{#if !menuHidden}
+			{#if !$userStore?.operator}
+				{#if innerWidth < 768}
 					<div
 						class={classNames(
-							'absolute top-0 right-0 -mr-12 pt-2 ease-in-out duration-300',
-							menuOpen ? 'opacity-100' : 'opacity-0'
+							'relative',
+							menuOpen ? 'z-40' : 'pointer-events-none',
+							devOnly ? 'hidden' : ''
 						)}
+						role="dialog"
+						aria-modal="true"
 					>
-						<button
-							type="button"
-							on:click={() => {
-								menuOpen = !menuOpen
-							}}
-							class="ml-1 flex items-center justify-center h-8 w-8 rounded-full focus:outline-none focus:ring-2 focus:ring-inset focus:ring-white border border-white"
-						>
-							<svg
-								class="h-6 w-6 text-white"
-								xmlns="http://www.w3.org/2000/svg"
-								fill="none"
-								viewBox="0 0 24 24"
-								stroke-width="2"
-								stroke="currentColor"
-								aria-hidden="true"
-							>
-								<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-							</svg>
-						</button>
-					</div>
-					<div class="bg-[#2e3440] h-full">
 						<div
-							class="flex items-center gap-x-2 flex-shrink-0 p-4 font-extrabold text-white w-10"
-							class:w-40={!isCollapsed}
-						>
-							<WindmillIcon white={true} height="20px" width="20px" />
-							{#if !isCollapsed}Windmill{/if}
-						</div>
-
-						<div class="px-2 py-4 space-y-2 border-y border-gray-500">
-							<WorkspaceMenu />
-							<UserMenu />
-							<FavoriteMenu {favoriteLinks} />
-						</div>
-
-						<SidebarContent {isCollapsed} />
-					</div>
-				</div>
-			</div>
-		</div>
-
-		<div
-			class={classNames(
-				'hidden md:flex md:flex-col md:fixed md:inset-y-0 transition-all ease-in-out duration-200 shadow-md z-40',
-				isCollapsed ? 'md:w-12' : 'md:w-40'
-			)}
-		>
-			<div class="flex-1 flex flex-col min-h-0 h-screen shadow-lg bg-[#2e3440]">
-				<button
-					on:click={() => {
-						goto('/')
-					}}
-				>
-					<div
-						class="center-center flex-row flex-shrink-0 px-2 py-3.5 font-extrabold text-white h-12"
-						class:w-40={!isCollapsed}
-					>
-						<div class:mr-1={!isCollapsed}>
-							<WindmillIcon white={true} height="20px" width="20px" />
-						</div>
-						{#if !isCollapsed}
-							<span> Windmill </span>
-						{/if}
-					</div>
-				</button>
-				<div class="px-2 py-4 space-y-2 border-y border-gray-500">
-					<WorkspaceMenu {isCollapsed} />
-					<UserMenu {isCollapsed} />
-					<FavoriteMenu {favoriteLinks} />
-				</div>
-				<SidebarContent {isCollapsed} />
-
-				<div class="flex-shrink-0 flex px-4 pb-3.5 pt-3 border-t border-gray-500">
-					<button
-						on:click={() => {
-							isCollapsed = !isCollapsed
-						}}
-					>
-						<Icon
-							data={faArrowLeft}
 							class={classNames(
-								'flex-shrink-0 h-4 w-4 transition-all ease-in-out duration-200 text-white',
-								isCollapsed ? 'rotate-180' : 'rotate-0'
+								'fixed inset-0 dark:bg-[#1e232e] bg-[#202125] dark:bg-opacity-75 bg-opacity-75 transition-opacity ease-linear duration-300 z-40 !dark',
+
+								menuOpen ? 'opacity-100' : 'opacity-0'
 							)}
 						/>
-					</button>
+
+						<div class="fixed inset-0 flex z-40">
+							<div
+								class={classNames(
+									'relative flex-1 flex flex-col max-w-min w-full bg-surface transition ease-in-out duration-300 transform',
+									menuOpen ? 'translate-x-0' : '-translate-x-full'
+								)}
+							>
+								<div
+									class={classNames(
+										'absolute top-0 right-0 -mr-12 pt-2 ease-in-out duration-300',
+										menuOpen ? 'opacity-100' : 'opacity-0'
+									)}
+								>
+									<button
+										type="button"
+										on:click={() => {
+											menuOpen = !menuOpen
+										}}
+										class="ml-1 flex items-center justify-center h-8 w-8 rounded-full focus:outline-none focus:ring-2 focus:ring-inset focus:ring-white border border-white"
+									>
+										<svg
+											class="h-6 w-6 text-white"
+											xmlns="http://www.w3.org/2000/svg"
+											fill="none"
+											viewBox="0 0 24 24"
+											stroke-width="2"
+											stroke="currentColor"
+											aria-hidden="true"
+										>
+											<path
+												stroke-linecap="round"
+												stroke-linejoin="round"
+												d="M6 18L18 6M6 6l12 12"
+											/>
+										</svg>
+									</button>
+								</div>
+								<div class="dark:bg-[#1e232e] bg-[#202125] h-full !dark">
+									<div class="flex gap-x-2 flex-shrink-0 p-4 font-semibold text-gray-200 w-40">
+										<WindmillIcon white={true} height="20px" width="20px" />
+										Windmill
+									</div>
+
+									<div class="px-2 py-4 space-y-2 border-y border-gray-500">
+										<WorkspaceMenu />
+										<FavoriteMenu {favoriteLinks} />
+										<MenuButton
+											stopPropagationOnClick={true}
+											on:click={() => openSearchModal()}
+											isCollapsed={false}
+											icon={Search}
+											label="Search"
+											class="!text-xs"
+											shortcut={`${getModifierKey()}k`}
+										/>
+									</div>
+
+									<SidebarContent isCollapsed={false} />
+								</div>
+							</div>
+						</div>
+					</div>
+				{:else}
+					<div
+						id="sidebar"
+						class={classNames(
+							'flex flex-col fixed inset-y-0 transition-all ease-in-out duration-200 shadow-md z-40 ',
+							isCollapsed ? 'md:w-12' : 'md:w-40',
+							devOnly ? '!hidden' : ''
+						)}
+					>
+						<div
+							class="flex-1 flex flex-col min-h-0 h-screen shadow-lg dark:bg-[#1e232e] bg-[#202125] !dark"
+						>
+							<button
+								on:click={() => {
+									goto('/')
+								}}
+							>
+								<div
+									class="flex-row flex-shrink-0 px-3.5 py-3.5 text-opacity-70 h-12 flex items-center gap-1.5"
+									class:w-40={!isCollapsed}
+								>
+									<div class:mr-1={!isCollapsed}>
+										<WindmillIcon white={true} height="20px" width="20px" />
+									</div>
+									{#if !isCollapsed}
+										<div class="text-sm mt-0.5 text-white"> Windmill </div>
+									{/if}
+								</div>
+							</button>
+							<div class="px-2 py-4 space-y-2 border-y border-gray-700">
+								<WorkspaceMenu {isCollapsed} />
+								<FavoriteMenu {favoriteLinks} {isCollapsed} />
+								<MenuButton
+									stopPropagationOnClick={true}
+									on:click={() => openSearchModal()}
+									{isCollapsed}
+									icon={Search}
+									label="Search"
+									class="!text-xs"
+									shortcut={`${getModifierKey()}k`}
+								/>
+							</div>
+
+							<SidebarContent {isCollapsed} />
+
+							<div class="flex-shrink-0 flex px-4 pb-3.5">
+								<button
+									on:click={() => {
+										isCollapsed = !isCollapsed
+									}}
+								>
+									<ArrowLeft
+										size={16}
+										class={classNames(
+											'flex-shrink-0 h-4 w-4 transition-all ease-in-out duration-200 text-white',
+											isCollapsed ? 'rotate-180' : 'rotate-0'
+										)}
+									/>
+								</button>
+							</div>
+						</div>
+					</div>
+				{/if}
+			{:else}
+				<div class="absolute top-2 left-2 z5000">
+					<OperatorMenu {favoriteLinks} />
+				</div>
+			{/if}
+
+			<div
+				class={classNames(
+					'fixed inset-0 dark:bg-[#1e232e] bg-[#202125] dark:bg-opacity-75 bg-opacity-75 transition-opacity ease-linear duration-300  !dark',
+					'opacity-0'
+				)}
+			>
+				<div class={twMerge('fixed inset-0 flex ', '-z-0')}>
+					<div
+						class={classNames(
+							'relative flex-1 flex flex-col max-w-min w-full bg-surface transition ease-in-out duration-100 transform',
+							'-translate-x-full'
+						)}
+					>
+						<div
+							class={classNames(
+								'absolute top-0 right-0 -mr-12 pt-2 ease-in-out duration-100',
+								'opacity-0'
+							)}
+						>
+							<button
+								type="button"
+								on:click={() => {
+									// menuSlide = !menuSlide
+								}}
+								class="ml-1 flex items-center justify-center h-8 w-8 rounded-full focus:outline-none focus:ring-2 focus:ring-inset focus:ring-white border border-white"
+							>
+								<svg
+									class="h-6 w-6 text-white"
+									xmlns="http://www.w3.org/2000/svg"
+									fill="none"
+									viewBox="0 0 24 24"
+									stroke-width="2"
+									stroke="currentColor"
+									aria-hidden="true"
+								>
+									<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+								</svg>
+							</button>
+						</div>
+						<div class="dark:bg-[#1e232e] bg-[#202125] h-full !dark">
+							<div
+								class="flex gap-x-2 flex-shrink-0 p-4 font-semibold text-gray-200 w-10"
+								class:w-40={!isCollapsed}
+							>
+								<WindmillIcon white={true} height="20px" width="20px" />
+								{#if !isCollapsed}Windmill{/if}
+							</div>
+
+							<div class="px-2 py-4 space-y-2 border-y border-gray-500">
+								<WorkspaceMenu />
+								<FavoriteMenu {favoriteLinks} />
+								<MenuButton
+									stopPropagationOnClick={true}
+									on:click={() => openSearchModal()}
+									{isCollapsed}
+									icon={Search}
+									label="Search"
+									class="!text-xs"
+									shortcut={`${getModifierKey()}k`}
+								/>
+							</div>
+
+							<SidebarContent {isCollapsed} />
+						</div>
+					</div>
 				</div>
 			</div>
-		</div>
-		<div class={classNames('w-full flex flex-col flex-1', isCollapsed ? 'md:pl-12' : 'md:pl-40')}>
+		{/if}
+		<div
+			id="content"
+			class={classNames(
+				'w-full flex flex-col flex-1 h-full',
+				devOnly || $userStore?.operator ? '!pl-0' : isCollapsed ? 'md:pl-12' : 'md:pl-40',
+				'transition-all ease-in-out duration-200'
+			)}
+		>
 			<main class="min-h-screen">
 				<div class="relative w-full h-full">
 					<div
-						class="py-2 px-2 sm:px-4 md:px-8 flex justify-between items-center shadow-sm max-w-6xl mx-auto md:hidden"
+						class={classNames(
+							'py-2 px-2 sm:px-4 md:px-8 flex justify-between items-center shadow-sm max-w-7xl mx-auto md:hidden',
+							devOnly || $userStore?.operator ? 'hidden' : ''
+						)}
 					>
 						<button
 							type="button"
 							on:click={() => {
 								menuOpen = true
 							}}
-							class="h-8 w-8 inline-flex items-center justify-center rounded-md text-gray-500 hover:text-gray-900 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-indigo-500"
+							class="h-8 w-8 inline-flex items-center justify-center rounded-md text-tertiary hover:text-primary focus:outline-none focus:ring-2 focus:ring-inset focus:ring-indigo-500"
 						>
 							<svg
 								class="h-6 w-6"

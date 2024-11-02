@@ -6,14 +6,10 @@ import {
   removeType,
 } from "./types.ts";
 import { requireLogin, resolveWorkspace, validatePath } from "./context.ts";
-import {
-  colors,
-  Command,
-  log,
-  Resource,
-  ResourceService,
-  Table,
-} from "./deps.ts";
+import { colors, Command, log, SEP, Table } from "./deps.ts";
+import * as wmill from "./gen/services.gen.ts";
+import { Resource } from "./gen/types.gen.ts";
+import { readInlinePathSync } from "./utils.ts";
 
 export interface ResourceFile {
   value: any;
@@ -26,28 +22,30 @@ export async function pushResource(
   workspace: string,
   remotePath: string,
   resource: ResourceFile | Resource | undefined,
-  localResource: ResourceFile,
-  raw: boolean
+  localResource: ResourceFile
 ): Promise<void> {
   remotePath = removeType(remotePath, "resource");
-  if (raw) {
-    try {
-      resource = await ResourceService.getResource({
-        workspace: workspace,
-        path: remotePath,
-      });
-    } catch {
-      // flow doesn't exist
-    }
+  try {
+    resource = await wmill.getResource({
+      workspace: workspace,
+      path: remotePath.replaceAll(SEP, "/"),
+    });
+  } catch {
+    // flow doesn't exist
+  }
+
+  if (localResource.value["content"]?.startsWith("!inline ")) {
+    const basePath = localResource.value["content"].split(" ")[1];
+    localResource.value["content"] = readInlinePathSync(basePath);
   }
   if (resource) {
     if (isSuperset(localResource, resource)) {
       return;
     }
 
-    await ResourceService.updateResource({
+    await wmill.updateResource({
       workspace: workspace,
-      path: remotePath,
+      path: remotePath.replaceAll(SEP, "/"),
       requestBody: { ...localResource },
     });
   } else {
@@ -60,10 +58,10 @@ export async function pushResource(
     }
 
     log.info(colors.yellow.bold("Creating new resource..."));
-    await ResourceService.createResource({
+    await wmill.createResource({
       workspace: workspace,
       requestBody: {
-        path: remotePath,
+        path: remotePath.replaceAll(SEP, "/"),
         ...localResource,
       },
     });
@@ -90,8 +88,7 @@ async function push(opts: PushOptions, filePath: string, remotePath: string) {
     workspace.workspaceId,
     remotePath,
     undefined,
-    parseFromFile(filePath),
-    true
+    parseFromFile(filePath)
   );
   log.info(colors.bold.underline.green(`Resource ${remotePath} pushed`));
 }
@@ -103,7 +100,7 @@ async function list(opts: GlobalOptions) {
   const perPage = 10;
   const total: Resource[] = [];
   while (true) {
-    const res = await ResourceService.listResource({
+    const res = await wmill.listResource({
       workspace: workspace.workspaceId,
       page,
       perPage,

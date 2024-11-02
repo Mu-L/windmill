@@ -6,83 +6,153 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-use anyhow::{Result};
-use const_format::concatcp;
-use itertools::Itertools;
-use once_cell::sync::OnceCell;
-use sqlx::{Pool, Postgres};
-use windmill_api_client::Client;
-use windmill_parser::Typ;
-use std::{
-    borrow::Borrow, collections::HashMap, io, os::unix::process::ExitStatusExt, panic,
-    process::Stdio, time::{Duration},
-    sync::{Arc, atomic::Ordering},
+use windmill_common::{
+    auth::{fetch_authed_from_permissioned_as, JWTAuthClaims, JobPerms, JWT_SECRET},
+    scripts::PREVIEW_IS_TAR_CODEBASE_HASH,
+    worker::{
+        get_memory, get_vcpus, get_windmill_memory_usage, get_worker_memory_usage, write_file,
+        ROOT_CACHE_DIR, TMP_DIR,
+    },
 };
-use tracing::{trace_span, Instrument};
+
+use anyhow::{Context, Result};
+use const_format::concatcp;
+#[cfg(feature = "prometheus")]
+use prometheus::IntCounter;
+
+use tracing::Instrument;
+#[cfg(feature = "prometheus")]
+use windmill_common::METRICS_DEBUG_ENABLED;
+#[cfg(feature = "prometheus")]
+use windmill_common::METRICS_ENABLED;
+
+use reqwest::Response;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sqlx::{types::Json, Pool, Postgres};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    fs::DirBuilder,
+    hash::Hash,
+    sync::{
+        atomic::{AtomicBool, AtomicU16, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
 use uuid::Uuid;
 
 use windmill_common::{
     error::{self, to_anyhow, Error},
-    flows::{FlowModuleValue, FlowValue},
-    scripts::{ScriptHash, ScriptLang, get_full_hub_script_by_path},
-    utils::{rd_string, StripPath},
-    variables, BASE_URL, users::SUPERADMIN_SECRET_EMAIL, METRICS_ENABLED, jobs::{JobKind, QueuedJob}, IS_READY,
+    get_latest_deployed_hash_for_path,
+    jobs::{JobKind, QueuedJob},
+    scripts::{get_full_hub_script_by_path, ScriptHash, ScriptLang, PREVIEW_IS_CODEBASE_HASH},
+    users::SUPERADMIN_SECRET_EMAIL,
+    utils::StripPath,
+    worker::{update_ping, CLOUD_HOSTED, NO_LOGS, WORKER_CONFIG, WORKER_GROUP},
+    DB, IS_READY,
 };
-use windmill_queue::{canceled_job_to_result, get_queued_job, pull, CLOUD_HOSTED, HTTP_CLIENT};
 
-use serde_json::{json, Value};
+use windmill_queue::{
+    append_logs, canceled_job_to_result, empty_result, pull, push, CanceledBy, PushArgs,
+    PushIsolationLevel, HTTP_CLIENT,
+};
+
+#[cfg(feature = "prometheus")]
+use windmill_queue::register_metric;
+
+use serde_json::value::RawValue;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use tokio::fs::symlink;
+
+#[cfg(target_os = "windows")]
+use tokio::fs::symlink_file as symlink;
 
 use tokio::{
-    fs::{metadata, symlink, DirBuilder, File},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
     sync::{
-        mpsc::{self, Sender},  watch, broadcast, RwLock, Barrier
+        mpsc::{self, Sender},
+        RwLock,
     },
-    time::{interval, sleep, Instant, MissedTickBehavior}, join
+    task::JoinHandle,
+    time::Instant,
 };
 
-use futures::{
-    future::{self, ready, FutureExt},
-    stream, StreamExt,
-};
-
-use async_recursion::async_recursion;
-
-#[cfg(feature = "enterprise")]
 use rand::Rng;
 
-#[cfg(feature = "enterprise")]
-use crate::global_cache::{copy_cache_to_tmp_cache, cache_global, copy_tmp_cache_to_cache, copy_denogo_cache_from_bucket_as_tar, copy_all_piptars_from_bucket};
-
 use crate::{
-    jobs::{add_completed_job, add_completed_job_error},
-    worker_flow::{
-        handle_flow, update_flow_status_after_job_completion, update_flow_status_in_progress,
-    }, python_executor::{create_dependencies_dir, pip_compile, handle_python_job, handle_python_reqs}, common::{read_result, set_logs}, go_executor::{handle_go_job, install_go_dependencies},
+    ansible_executor::handle_ansible_job,
+    bash_executor::{handle_bash_job, handle_powershell_job},
+    bun_executor::handle_bun_job,
+    common::{
+        build_args_map, get_cached_resource_value_if_valid, get_reserved_variables, hash_args,
+        update_worker_ping_for_failed_init_script, OccupancyMetrics,
+    },
+    deno_executor::handle_deno_job,
+    go_executor::handle_go_job,
+    graphql_executor::do_graphql,
+    handle_child::SLOW_LOGS,
+    handle_job_error,
+    job_logger::NO_LOGS_AT_ALL,
+    js_eval::{eval_fetch_timeout, transpile_ts},
+    mysql_executor::do_mysql,
+    pg_executor::do_postgresql,
+    php_executor::handle_php_job,
+    python_executor::handle_python_job,
+    result_processor::{process_result, start_background_processor},
+    rust_executor::handle_rust_job,
+    worker_flow::{handle_flow, update_flow_status_in_progress, Step},
+    worker_lockfiles::{
+        handle_app_dependency_job, handle_dependency_job, handle_flow_dependency_job,
+    },
 };
 
+#[cfg(feature = "enterprise")]
+use crate::dedicated_worker::create_dedicated_worker_map;
 
+#[cfg(feature = "enterprise")]
+use crate::{
+    bigquery_executor::do_bigquery, mssql_executor::do_mssql, snowflake_executor::do_snowflake,
+};
 
+#[cfg(feature = "benchmark")]
+use windmill_common::bench::{benchmark_init, BenchmarkInfo, BenchmarkIter};
 
-pub async fn create_token_for_owner_in_bg(db: &Pool<Postgres>, job: &QueuedJob) -> Arc<RwLock<String>> {
+use windmill_common::add_time;
+
+pub async fn create_token_for_owner_in_bg(
+    db: &Pool<Postgres>,
+    job: &QueuedJob,
+) -> Arc<RwLock<String>> {
     let rw_lock = Arc::new(RwLock::new(String::new()));
     // skipping test runs
     if job.workspace_id != "" {
         let mut locked = rw_lock.clone().write_owned().await;
         let db = db.clone();
-        let job = job.clone();
+        let w_id = job.workspace_id.clone();
+        let owner = job.permissioned_as.clone();
+        let email = job.email.clone();
+        let job_id = job.id.clone();
+
+        let label = if job.permissioned_as != format!("u/{}", job.created_by)
+            && job.permissioned_as != job.created_by
+        {
+            format!("ephemeral-script-end-user-{}", job.created_by)
+        } else {
+            "ephemeral-script".to_string()
+        };
         tokio::spawn(async move {
-            let job = job.clone();
             let token = create_token_for_owner(
                 &db.clone(),
-                &job.workspace_id,
-                &job.permissioned_as,
-                "ephemeral-script",
-                *SESSION_TOKEN_EXPIRY,
-                &job.email,
+                &w_id,
+                &owner,
+                &label,
+                *SCRIPT_TOKEN_EXPIRY,
+                &email,
+                &job_id,
             )
-            .await.expect("could not create job token");
+            .await
+            .expect("could not create job token");
             *locked = token;
         });
     };
@@ -95,67 +165,146 @@ pub async fn create_token_for_owner(
     w_id: &str,
     owner: &str,
     label: &str,
-    expires_in: i32,
+    expires_in: u64,
     email: &str,
+    job_id: &Uuid,
 ) -> error::Result<String> {
     // TODO: Bad implementation. We should not have access to this DB here.
-    let token: String = rd_string(30);
-    let is_super_admin = sqlx::query_scalar!("SELECT super_admin FROM password WHERE email = $1", email)
-            .fetch_optional(db)
-            .await?
-            .unwrap_or(false) || email == SUPERADMIN_SECRET_EMAIL;
+    if let Some(token) = JOB_TOKEN.as_ref() {
+        return Ok(token.clone());
+    }
 
-    sqlx::query_scalar!(
-        "INSERT INTO token
-            (workspace_id, token, owner, label, expiration, super_admin, email)
-            VALUES ($1, $2, $3, $4, now() + ($5 || ' seconds')::interval, $6, $7)",
-        &w_id,
-        token,
-        owner,
-        label,
-        expires_in.to_string(),
-        is_super_admin,
-        email
+    let jwt_secret = JWT_SECRET.read().await;
+
+    if jwt_secret.is_empty() {
+        return Err(Error::InternalErr("No JWT secret found".to_string()));
+    }
+
+    let job_authed = match sqlx::query_as!(
+        JobPerms,
+        "SELECT * FROM job_perms WHERE job_id = $1 AND workspace_id = $2",
+        job_id,
+        w_id
     )
-    .execute(db)
-    .await?;
-    Ok(token)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some(jp)) => jp.into(),
+        _ => {
+            tracing::warn!("Could not get permissions for job {job_id} from job_perms table, getting permissions directly...");
+            fetch_authed_from_permissioned_as(owner.to_string(), email.to_string(), w_id, db)
+                .await
+                .map_err(|e| {
+                    Error::InternalErr(format!(
+                        "Could not get permissions directly for job {job_id}: {e:#}"
+                    ))
+                })?
+        }
+    };
+
+    let payload = JWTAuthClaims {
+        email: job_authed.email,
+        username: job_authed.username,
+        is_admin: job_authed.is_admin,
+        is_operator: job_authed.is_operator,
+        groups: job_authed.groups,
+        folders: job_authed.folders,
+        label: Some(label.to_string()),
+        workspace_id: w_id.to_string(),
+        exp: (chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64)).timestamp()
+            as usize,
+        job_id: Some(job_id.to_string()),
+        scopes: None,
+    };
+
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &payload,
+        &jsonwebtoken::EncodingKey::from_secret(jwt_secret.as_bytes()),
+    )
+    .map_err(|err| {
+        Error::InternalErr(format!(
+            "Could not encode JWT token for job {job_id}: {:?}",
+            err
+        ))
+    })?;
+    Ok(format!("jwt_{}", token))
 }
 
-pub const TMP_DIR: &str = "/tmp/windmill";
-pub const ROOT_CACHE_DIR: &str = "/tmp/windmill/cache/";
-pub const ROOT_TMP_CACHE_DIR: &str = "/tmp/windmill/tmpcache/";
-pub const PIP_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "pip");
-pub const DENO_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "deno");
-pub const GO_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "go");
-pub const HUB_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "hub");
+pub const TMP_LOGS_DIR: &str = concatcp!(TMP_DIR, "/logs");
 
-pub const TAR_PIP_TMP_CACHE_DIR: &str = concatcp!(ROOT_TMP_CACHE_DIR, "tar/pip");
-pub const DENO_TMP_CACHE_DIR: &str = concatcp!(ROOT_TMP_CACHE_DIR, "deno");
-pub const GO_TMP_CACHE_DIR: &str = concatcp!(ROOT_TMP_CACHE_DIR, "go");
-pub const HUB_TMP_CACHE_DIR: &str = concatcp!(ROOT_TMP_CACHE_DIR, "hub");
+pub const ROOT_CACHE_NOMOUNT_DIR: &str = concatcp!(TMP_DIR, "/cache_nomount/");
+
+pub const LOCK_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "lock");
+pub const PIP_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "pip");
+pub const UV_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "uv");
+pub const TAR_PIP_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "tar/pip");
+pub const DENO_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "deno");
+pub const DENO_CACHE_DIR_DEPS: &str = concatcp!(ROOT_CACHE_DIR, "deno/deps");
+pub const DENO_CACHE_DIR_NPM: &str = concatcp!(ROOT_CACHE_DIR, "deno/npm");
+
+pub const GO_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "go");
+pub const RUST_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "rust");
+pub const BUN_CACHE_DIR: &str = concatcp!(ROOT_CACHE_NOMOUNT_DIR, "bun");
+pub const BUN_BUNDLE_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "bun");
+pub const BUN_DEPSTAR_CACHE_DIR: &str = concatcp!(ROOT_CACHE_NOMOUNT_DIR, "buntar");
+
+pub const GO_BIN_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "gobin");
+pub const POWERSHELL_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "powershell");
+pub const COMPOSER_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "composer");
 
 const NUM_SECS_PING: u64 = 5;
-
+const NUM_SECS_READINGS: u64 = 60;
 
 const INCLUDE_DEPS_PY_SH_CONTENT: &str = include_str!("../nsjail/download_deps.py.sh");
-const NSJAIL_CONFIG_RUN_BASH_CONTENT: &str = include_str!("../nsjail/run.bash.config.proto");
 
-
-#[derive(Clone)]
-pub struct Metrics {
-    pub worker_execution_failed: prometheus::IntCounter,
-}
-
-pub const DEFAULT_TIMEOUT: u64 = 900;
+pub const DEFAULT_CLOUD_TIMEOUT: u64 = 900;
+pub const DEFAULT_SELFHOSTED_TIMEOUT: u64 = 604800; // 7 days
 pub const DEFAULT_SLEEP_QUEUE: u64 = 50;
+
+// only 1 native job so that we don't have to worry about concurrency issues on non dedicated native jobs workers
+pub const DEFAULT_NATIVE_JOBS: usize = 1;
+
+const VACUUM_PERIOD: u32 = 50000;
+
+const DROP_CACHE_PERIOD: u32 = 1000;
+
+pub const MAX_BUFFERED_DEDICATED_JOBS: usize = 3;
+
+#[cfg(feature = "prometheus")]
+lazy_static::lazy_static! {
+
+    static ref WORKER_STARTED: Option<prometheus::IntGauge> = if METRICS_ENABLED.load(Ordering::Relaxed) { Some(prometheus::register_int_gauge!(
+        "worker_started",
+        "Total number of workers started."
+    )
+    .unwrap()) } else { None };
+
+    static ref WORKER_UPTIME_OPTS: prometheus::Opts = prometheus::opts!(
+        "worker_uptime",
+        "Total number of seconds since the worker has started"
+    );
+
+
+    pub static ref WORKER_EXECUTION_COUNT: Arc<RwLock<HashMap<String, IntCounter>>> = Arc::new(RwLock::new(HashMap::new()));
+    pub static ref WORKER_EXECUTION_DURATION_COUNTER: Arc<RwLock<HashMap<String, prometheus::Counter>>> = Arc::new(RwLock::new(HashMap::new()));
+
+    pub static ref WORKER_EXECUTION_DURATION: Arc<RwLock<HashMap<String, prometheus::Histogram>>> = Arc::new(RwLock::new(HashMap::new()));
+}
 
 lazy_static::lazy_static! {
 
-    static ref SLEEP_QUEUE: u64 = std::env::var("SLEEP_QUEUE")
+    pub static ref JOB_TOKEN: Option<String> = std::env::var("JOB_TOKEN").ok();
+
+    pub static ref SLEEP_QUEUE: u64 = std::env::var("SLEEP_QUEUE")
     .ok()
     .and_then(|x| x.parse::<u64>().ok())
-    .unwrap_or(DEFAULT_SLEEP_QUEUE);
+    .unwrap_or(DEFAULT_SLEEP_QUEUE * std::env::var("NUM_WORKERS")
+    .ok()
+    .map(|x| x.parse().ok())
+    .flatten()
+    .unwrap_or(2) / 2);
+
 
     pub static ref DISABLE_NUSER: bool = std::env::var("DISABLE_NUSER")
     .ok()
@@ -167,91 +316,108 @@ lazy_static::lazy_static! {
         .and_then(|x| x.parse::<bool>().ok())
         .unwrap_or(true);
 
-    pub static ref KEEP_JOB_DIR: bool = std::env::var("KEEP_JOB_DIR")
-    .ok()
-    .and_then(|x| x.parse::<bool>().ok())
-    .unwrap_or(false);
+    pub static ref KEEP_JOB_DIR: AtomicBool = AtomicBool::new(std::env::var("KEEP_JOB_DIR")
+        .ok()
+        .and_then(|x| x.parse::<bool>().ok())
+        .unwrap_or(false));
 
+    pub static ref NO_PROXY: Option<String> = std::env::var("no_proxy").ok().or(std::env::var("NO_PROXY").ok());
+    pub static ref HTTP_PROXY: Option<String> = std::env::var("http_proxy").ok().or(std::env::var("HTTP_PROXY").ok());
+    pub static ref HTTPS_PROXY: Option<String> = std::env::var("https_proxy").ok().or(std::env::var("HTTPS_PROXY").ok());
 
+    pub static ref PROXY_ENVS: Vec<(&'static str, String)> = {
+        let mut proxy_env = Vec::new();
+        if let Some(no_proxy) = NO_PROXY.as_ref() {
+            proxy_env.push(("NO_PROXY", no_proxy.to_string()));
+        }
+        if let Some(http_proxy) = HTTP_PROXY.as_ref() {
+            proxy_env.push(("HTTP_PROXY", http_proxy.to_string()));
+        }
+        if let Some(https_proxy) = HTTPS_PROXY.as_ref() {
+            proxy_env.push(("HTTPS_PROXY", https_proxy.to_string()));
+        }
+        proxy_env
+    };
     pub static ref DENO_PATH: String = std::env::var("DENO_PATH").unwrap_or_else(|_| "/usr/bin/deno".to_string());
+    pub static ref BUN_PATH: String = std::env::var("BUN_PATH").unwrap_or_else(|_| "/usr/bin/bun".to_string());
+    pub static ref NPM_PATH: String = std::env::var("NPM_PATH").unwrap_or_else(|_| "/usr/bin/npm".to_string());
+    pub static ref NODE_BIN_PATH: String = std::env::var("NODE_BIN_PATH").unwrap_or_else(|_| "/usr/bin/node".to_string());
+    pub static ref POWERSHELL_PATH: String = std::env::var("POWERSHELL_PATH").unwrap_or_else(|_| "/usr/bin/pwsh".to_string());
+    pub static ref PHP_PATH: String = std::env::var("PHP_PATH").unwrap_or_else(|_| "/usr/bin/php".to_string());
+    pub static ref COMPOSER_PATH: String = std::env::var("COMPOSER_PATH").unwrap_or_else(|_| "/usr/bin/composer".to_string());
     pub static ref NSJAIL_PATH: String = std::env::var("NSJAIL_PATH").unwrap_or_else(|_| "nsjail".to_string());
     pub static ref PATH_ENV: String = std::env::var("PATH").unwrap_or_else(|_| String::new());
-    pub static ref HOME_ENV: String = std::env::var("HOME").unwrap_or_else(|_| String::new());
+    pub static ref HOME_ENV: String = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    pub static ref NODE_PATH: Option<String> = std::env::var("NODE_PATH").ok();
+
+    pub static ref TZ_ENV: String = std::env::var("TZ").unwrap_or_else(|_| String::new());
     pub static ref GOPRIVATE: Option<String> = std::env::var("GOPRIVATE").ok();
     pub static ref GOPROXY: Option<String> = std::env::var("GOPROXY").ok();
     pub static ref NETRC: Option<String> = std::env::var("NETRC").ok();
 
-    static ref DENO_AUTH_TOKENS: String = std::env::var("DENO_AUTH_TOKENS")
-        .ok()
-        .map(|x| format!(";{x}"))
-        .unwrap_or_else(|| String::new());
 
-    static ref NPM_CONFIG_REGISTRY: Option<String> = std::env::var("NPM_CONFIG_REGISTRY").ok();
+    pub static ref NPM_CONFIG_REGISTRY: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    pub static ref BUNFIG_INSTALL_SCOPES: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-    static ref DENO_FLAGS: Option<Vec<String>> = std::env::var("DENO_FLAGS")
-        .ok()
-        .map(|x| x.split(' ').map(|x| x.to_string()).collect());
-        
+    pub static ref PIP_EXTRA_INDEX_URL: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    pub static ref PIP_INDEX_URL: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    pub static ref JOB_DEFAULT_TIMEOUT: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
 
-
-    static ref WHITELIST_WORKSPACES: Option<Vec<String>> = std::env::var("WHITELIST_WORKSPACES")
-        .ok()
-        .map(|x| x.split(',').map(|x| x.to_string()).collect());
-    static ref BLACKLIST_WORKSPACES: Option<Vec<String>>  = std::env::var("BLACKLIST_WORKSPACES")
-        .ok()
-        .map(|x| x.split(',').map(|x| x.to_string()).collect());
-
-    pub static ref TAR_CACHE_RATE: i32 = std::env::var("TAR_CACHE_RATE")
-        .ok()
-        .and_then(|x| x.parse::<i32>().ok())
-        .unwrap_or(100);
-
-    static ref WORKER_STARTED: prometheus::IntGauge = prometheus::register_int_gauge!(
-        "worker_started",
-        "Total number of workers started."
-    )
-    .unwrap();
-
-    static ref WORKER_UPTIME_OPTS: prometheus::Opts = prometheus::opts!(
-        "worker_uptime",
-        "Total number of seconds since the worker has started"
-    );
-
-    static ref TIMEOUT: u64 = std::env::var("TIMEOUT")
+    static ref MAX_TIMEOUT: u64 = std::env::var("TIMEOUT")
         .ok()
         .and_then(|x| x.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT);
+        .unwrap_or_else(|| if *CLOUD_HOSTED { DEFAULT_CLOUD_TIMEOUT } else { DEFAULT_SELFHOSTED_TIMEOUT });
 
-    static ref TIMEOUT_DURATION: Duration = Duration::from_secs(*TIMEOUT);
+    pub static ref MAX_WAIT_FOR_SIGINT: u64 = std::env::var("MAX_WAIT_FOR_SIGINT")
+        .ok()
+        .and_then(|x| x.parse::<u64>().ok())
+        .unwrap_or_else(|| 0);
 
-    pub static ref SESSION_TOKEN_EXPIRY: i32 = (*TIMEOUT as i32) * 2;
+    pub static ref MAX_WAIT_FOR_SIGTERM: u64 = std::env::var("MAX_WAIT_FOR_SIGTERM")
+        .ok()
+        .and_then(|x| x.parse::<u64>().ok())
+        .unwrap_or_else(|| 5);
+
+    pub static ref MAX_TIMEOUT_DURATION: Duration = Duration::from_secs(*MAX_TIMEOUT);
+
+    pub static ref SCRIPT_TOKEN_EXPIRY: u64 = std::env::var("SCRIPT_TOKEN_EXPIRY")
+        .ok()
+        .and_then(|x| x.parse::<u64>().ok())
+        .unwrap_or(*MAX_TIMEOUT);
 
     pub static ref GLOBAL_CACHE_INTERVAL: u64 = std::env::var("GLOBAL_CACHE_INTERVAL")
         .ok()
         .and_then(|x| x.parse::<u64>().ok())
         .unwrap_or(60 * 10);
 
-    pub static ref S3_CACHE_BUCKET: Option<String> = std::env::var("S3_CACHE_BUCKET")
-        .ok()
-        .map(|e| Some(e))
-        .unwrap_or(None);
-
 
     pub static ref EXIT_AFTER_NO_JOB_FOR_SECS: Option<u64> = std::env::var("EXIT_AFTER_NO_JOB_FOR_SECS")
         .ok()
         .and_then(|x| x.parse::<u64>().ok());
 
-    pub static ref CAN_PULL: Arc<RwLock<()>> = Arc::new(RwLock::new(()));
+
+    pub static ref REFRESH_CGROUP_READINGS: bool = std::env::var("REFRESH_CGROUP_READINGS")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(false);
+
+
+}
+
+#[cfg(windows)]
+lazy_static::lazy_static! {
+    pub static ref SYSTEM_ROOT: String = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
 }
 
 //only matter if CLOUD_HOSTED
 pub const MAX_RESULT_SIZE: usize = 1024 * 1024 * 2; // 2MB
 
+pub const INIT_SCRIPT_TAG: &str = "init_script";
+
 pub struct AuthedClientBackgroundTask {
     pub base_internal_url: String,
     pub workspace: String,
     pub token: Arc<RwLock<String>>,
-    pub client: OnceCell<Client>
 }
 
 impl AuthedClientBackgroundTask {
@@ -260,8 +426,8 @@ impl AuthedClientBackgroundTask {
             base_internal_url: self.base_internal_url.clone(),
             workspace: self.workspace.clone(),
             token: self.get_token().await,
-            client: self.client.clone()
-        }
+            force_client: None,
+        };
     }
     pub async fn get_token(&self) -> String {
         return self.token.read().await.clone();
@@ -272,29 +438,279 @@ pub struct AuthedClient {
     pub base_internal_url: String,
     pub workspace: String,
     pub token: String,
-    pub client: OnceCell<Client>
+    pub force_client: Option<reqwest::Client>,
 }
 
 impl AuthedClient {
-    pub fn get_client(&self) -> &Client {
-        return self.client.get_or_init(|| {
-            windmill_api_client::create_client(&self.base_internal_url, self.token.clone())
-        });
+    pub async fn get(&self, url: &str, query: Vec<(&str, String)>) -> anyhow::Result<Response> {
+        self.force_client
+            .as_ref()
+            .unwrap_or(&HTTP_CLIENT)
+            .get(url)
+            .query(&query)
+            .header(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            )
+            .header(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            )
+            .send()
+            .await
+            .context(format!(
+                "Executing request from authed http client to {url} with query {query:?}",
+            ))
+    }
+
+    pub async fn get_id_token(&self, audience: &str) -> anyhow::Result<String> {
+        let url = format!(
+            "{}/api/w/{}/oidc/token/{}",
+            self.base_internal_url, self.workspace, audience
+        );
+        let response = self.get(&url, vec![]).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<String>()
+                .await
+                .context("decoding oidc token as json string")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    pub async fn get_resource_value<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/resources/get_value/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let response = self.get(&url, vec![]).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<T>()
+                .await
+                .context("decoding resource value as json")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    pub async fn get_variable_value(&self, path: &str) -> anyhow::Result<String> {
+        let url = format!(
+            "{}/api/w/{}/variables/get_value/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let response = self.get(&url, vec![]).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<String>()
+                .await
+                .context("decoding variable value as json")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    pub async fn get_resource_value_interpolated<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        job_id: Option<String>,
+    ) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/resources/get_value_interpolated/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let mut query = Vec::with_capacity(1usize);
+        if let Some(v) = &job_id {
+            query.push(("job_id", v.to_string()));
+        }
+        let response = self.get(&url, query).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<T>()
+                .await
+                .context("decoding interpolated resource value as json")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    pub async fn get_completed_job_result<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        json_path: Option<String>,
+    ) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/jobs_u/completed/get_result/{}",
+            self.base_internal_url, self.workspace, path
+        );
+        let query = if let Some(json_path) = json_path {
+            vec![("json_path", json_path)]
+        } else {
+            vec![]
+        };
+        let response = self.get(&url, query).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<T>()
+                .await
+                .context("decoding completed job result as json")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
+    }
+
+    pub async fn get_result_by_id<T: DeserializeOwned>(
+        &self,
+        flow_job_id: &str,
+        node_id: &str,
+        json_path: Option<String>,
+    ) -> anyhow::Result<T> {
+        let url = format!(
+            "{}/api/w/{}/jobs/result_by_id/{}/{}",
+            self.base_internal_url, self.workspace, flow_job_id, node_id
+        );
+        let query = if let Some(json_path) = json_path {
+            vec![("json_path", json_path)]
+        } else {
+            vec![]
+        };
+        let response = self.get(&url, query).await?;
+        match response.status().as_u16() {
+            200u16 => Ok(response
+                .json::<T>()
+                .await
+                .context("decoding result by id as json")?),
+            _ => Err(anyhow::anyhow!(response.text().await.unwrap_or_default())),
+        }
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct JobCompletedSender(Sender<SendResult>);
 
+#[derive(Clone)]
+pub struct SameWorkerSender(pub Sender<SameWorkerPayload>, pub Arc<AtomicU16>);
+
+pub struct SameWorkerPayload {
+    pub job_id: Uuid,
+    pub recoverable: bool,
+}
+
+impl JobCompletedSender {
+    pub async fn send(
+        &self,
+        jc: JobCompleted,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<SendResult>> {
+        self.0.send(SendResult::JobCompleted(jc)).await
+    }
+}
+
+impl SameWorkerSender {
+    pub async fn send(
+        &self,
+        payload: SameWorkerPayload,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<SameWorkerPayload>> {
+        self.1.fetch_add(1, Ordering::Relaxed);
+        self.0.send(payload).await
+    }
+}
+
+// on linux, we drop caches every DROP_CACHE_PERIOD to avoid OOM killer believing we are using too much memory just because we create lots of files when executing jobs
+#[cfg(any(target_os = "linux"))]
+pub async fn drop_cache() {
+    tracing::info!("Syncing and dropping linux file caches to reduce memory usage");
+    // Run the sync command
+    if let Err(e) = tokio::process::Command::new("sync").status().await {
+        tracing::error!("Failed to run sync command: {}", e);
+        return;
+    }
+
+    // Open /proc/sys/vm/drop_caches for writing asynchronously
+    match tokio::fs::File::create("/proc/sys/vm/drop_caches").await {
+        Ok(mut file) => {
+            // Write '3' to the file to drop caches
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, b"3").await {
+                tracing::warn!("Failed to write to /proc/sys/vm/drop_caches (expected to not work in not in privileged mode, only required to forcefully drop the cache to avoid spurrious oom killer): {}", e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to open /proc/sys/vm/drop_caches (expected to not work in not in privileged mode, only required to forcefully drop the cache to avoid spurrious oom killer):: {}", e);
+        }
+    }
+}
+
+const OUTSTANDING_WAIT_TIME_THRESHOLD_MS: i64 = 1000;
+
+async fn insert_wait_time(
+    job_id: Uuid,
+    root_job_id: Option<Uuid>,
+    db: &Pool<Postgres>,
+    wait_time: i64,
+) -> sqlx::error::Result<()> {
+    sqlx::query!(
+        "INSERT INTO outstanding_wait_time(job_id, self_wait_time_ms) VALUES ($1, $2)
+            ON CONFLICT (job_id) DO UPDATE SET self_wait_time_ms = EXCLUDED.self_wait_time_ms",
+        job_id,
+        wait_time
+    )
+    .execute(db)
+    .await?;
+
+    if let Some(root_id) = root_job_id {
+        // TODO: queued_job.root_job is not guaranteed to be the true root job (e.g. parallel flow
+        // subflows). So this is currently incorrect for those cases
+        sqlx::query!(
+            "INSERT INTO outstanding_wait_time(job_id, aggregate_wait_time_ms) VALUES ($1, $2)
+                ON CONFLICT (job_id) DO UPDATE SET aggregate_wait_time_ms =
+                COALESCE(outstanding_wait_time.aggregate_wait_time_ms, 0) + EXCLUDED.aggregate_wait_time_ms",
+            root_id,
+            wait_time
+        )
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
+fn add_outstanding_wait_time(
+    queued_job: &QueuedJob,
+    db: &Pool<Postgres>,
+    waiting_threshold: i64,
+) -> () {
+    let wait_time;
+
+    if let Some(started_time) = queued_job.started_at {
+        wait_time = (started_time - queued_job.scheduled_for).num_milliseconds();
+    } else {
+        return;
+    }
+
+    if wait_time < waiting_threshold {
+        return;
+    }
+
+    let job_id = queued_job.id;
+    let root_job_id = queued_job.root_job;
+    let db = db.clone();
+
+    tokio::spawn(async move {
+            match insert_wait_time(job_id, root_job_id, &db, wait_time).await {
+                Ok(()) => tracing::warn!("job {job_id} waited for an executor for a significant amount of time. Recording value wait_time={}ms", wait_time),
+                Err(e) => tracing::error!("Failed to insert outstanding wait time: {}", e),
+            }
+    }.in_current_span());
+}
+
+#[tracing::instrument(name = "worker", level = "info", skip_all, fields(worker = %worker_name, hostname = %hostname))]
 pub async fn run_worker<R: rsmq_async::RsmqConnection + Send + Sync + Clone + 'static>(
     db: &Pool<Postgres>,
-    worker_instance: &str,
+    hostname: &str,
     worker_name: String,
     i_worker: u64,
-    num_workers: u32,
+    _num_workers: u32,
     ip: &str,
-    mut rx: tokio::sync::broadcast::Receiver<()>,
+    mut killpill_rx: tokio::sync::broadcast::Receiver<()>,
+    killpill_tx: tokio::sync::broadcast::Sender<()>,
     base_internal_url: &str,
     rsmq: Option<R>,
-    sync_barrier: Arc<RwLock<Option<Barrier>>>,
+    agent_mode: bool,
 ) {
     #[cfg(not(feature = "enterprise"))]
     if !*DISABLE_NSJAIL {
@@ -306,819 +722,1455 @@ pub async fn run_worker<R: rsmq_async::RsmqConnection + Send + Sync + Clone + 's
     let start_time = Instant::now();
 
     let worker_dir = format!("{TMP_DIR}/{worker_name}");
-    tracing::debug!(worker_dir = %worker_dir, worker_name = %worker_name, "Creating worker dir");
+    tracing::debug!(worker_dir = %worker_dir, "Creating worker dir");
+
+    if let Some(ref netrc) = *NETRC {
+        tracing::info!("Writing netrc at {}/.netrc", HOME_ENV.as_str());
+        write_file(&HOME_ENV, ".netrc", netrc).expect("could not write netrc");
+    }
 
     DirBuilder::new()
         .recursive(true)
         .create(&worker_dir)
-        .await
         .expect("could not create initial worker dir");
 
-    let _ = write_file(
-        &worker_dir,
-        "download_deps.py.sh",
-        INCLUDE_DEPS_PY_SH_CONTENT,
-    )
-    .await;
+    if !*DISABLE_NSJAIL {
+        let _ = write_file(
+            &worker_dir,
+            "download_deps.py.sh",
+            INCLUDE_DEPS_PY_SH_CONTENT,
+        );
+    }
 
     let mut last_ping = Instant::now() - Duration::from_secs(NUM_SECS_PING + 1);
 
-    insert_initial_ping(worker_instance, &worker_name, ip, db).await;
+    update_ping(hostname, &worker_name, ip, db).await;
 
-    let uptime_metric = prometheus::register_counter!(WORKER_UPTIME_OPTS
-        .clone()
-        .const_label("name", &worker_name))
-    .unwrap();
-
-
-    let all_langs = [
-        None, 
-        Some(ScriptLang::Python3),
-        Some(ScriptLang::Deno),
-        Some(ScriptLang::Go),
-        Some(ScriptLang::Bash)];
-
-    let worker_execution_duration: HashMap<_, _>  = all_langs.clone().into_iter().map(|x| (x.clone(), prometheus::register_histogram!(
-        prometheus::HistogramOpts::new(
-            "worker_execution_duration",
-            "Duration between receiving a job and completing it",
+    #[cfg(feature = "prometheus")]
+    let uptime_metric = if METRICS_ENABLED.load(Ordering::Relaxed) {
+        Some(
+            prometheus::register_counter!(WORKER_UPTIME_OPTS
+                .clone()
+                .const_label("name", &worker_name))
+            .unwrap(),
         )
-        .const_label("name", &worker_name)
-        .const_label("language", x.map(|x| x.as_str()).unwrap_or("none")))
-        .expect("register prometheus metric"))
-    ).collect();
+    } else {
+        None
+    };
 
-
-    let worker_execution_duration_counter: HashMap<_, _>  = all_langs.clone().into_iter().map(|x| (x.clone(), prometheus::register_counter!(
-        prometheus::Opts::new(
-            "worker_execution_duration_counter",
-            "Total number of seconds spent executing jobs"
+    #[cfg(feature = "prometheus")]
+    let worker_sleep_duration_counter = if METRICS_ENABLED.load(Ordering::Relaxed) {
+        Some(
+            prometheus::register_counter!(prometheus::opts!(
+                "worker_sleep_duration_counter",
+                "Total number of seconds spent sleeping between pulling jobs from the queue"
+            )
+            .const_label("name", &worker_name))
+            .expect("register prometheus metric"),
         )
-        .const_label("name", &worker_name)
-        .const_label("language", x.map(|x| x.as_str()).unwrap_or("none")))
-        .expect("register prometheus metric"))
-    ).collect();
+    } else {
+        None
+    };
 
+    #[cfg(feature = "prometheus")]
+    let worker_pull_duration = if METRICS_ENABLED.load(Ordering::Relaxed) {
+        Some(
+            prometheus::register_histogram!(prometheus::HistogramOpts::new(
+                "worker_pull_duration",
+                "Duration pulling next job",
+            )
+            .const_label("name", &worker_name)
+            .const_label("has_job", "true"),)
+            .expect("register prometheus metric"),
+        )
+    } else {
+        None
+    };
 
-    let worker_sleep_duration_counter = prometheus::register_counter!(prometheus::opts!(
-        "worker_sleep_duration_counter",
-        "Total number of seconds spent sleeping between pulling jobs from the queue"
-    )
-        .const_label("name", &worker_name))
-        .expect("register prometheus metric");
+    #[cfg(feature = "prometheus")]
+    let worker_pull_duration_empty = if METRICS_ENABLED.load(Ordering::Relaxed) {
+        Some(
+            prometheus::register_histogram!(prometheus::HistogramOpts::new(
+                "worker_pull_duration",
+                "Duration pulling next job",
+            )
+            .const_label("name", &worker_name)
+            .const_label("has_job", "false"),)
+            .expect("register prometheus metric"),
+        )
+    } else {
+        None
+    };
 
+    #[cfg(feature = "prometheus")]
+    let worker_save_completed_job_duration = if METRICS_DEBUG_ENABLED.load(Ordering::Relaxed)
+        && METRICS_ENABLED.load(Ordering::Relaxed)
+    {
+        Some(Arc::new(
+            prometheus::register_histogram!(prometheus::HistogramOpts::new(
+                "worker_save_duration",
+                "Duration sending job to completed job channel",
+            )
+            .const_label("name", &worker_name),)
+            .expect("register prometheus metric"),
+        ))
+    } else {
+        None
+    };
 
-    let worker_pull_duration = prometheus::register_histogram!(prometheus::HistogramOpts::new(
-        "worker_pull_duration",
-        "Duration pulling next job",
-    )
-    .const_label("name", &worker_name),)
-    .expect("register prometheus metric");
-
-    let worker_pull_duration_counter = prometheus::register_counter!(prometheus::opts!(
+    #[cfg(feature = "prometheus")]
+    let worker_pull_duration_counter_empty =
+        if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(
+                prometheus::register_counter!(prometheus::opts!(
         "worker_pull_duration_counter",
         "Total number of seconds spent pulling jobs (if growing large the db is undersized)"
     )
-        .const_label("name", &worker_name))
-        .expect("register prometheus metric");
+                .const_label("name", &worker_name)
+                .const_label("has_job", "false"))
+                .expect("register prometheus metric"),
+            )
+        } else {
+            None
+        };
 
-    let worker_execution_failed: HashMap<_, _>  = all_langs.clone().into_iter().map(|x| (x.clone(), prometheus::register_int_counter!(
-        prometheus::Opts::new(
-            "worker_execution_failed", "Number of failed jobs",
-        )
-        .const_label("name", &worker_name)
-        .const_label("language", x.map(|x| x.as_str()).unwrap_or("none")))
-        .expect("register prometheus metric"))
-    ).collect();
-
-
-    let worker_execution_count: HashMap<_, _> = all_langs.into_iter().map(|x| (x.clone(), prometheus::register_int_counter!(
-        prometheus::Opts::new(
-            "worker_execution_count", "Number of executed jobs"
-        )
-        .const_label("name", &worker_name)
-        .const_label("language", x.map(|x| x.as_str()).unwrap_or("none")))
-        .expect("register prometheus metric"))
-    ).collect();
-
-    let worker_busy: prometheus::IntGauge = prometheus::register_int_gauge!(prometheus::Opts::new(
-        "worker_busy",
-        "Is the worker busy executing a job?",
+    #[cfg(feature = "prometheus")]
+    let worker_pull_duration_counter = if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        Some(
+            prometheus::register_counter!(prometheus::opts!(
+        "worker_pull_duration_counter",
+        "Total number of seconds spent pulling jobs (if growing large the db is undersized)"
     )
-    .const_label("name", &worker_name))
-    .unwrap();
+            .const_label("name", &worker_name)
+            .const_label("has_job", "true"))
+            .expect("register prometheus metric"),
+        )
+    } else {
+        None
+    };
 
+    #[cfg(feature = "prometheus")]
+    let worker_pull_over_500_counter_empty =
+        if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(
+                prometheus::register_counter!(prometheus::opts!(
+                    "worker_pull_slow_counter",
+                    "Total number of pull being too slow (if growing large the db is undersized)"
+                )
+                .const_label("name", &worker_name)
+                .const_label("over", "500")
+                .const_label("has_job", "false"))
+                .expect("register prometheus metric"),
+            )
+        } else {
+            None
+        };
+
+    #[cfg(feature = "prometheus")]
+    let worker_pull_over_500_counter = if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        Some(
+            prometheus::register_counter!(prometheus::opts!(
+                "worker_pull_slow_counter",
+                "Total number of pull being too slow (if growing large the db is undersized)"
+            )
+            .const_label("name", &worker_name)
+            .const_label("over", "500")
+            .const_label("has_job", "true"))
+            .expect("register prometheus metric"),
+        )
+    } else {
+        None
+    };
+
+    #[cfg(feature = "prometheus")]
+    let worker_pull_over_100_counter_empty =
+        if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(
+                prometheus::register_counter!(prometheus::opts!(
+                    "worker_pull_slow_counter",
+                    "Total number of pull being too slow (if growing large the db is undersized)"
+                )
+                .const_label("name", &worker_name)
+                .const_label("over", "100")
+                .const_label("has_job", "false"))
+                .expect("register prometheus metric"),
+            )
+        } else {
+            None
+        };
+
+    #[cfg(feature = "prometheus")]
+    let worker_pull_over_100_counter = if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        Some(
+            prometheus::register_counter!(prometheus::opts!(
+                "worker_pull_slow_counter",
+                "Total number of pull being too slow (if growing large the db is undersized)"
+            )
+            .const_label("name", &worker_name)
+            .const_label("over", "100")
+            .const_label("has_job", "true"))
+            .expect("register prometheus metric"),
+        )
+    } else {
+        None
+    };
+
+    #[cfg(feature = "prometheus")]
+    let worker_busy: Option<prometheus::IntGauge> =
+        if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(
+                prometheus::register_int_gauge!(prometheus::Opts::new(
+                    "worker_busy",
+                    "Is the worker busy executing a job?",
+                )
+                .const_label("name", &worker_name))
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+
+    let mut occupancy_metrics = OccupancyMetrics::new(start_time);
     let mut jobs_executed = 0;
 
-    if *METRICS_ENABLED {
-        WORKER_STARTED.inc();
+    let is_dedicated_worker: bool = WORKER_CONFIG.read().await.dedicated_worker.is_some();
+
+    #[cfg(feature = "benchmark")]
+    let benchmark_jobs: i32 = std::env::var("BENCHMARK_JOBS")
+        .unwrap_or("5000".to_string())
+        .parse::<i32>()
+        .unwrap();
+
+    #[cfg(feature = "benchmark")]
+    benchmark_init(benchmark_jobs, &db).await;
+
+    #[cfg(feature = "prometheus")]
+    if let Some(ws) = WORKER_STARTED.as_ref() {
+        ws.inc();
     }
 
+    let (same_worker_tx, mut same_worker_rx) = mpsc::channel::<SameWorkerPayload>(5);
 
-    let (copy_to_bucket_tx, mut copy_to_bucket_rx) = mpsc::channel::<()>(2);
+    let (job_completed_tx, job_completed_rx) = mpsc::channel::<SendResult>(3);
 
-    let mut copy_cache_from_bucket_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let job_completed_tx = JobCompletedSender(job_completed_tx);
 
-    tracing::info!(worker = %worker_name, "starting worker");
+    let same_worker_queue_size = Arc::new(AtomicU16::new(0));
+    let same_worker_tx = SameWorkerSender(same_worker_tx, same_worker_queue_size.clone());
+    let job_completed_processor_is_done = Arc::new(AtomicBool::new(false));
 
-    #[cfg(feature = "enterprise")]
-    let mut last_sync =
-        Instant::now() + Duration::from_secs(rand::thread_rng().gen_range(0..*GLOBAL_CACHE_INTERVAL));
-
-    #[cfg(feature = "enterprise")]
-    let mut handles = Vec::with_capacity(2);
-
-    #[cfg(feature = "enterprise")]
-    if i_worker == 1 {
-        if let Some(ref s) = S3_CACHE_BUCKET.clone() {
-            let bucket = s.to_string();
-            let copy_to_bucket_tx2 = copy_to_bucket_tx.clone();
-            let worker_name2 = worker_name.clone();
-
-            handles.push(tokio::task::spawn(async move {
-                tracing::info!(worker = %worker_name2, "Started initial sync in background");
-                join!(copy_denogo_cache_from_bucket_as_tar(&bucket), copy_all_piptars_from_bucket(&bucket));
-                let _ = copy_to_bucket_tx2.send(()).await;
-            }));
-        }
-    }
-
-    let (same_worker_tx, mut same_worker_rx) = mpsc::channel::<Uuid>(5);
-
-    let (job_completed_tx, mut job_completed_rx) = mpsc::channel::<JobCompleted>(10);
-
-    let db2 = db.clone();
-    let rsmq2 = rsmq.clone();
-    let worker_name2 = worker_name.clone();
-    let send_result = tokio::spawn(async move {
-        while let Some(JobCompleted { job, logs, result}) = job_completed_rx.recv().await {
-            if let Err(e) = add_completed_job(&db2, &job, true, false, result, logs, rsmq2.clone()).await {
-                tracing::error!(worker = %worker_name2, "failed to add completed job: {}", e);
-            }
-        }
-    });
-    
-    tracing::info!(worker = %worker_name, "listening for jobs");
-    
-    let mut first_run = true;
+    let send_result = start_background_processor(
+        job_completed_rx,
+        job_completed_tx.0.clone(),
+        same_worker_queue_size.clone(),
+        job_completed_processor_is_done.clone(),
+        base_internal_url.to_string(),
+        db.clone(),
+        worker_dir.clone(),
+        same_worker_tx.clone(),
+        rsmq.clone(),
+        worker_name.clone(),
+        killpill_tx.clone(),
+        is_dedicated_worker,
+    );
 
     let mut last_executed_job: Option<Instant> = None;
+
+    #[cfg(feature = "benchmark")]
+    let mut started = false;
+
+    #[cfg(feature = "benchmark")]
+    let mut infos = BenchmarkInfo::new();
+
+    let vacuum_shift = rand::thread_rng().gen_range(0..VACUUM_PERIOD);
+
+    IS_READY.store(true, Ordering::Relaxed);
+    tracing::info!(
+        "listening for jobs, WORKER_GROUP: {}, config: {:?}",
+        *WORKER_GROUP,
+        WORKER_CONFIG.read().await
+    );
+
+    // (dedi_path, dedicated_worker_tx, dedicated_worker_handle)
+    // Option<Sender<Arc<QueuedJob>>>,
+    // Option<JoinHandle<()>>,
+
+    #[cfg(feature = "enterprise")]
+    let (dedicated_workers, is_flow_worker, dedicated_handles): (
+        HashMap<String, Sender<Arc<QueuedJob>>>,
+        bool,
+        Vec<JoinHandle<()>>,
+    ) = create_dedicated_worker_map(
+        &killpill_tx,
+        &killpill_rx,
+        db,
+        &worker_dir,
+        base_internal_url,
+        &worker_name,
+        &job_completed_tx,
+    )
+    .await;
+
+    #[cfg(not(feature = "enterprise"))]
+    let (dedicated_workers, is_flow_worker, dedicated_handles): (
+        HashMap<String, Sender<Arc<QueuedJob>>>,
+        bool,
+        Vec<JoinHandle<()>>,
+    ) = (HashMap::new(), false, vec![]);
+
+    if i_worker == 1 {
+        if let Err(e) =
+            queue_init_bash_maybe(db, same_worker_tx.clone(), &worker_name, rsmq.clone()).await
+        {
+            killpill_tx.send(()).unwrap_or_default();
+            tracing::error!("Error queuing init bash script for worker {worker_name}: {e:#}");
+            return;
+        }
+    }
+
+    #[cfg(feature = "prometheus")]
+    let worker_dedicated_channel_queue_send_duration = {
+        if is_dedicated_worker
+            && METRICS_DEBUG_ENABLED.load(Ordering::Relaxed)
+            && METRICS_ENABLED.load(Ordering::Relaxed)
+        {
+            Some(Arc::new(
+                prometheus::register_histogram!(prometheus::HistogramOpts::new(
+                    "worker_dedicated_worker_channel_send_duration",
+                    "Duration sending job to dedicated worker channel",
+                )
+                .const_label("name", &worker_name),)
+                .expect("register prometheus metric"),
+            ))
+        } else {
+            None
+        }
+    };
+    let mut suspend_first_success = false;
+    let mut last_reading = Instant::now() - Duration::from_secs(NUM_SECS_READINGS + 1);
+    let mut last_30jobs_suspended: Vec<bool> = vec![false; 30];
+    let mut last_suspend_first = Instant::now();
+    let mut killed_but_draining_same_worker_jobs = false;
+
     loop {
-        if *METRICS_ENABLED {
-            worker_busy.set(0);
-            uptime_metric.inc_by(
-                ((start_time.elapsed().as_millis() as f64)/1000.0 - uptime_metric.get())
+        #[cfg(feature = "benchmark")]
+        let mut bench = BenchmarkIter::new();
+
+        #[cfg(feature = "prometheus")]
+        if let Some(wk) = worker_busy.as_ref() {
+            wk.set(0);
+            tracing::debug!("set worker busy to 0");
+        }
+
+        occupancy_metrics.running_job_started_at = None;
+
+        #[cfg(feature = "prometheus")]
+        if let Some(ref um) = uptime_metric {
+            um.inc_by(
+                ((start_time.elapsed().as_millis() as f64) / 1000.0 - um.get())
                     .try_into()
                     .unwrap(),
             );
+            tracing::debug!("set uptime metric");
         }
 
-        #[cfg(feature = "enterprise")]
-        let copy_tx = copy_to_bucket_tx.clone();
+        if last_ping.elapsed().as_secs() > NUM_SECS_PING {
+            let tags = WORKER_CONFIG.read().await.worker_tags.clone();
 
-        let do_break = async {
-            if last_ping.elapsed().as_secs() > NUM_SECS_PING {
-                sqlx::query!(
-                    "UPDATE worker_ping SET ping_at = now(), jobs_executed = $1 WHERE worker = $2",
-                    jobs_executed,
-                    &worker_name
-                )
-                .execute(db)
-                .await
-                .expect("update worker ping");
+            let memory_usage = get_worker_memory_usage();
+            let wm_memory_usage = get_windmill_memory_usage();
 
-                last_ping = Instant::now();
-            }
-
-            #[cfg(feature = "enterprise")]
-            if i_worker == 1 && S3_CACHE_BUCKET.is_some() {
-                if last_sync.elapsed().as_secs() > *GLOBAL_CACHE_INTERVAL &&
-                    (copy_cache_from_bucket_handle.is_none() || copy_cache_from_bucket_handle.as_ref().unwrap().is_finished()) {
-
-                    tracing::debug!("CAN PULL LOCK START");
-                    let _lock = CAN_PULL.write().await;
-
-                    tracing::info!("Started syncing cache");
-                    last_sync = Instant::now();
-                    if num_workers > 1 {
-                        create_barrier_for_all_workers(num_workers, sync_barrier.clone()).await;
-                    }
-                    if let Err(e) = copy_cache_to_tmp_cache().await {
-                        tracing::error!("failed to copy cache to tmp cache: {}", e);
-                    } else {
-                        copy_cache_from_bucket_handle = Some(tokio::task::spawn(async move {
-                            if let Some(ref s) = S3_CACHE_BUCKET.clone() {
-                                if let Err(e) = cache_global(s, copy_tx).await { 
-                                    tracing::error!("failed to sync cache: {}", e);
-                                }
-                            }
-                        }));
-                    }
-                }
-            }
-
-            // The barrier is to avoid the sync to bucket syncing partial folders
-            #[cfg(feature = "enterprise")]
-            if num_workers > 1 && S3_CACHE_BUCKET.is_some()  {
-                let read_barrier = sync_barrier.read().await;
-                if let Some(b) = read_barrier.as_ref() {
-                    tracing::debug!("worker #{i_worker} waiting for barrier");
-                    b.wait().await;
-                    tracing::debug!("worker #{i_worker} done waiting for barrier");
-                    drop(read_barrier);
-                    // wait for barrier to be reset
-                    let _ = CAN_PULL.read().await;
-                    tracing::debug!("worker #{i_worker} done waiting for lock");
-                } else {
-                    tracing::debug!("worker #{i_worker} no barrier");
-                };
-            }
-            
-            let (do_break, next_job) = if first_run { 
-                (false, Ok(Some(QueuedJob::default())))
+            let (vcpus, memory) = if *REFRESH_CGROUP_READINGS
+                && last_reading.elapsed().as_secs() > NUM_SECS_READINGS
+            {
+                last_reading = Instant::now();
+                (get_vcpus(), get_memory())
             } else {
-                async {
-                    tokio::select! {
-                        biased;
-                        _ = rx.recv() => {
-                            #[cfg(feature = "enterprise")]
-                            if let Some(copy_cache_from_bucket_handle) = copy_cache_from_bucket_handle.as_ref() {
-                                if !copy_cache_from_bucket_handle.is_finished() {
-                                    copy_cache_from_bucket_handle.abort();
-                                }
-                            }
-                            #[cfg(feature = "enterprise")]
-                            for handle in &handles {
-                                if !handle.is_finished() {
-                                    handle.abort();
-                                }
-                            }
-                            println!("received killpill for worker {}", i_worker);
-                            (true, Ok(None))
-                        },
-                        _ = copy_to_bucket_rx.recv() => {
-                            tracing::debug!("can_pull lock start");
-                            let _lock = CAN_PULL.write().await;
-                            if num_workers > 1 {
-                                create_barrier_for_all_workers(num_workers, sync_barrier.clone()).await;
-                            }
-                            //Arc::new(tokio::sync::Barrier::new(num_workers as usize + 1));
-                            #[cfg(feature = "enterprise")]
-                            if let Err(e) = copy_tmp_cache_to_cache().await {
-                                tracing::error!(worker = %worker_name, "failed to sync tmp cache to cache: {}", e);
-                            }
-                            tracing::debug!("can_pull lock end");
-                            (false, Ok(None))
-                        },
-                        Some(job_id) = same_worker_rx.recv() => {
-                            (false, sqlx::query_as::<_, QueuedJob>("SELECT * FROM queue WHERE id = $1")
-                            .bind(job_id)
-                            .fetch_optional(db)
-                            .await
-                            .map_err(|_| Error::InternalErr("Impossible to fetch same_worker job".to_string())))
-                        },
-                        (job, timer) = {
-                            let timer = if *METRICS_ENABLED { Some(worker_pull_duration.start_timer()) } else { None }; 
-                            pull(&db, WHITELIST_WORKSPACES.clone(), BLACKLIST_WORKSPACES.clone(), rsmq.clone()).map(|x| (x, timer)) 
-                        } => {
-                            timer.map(|timer| {
-                                let duration_pull_s = timer.stop_and_record();
-                                worker_pull_duration_counter.inc_by(duration_pull_s);
-                            });
-                            (false, job)
-                        },
-                    }
-                }.await
+                (None, None)
             };
 
-            first_run = false;
-            IS_READY.store(true, Ordering::Relaxed);
+            let (occupancy_rate, occupancy_rate_15s, occupancy_rate_5m, occupancy_rate_30m) =
+                occupancy_metrics.update_occupancy_metrics();
 
-            if do_break {
-                return true;
+            if let Err(e) = sqlx::query!(
+                "UPDATE worker_ping SET ping_at = now(), jobs_executed = $1, custom_tags = $2,
+                 occupancy_rate = $3, memory_usage = $4, wm_memory_usage = $5, vcpus = COALESCE($7, vcpus),
+                 memory = COALESCE($8, memory), occupancy_rate_15s = $9, occupancy_rate_5m = $10, occupancy_rate_30m = $11 WHERE worker = $6",
+                jobs_executed,
+                tags.as_slice(),
+                occupancy_rate,
+                memory_usage,
+                wm_memory_usage,
+                &worker_name,
+                vcpus,
+                memory,
+                occupancy_rate_15s,
+                occupancy_rate_5m,
+                occupancy_rate_30m
+            ).execute(db).await {
+                tracing::error!("failed to update worker ping, exiting: {}", e);
+                killpill_tx.send(()).unwrap_or_default();
             }
-            if *METRICS_ENABLED {
-                worker_busy.set(1);
-            }
-            match next_job {
-                Ok(Some(job)) => {
-                    // println!("{:?}",  SystemTime::now());
+            tracing::info!(
+                "ping update, memory: container={}MB, windmill={}MB",
+                memory_usage.unwrap_or_default() / (1024 * 1024),
+                wm_memory_usage.unwrap_or_default() / (1024 * 1024)
+            );
 
-                    last_executed_job = None;
-                    
-                    let token = create_token_for_owner_in_bg(&db, &job).await;
-                    let language = job.language.clone();
-                    let _timer = worker_execution_duration
-                        .get(&language)
-                        .expect("no timer found")
-                        .start_timer();
+            last_ping = Instant::now();
+        }
 
-                    jobs_executed += 1;
-                    if *METRICS_ENABLED {
-                        worker_execution_count
-                            .get(&language)
-                            .expect("no timer found")
-                            .inc();
+        if (jobs_executed as u32 + vacuum_shift) % VACUUM_PERIOD == 0 {
+            let db2 = db.clone();
+            let current_span = tracing::Span::current();
+            tokio::task::spawn(
+                (async move {
+                    tracing::info!("vacuuming queue and completed_job");
+                    if let Err(e) = sqlx::query!("VACUUM (skip_locked) queue")
+                        .execute(&db2)
+                        .await
+                    {
+                        tracing::error!("failed to vacuum queue: {}", e);
                     }
+                    tracing::info!("vacuumed queue and completed_job");
+                })
+                .instrument(current_span),
+            );
+            jobs_executed += 1;
+        }
 
-                    let metrics = if *METRICS_ENABLED {
-                        Some(Metrics {
-                            worker_execution_failed: worker_execution_failed
-                                .get(&language)
-                                .expect("no timer found").clone(),
-                        }) 
-                    } else { None };
+        #[cfg(any(target_os = "linux"))]
+        if (jobs_executed as u32 + 1) % DROP_CACHE_PERIOD == 0 {
+            drop_cache().await;
+            jobs_executed += 1;
+        }
 
-                    let job_root = job.root_job.map(|x| x.to_string()).unwrap_or_else(|| "none".to_string());
+        #[cfg(feature = "benchmark")]
+        if benchmark_jobs > 0 && infos.iters == benchmark_jobs as u64 {
+            tracing::info!("benchmark finished, exiting");
+            job_completed_tx
+                .0
+                .send(SendResult::Kill)
+                .await
+                .expect("send kill to job completed tx");
+            break;
+        } else {
+            tracing::info!("benchmark not finished, still pulling jobs {}", infos.iters);
+        }
+
+        let next_job = {
+            // println!("2: {:?}",  instant.elapsed());
+            #[cfg(feature = "benchmark")]
+            if !started {
+                started = true
+            }
+
+            if let Ok(same_worker_job) = same_worker_rx.try_recv() {
+                same_worker_queue_size.fetch_sub(1, Ordering::SeqCst);
+                tracing::debug!(
+                    "received {} from same worker channel",
+                    same_worker_job.job_id
+                );
+                let r = sqlx::query_as::<_, QueuedJob>(
+                    "UPDATE queue SET last_ping = now() WHERE id = $1 RETURNING *",
+                )
+                .bind(same_worker_job.job_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|_| Error::InternalErr("Impossible to fetch same_worker job".to_string()));
+                if r.is_err() && !same_worker_job.recoverable {
+                    tracing::error!(
+                        "failed to fetch same_worker job on a non recoverable job, exiting"
+                    );
+                    job_completed_tx
+                        .0
+                        .send(SendResult::Kill)
+                        .await
+                        .expect("send kill to job completed tx");
+                    break;
+                } else {
+                    r
+                }
+            } else if let Ok(_) = killpill_rx.try_recv() {
+                if !killed_but_draining_same_worker_jobs {
+                    tracing::info!("received killpill for worker {}, jobs are not pulled anymore except same_worker jobs", i_worker);
+                    killed_but_draining_same_worker_jobs = true;
+                    job_completed_tx
+                        .0
+                        .send(SendResult::Kill)
+                        .await
+                        .expect("send kill to job completed tx");
+                }
+                continue;
+            } else if killed_but_draining_same_worker_jobs {
+                if job_completed_processor_is_done.load(Ordering::SeqCst) {
+                    tracing::info!("all running jobs have completed and all completed jobs have been fully processed, exiting");
+                    break;
+                } else {
+                    tracing::info!("there may be same_worker jobs to process later, waiting for job_completed_processor to finish progressing all remaining flows before exiting");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            } else {
+                let pull_time = Instant::now();
+                let likelihood_of_suspend =
+                    (1.0 + last_30jobs_suspended.iter().filter(|&&x| x).count() as f64) / 31.0;
+                let suspend_first = suspend_first_success
+                    || rand::random::<f64>() < likelihood_of_suspend
+                    || last_suspend_first.elapsed().as_secs_f64() > 5.0;
+
+                if suspend_first {
+                    last_suspend_first = Instant::now();
+                }
+
+                let job = pull(&db, rsmq.clone(), suspend_first).await;
+
+                add_time!(bench, "job pulled from DB");
+                let duration_pull_s = pull_time.elapsed().as_secs_f64();
+                let err_pull = job.is_ok();
+                // let empty = job.as_ref().is_ok_and(|x| x.is_none());
+
+                if !agent_mode && duration_pull_s > 0.5 {
+                    let empty = job.as_ref().is_ok_and(|x| x.0.is_none());
+                    tracing::warn!("pull took more than 0.5s ({duration_pull_s}), this is a sign that the database is VERY undersized for this load. empty: {empty}, err: {err_pull}");
+                    #[cfg(feature = "prometheus")]
+                    if empty {
+                        if let Some(wp) = worker_pull_over_500_counter_empty.as_ref() {
+                            wp.inc();
+                        }
+                    } else if let Some(wp) = worker_pull_over_500_counter.as_ref() {
+                        wp.inc();
+                    }
+                } else if !agent_mode && duration_pull_s > 0.1 {
+                    let empty = job.as_ref().is_ok_and(|x| x.0.is_none());
+                    tracing::warn!("pull took more than 0.1s ({duration_pull_s}) this is a sign that the database is undersized for this load. empty: {empty}, err: {err_pull}");
+                    #[cfg(feature = "prometheus")]
+                    if empty {
+                        if let Some(wp) = worker_pull_over_100_counter_empty.as_ref() {
+                            wp.inc();
+                        }
+                    } else if let Some(wp) = worker_pull_over_100_counter.as_ref() {
+                        wp.inc();
+                    }
+                }
+
+                if let Ok(j) = job.as_ref() {
+                    let suspend_success = j.1;
+                    if suspend_first {
+                        last_30jobs_suspended.push(suspend_success);
+                        if last_30jobs_suspended.len() > 30 {
+                            last_30jobs_suspended.remove(0);
+                        }
+                    }
+                    suspend_first_success = suspend_first && suspend_success;
+                    #[cfg(feature = "prometheus")]
+                    if j.0.is_some() {
+                        if let Some(wp) = worker_pull_duration_counter.as_ref() {
+                            wp.inc_by(duration_pull_s);
+                        }
+                        if let Some(wp) = worker_pull_duration.as_ref() {
+                            wp.observe(duration_pull_s);
+                        }
+                    } else {
+                        if let Some(wp) = worker_pull_duration_counter_empty.as_ref() {
+                            wp.inc_by(duration_pull_s);
+                        }
+                        if let Some(wp) = worker_pull_duration_empty.as_ref() {
+                            wp.observe(duration_pull_s);
+                        }
+                    }
+                }
+                job.map(|x| x.0)
+            }
+        };
+
+        match next_job {
+            Ok(Some(job)) => {
+                #[cfg(feature = "prometheus")]
+                if let Some(wb) = worker_busy.as_ref() {
+                    wb.set(1);
+                    tracing::debug!("set worker busy to 1");
+                }
+
+                occupancy_metrics.running_job_started_at = Some(Instant::now());
+
+                last_executed_job = None;
+                jobs_executed += 1;
+
+                tracing::debug!("started handling of job {}", job.id);
+
+                if matches!(job.job_kind, JobKind::Script | JobKind::Preview) {
+                    if !dedicated_workers.is_empty() {
+                        let key_o = if is_flow_worker {
+                            job.flow_step_id.as_ref().map(|x| x.to_string())
+                        } else {
+                            job.script_path.as_ref().map(|x| x.to_string())
+                        };
+                        if let Some(key) = key_o {
+                            if let Some(dedicated_worker_tx) = dedicated_workers.get(&key) {
+                                if let Err(e) = dedicated_worker_tx.send(Arc::new(job)).await {
+                                    tracing::info!("failed to send jobs to dedicated workers. Likely dedicated worker has been shut down. This is normal: {e:?}");
+                                }
+
+                                #[cfg(feature = "benchmark")]
+                                {
+                                    add_time!(bench, "sent to dedicated worker");
+                                    infos.add_iter(bench, true);
+                                }
+
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if matches!(job.job_kind, JobKind::Noop) {
+                    add_time!(bench, "send job completed START");
+                    job_completed_tx
+                        .send(JobCompleted {
+                            job: Arc::new(job),
+                            success: true,
+                            result: Arc::new(empty_result()),
+                            mem_peak: 0,
+                            cached_res_path: None,
+                            token: "".to_string(),
+                            canceled_by: None,
+                        })
+                        .await
+                        .expect("send job completed END");
+                    add_time!(bench, "sent job completed");
+                } else {
+                    let token = create_token_for_owner_in_bg(&db, &job).await;
+                    add_outstanding_wait_time(&job, db, OUTSTANDING_WAIT_TIME_THRESHOLD_MS);
+
+                    #[cfg(feature = "prometheus")]
+                    register_metric(
+                        &WORKER_EXECUTION_COUNT,
+                        &job.tag,
+                        |s| {
+                            let counter = prometheus::register_int_counter!(prometheus::Opts::new(
+                                "worker_execution_count",
+                                "Number of executed jobs"
+                            )
+                            .const_label("name", &worker_name)
+                            .const_label("tag", s))
+                            .expect("register prometheus metric");
+                            counter.inc();
+                            (counter, ())
+                        },
+                        |c| c.inc(),
+                    )
+                    .await;
+
+                    #[cfg(feature = "prometheus")]
+                    let _timer = register_metric(
+                        &WORKER_EXECUTION_DURATION,
+                        &job.tag,
+                        |s| {
+                            let counter =
+                                prometheus::register_histogram!(prometheus::HistogramOpts::new(
+                                    "worker_execution_duration",
+                                    "Duration between receiving a job and completing it",
+                                )
+                                .const_label("name", &worker_name)
+                                .const_label("tag", s))
+                                .expect("register prometheus metric");
+                            let t = counter.start_timer();
+                            (counter, t)
+                        },
+                        |c| c.start_timer(),
+                    )
+                    .await;
+
+                    let job_root = job
+                        .root_job
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "none".to_string());
 
                     if job.id == Uuid::nil() {
-                        tracing::info!(worker = %worker_name, "running warmup job");
+                        tracing::info!("running warmup job");
                     } else {
-                        tracing::info!(worker = %worker_name, workspace_id = %job.workspace_id, id = %job.id, root_id = %job_root, "fetched job {}, root job: {}", job.id, job_root);
-                    }
+                        tracing::info!(workspace_id = %job.workspace_id, job_id = %job.id, root_id = %job_root, "fetched job {}, root job: {}", job.id, job_root);
+                    } // Here we can't remove the job id, but maybe with the
+                      // fields macro we can make a job id that only appears when
+                      // the job is defined?
 
                     let job_dir = format!("{worker_dir}/{}", job.id);
 
                     DirBuilder::new()
+                        .recursive(true)
                         .create(&job_dir)
-                        .await
                         .expect("could not create job dir");
 
                     let same_worker = job.same_worker;
 
-                    let target = &format!("{job_dir}/shared");
+                    let folder = if job.language == Some(ScriptLang::Go) {
+                        DirBuilder::new()
+                            .recursive(true)
+                            .create(&format!("{job_dir}/go"))
+                            .expect("could not create go dir");
+                        "/go"
+                    } else {
+                        ""
+                    };
+
+                    let target = &format!("{job_dir}{folder}/shared");
 
                     if same_worker && job.parent_job.is_some() {
-                        let parent_flow = job.parent_job.unwrap();
-                        let parent_shared_dir = format!("{worker_dir}/{parent_flow}/shared");
-                        if metadata(&parent_shared_dir).await.is_err() {
+                        if tokio::fs::metadata(target).await.is_err() {
+                            let parent_flow = job.parent_job.unwrap();
+                            let parent_shared_dir = format!("{worker_dir}/{parent_flow}/shared");
                             DirBuilder::new()
                                 .recursive(true)
                                 .create(&parent_shared_dir)
-                                .await
                                 .expect("could not create parent shared dir");
+
+                            symlink(&parent_shared_dir, target)
+                                .await
+                                .expect("could not symlink target");
                         }
-                        symlink(&parent_shared_dir, target)
-                            .await
-                            .expect("could not symlink target");
                     } else {
                         DirBuilder::new()
+                            .recursive(true)
                             .create(target)
-                            .await
                             .expect("could not create shared dir");
                     }
 
-                    let authed_client = AuthedClientBackgroundTask { base_internal_url: base_internal_url.to_string(), token, workspace: job.workspace_id.to_string(), client: OnceCell::new() };
-                    let is_flow = job.job_kind == JobKind::Flow || job.job_kind == JobKind::FlowPreview || job.job_kind == JobKind::FlowDependencies;
+                    let authed_client = AuthedClientBackgroundTask {
+                        base_internal_url: base_internal_url.to_string(),
+                        token,
+                        workspace: job.workspace_id.to_string(),
+                    };
 
-                    if let Some(err) = handle_queued_job(
-                        job.clone(),
+                    #[cfg(feature = "prometheus")]
+                    let tag = job.tag.clone();
+
+                    let is_init_script: bool = job.tag.as_str() == INIT_SCRIPT_TAG;
+                    let arc_job = Arc::new(job);
+                    add_time!(bench, "handle_queued_job START");
+                    match handle_queued_job(
+                        arc_job.clone(),
                         db,
                         &authed_client,
+                        &hostname,
                         &worker_name,
                         &worker_dir,
                         &job_dir,
-                        metrics.clone(),
                         same_worker_tx.clone(),
                         base_internal_url,
                         rsmq.clone(),
                         job_completed_tx.clone(),
+                        &mut occupancy_metrics,
+                        #[cfg(feature = "benchmark")]
+                        &mut bench,
                     )
                     .await
-                    .err()
                     {
-                        handle_job_error(
-                            db,
-                            &authed_client.get_authed().await,
-                            job,
-                            err,
-                            metrics,
-                            false,
-                            same_worker_tx.clone(),
-                            &worker_dir,
-                            base_internal_url,
-                            rsmq.clone()
+                        Err(err) => {
+                            handle_job_error(
+                                db,
+                                &authed_client.get_authed().await,
+                                arc_job.as_ref(),
+                                0,
+                                None,
+                                err,
+                                false,
+                                same_worker_tx.clone(),
+                                &worker_dir,
+                                rsmq.clone(),
+                                &worker_name,
+                                (&job_completed_tx.0).clone(),
+                                #[cfg(feature = "benchmark")]
+                                &mut bench,
+                            )
+                            .await;
+                            if is_init_script {
+                                tracing::error!("init script job failed (in handler), exiting");
+                                update_worker_ping_for_failed_init_script(
+                                    db,
+                                    &worker_name,
+                                    arc_job.id,
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                        Ok(false) if is_init_script => {
+                            tracing::error!("init script job failed, exiting");
+                            update_worker_ping_for_failed_init_script(db, &worker_name, arc_job.id)
+                                .await;
+                            break;
+                        }
+                        _ => {}
+                    }
+
+                    #[cfg(feature = "prometheus")]
+                    if let Some(duration) = _timer.map(|x| x.stop_and_record()) {
+                        register_metric(
+                            &WORKER_EXECUTION_DURATION_COUNTER,
+                            &tag,
+                            |s| {
+                                let counter = prometheus::register_counter!(prometheus::Opts::new(
+                                    "worker_execution_duration_counter",
+                                    "Total number of seconds spent executing jobs"
+                                )
+                                .const_label("name", &worker_name)
+                                .const_label("tag", s))
+                                .expect("register prometheus metric");
+                                counter.inc_by(duration);
+                                (counter, ())
+                            },
+                            |c| c.inc_by(duration),
                         )
                         .await;
-                    };
+                    }
 
-                    let duration = _timer.stop_and_record();
-                    worker_execution_duration_counter
-                        .get(&language)
-                        .expect("no timer found").inc_by(duration);
-
-                    if !*KEEP_JOB_DIR && !(is_flow && same_worker) {
+                    if !KEEP_JOB_DIR.load(Ordering::Relaxed) && !(arc_job.is_flow() && same_worker)
+                    {
                         let _ = tokio::fs::remove_dir_all(job_dir).await;
                     }
                 }
-                Ok(None) => {
-                    if let Some(secs) = *EXIT_AFTER_NO_JOB_FOR_SECS {
-                        if let Some(lj) = last_executed_job {
-                            if lj.elapsed().as_secs() > secs {
-                                tracing::info!(worker = %worker_name, "no job for {} seconds, exiting", secs);
-                                return true;
-                            }
-                        } else  {
-                            last_executed_job = Some(Instant::now());
-                        }
-                    }
-                    let _timer =  if *METRICS_ENABLED { Some(Instant::now()) } else { None };
-                    tokio::time::sleep(Duration::from_millis(*SLEEP_QUEUE)).await;
-                    _timer.map(|timer| {
-                        let duration = timer.elapsed().as_secs_f64();
-                        worker_sleep_duration_counter.inc_by(duration);
-                    });
-                }
-                Err(err) => {
-                    tracing::error!(worker = %worker_name, "Failed to pull jobs: {}", err);
-                }
-            };
 
-            false
+                #[cfg(feature = "benchmark")]
+                {
+                    if started {
+                        add_time!(bench, "job processed");
+                        infos.add_iter(bench, true);
+                    }
+                }
+            }
+            Ok(None) => {
+                if let Some(secs) = *EXIT_AFTER_NO_JOB_FOR_SECS {
+                    if let Some(lj) = last_executed_job {
+                        if lj.elapsed().as_secs() > secs {
+                            tracing::info!("no job for {} seconds, exiting", secs);
+                            break;
+                        }
+                    } else {
+                        last_executed_job = Some(Instant::now());
+                    }
+                }
+
+                #[cfg(feature = "prometheus")]
+                let _timer = if METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+
+                tokio::time::sleep(Duration::from_millis(*SLEEP_QUEUE)).await;
+
+                #[cfg(feature = "benchmark")]
+                {
+                    add_time!(bench, "sleep because empty job queue");
+                    infos.add_iter(bench, false);
+                }
+                #[cfg(feature = "prometheus")]
+                _timer.map(|timer| {
+                    let duration = timer.elapsed().as_secs_f64();
+                    if let Some(ws) = worker_sleep_duration_counter.as_ref() {
+                        ws.inc_by(duration);
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::error!("Failed to pull jobs: {}", err);
+            }
+        };
+    }
+
+    tracing::info!("worker {} exiting", worker_name);
+
+    #[cfg(feature = "benchmark")]
+    {
+        infos
+            .write_to_file("profiling_main.json")
+            .expect("write to file profiling");
+    }
+
+    drop(dedicated_workers);
+
+    let has_dedicated_workers = !dedicated_handles.is_empty();
+    if has_dedicated_workers {
+        for handle in dedicated_handles {
+            if let Err(e) = handle.await {
+                tracing::error!("error in dedicated worker waiting for it to end: {:?}", e)
+            }
         }
-        .instrument(trace_span!("worker_loop_iteration"))
-        .await;
-        if do_break {
-            break;
-        }
+        tracing::info!("all dedicated workers have exited");
     }
 
     drop(job_completed_tx);
 
-    send_result.await.expect("send result failed");
-
-}
-
-pub async fn create_barrier_for_all_workers(num_workers: u32, sync_barrier: Arc<RwLock<Option<tokio::sync::Barrier>>>) {
-    tracing::debug!("acquiring write lock");
-    let mut barrier = sync_barrier.write().await;
-    *barrier = Some(tokio::sync::Barrier::new(num_workers as usize));
-    drop(barrier);
-    tracing::debug!("dropped write lock");
-    if let Some(b) = sync_barrier.read().await.as_ref() {
-        tracing::debug!("leader worker waiting for barrier");
-        b.wait().await;
-        tracing::debug!("leader worker done waiting for barrier");
-    };
-    let mut barrier = sync_barrier.write().await;
-    *barrier = None;
-    tracing::debug!("leader worker done waiting for");
-}
-pub async fn handle_job_error<R: rsmq_async::RsmqConnection + Send + Sync + Clone>(
-    db: &Pool<Postgres>,
-    client: &AuthedClient,
-    job: QueuedJob,
-    err: Error,
-    metrics: Option<Metrics>,
-    unrecoverable: bool,
-    same_worker_tx: Sender<Uuid>,
-    worker_dir: &str,
-    base_internal_url: &str,
-    rsmq: Option<R>,
-) {
-    let err = match err {
-        Error::JsonErr(err) => err,
-        _ => json!({"message": err.to_string(), "name": "InternalErr"}),
-    };
-
-    let rsmq_2 = rsmq.clone();
-    let update_job_future = || {
-        add_completed_job_error(
-            db,
-            &job,
-            format!("Unexpected error during job execution:\n{err}"),
-            err.clone(),
-            metrics.clone(),
-            rsmq_2,
-        )
-    };
-
-    let update_job_future = if job.is_flow_step || job.job_kind == JobKind::FlowPreview || job.job_kind == JobKind::Flow {
-        let (flow, job_status_to_update, update_job_future) = if let Some(parent_job_id) = job.parent_job {
-            let _ = update_job_future().await;
-            (parent_job_id, job.id, None)
-        } else {
-            (job.id, Uuid::nil(), Some(update_job_future))
-        };
-
-        let updated_flow = update_flow_status_after_job_completion(
-            db,
-            client,
-            flow,
-            &job_status_to_update,
-            &job.workspace_id,
-            false,
-            json!({ "error": err }),
-            metrics.clone(),
-            unrecoverable,
-            same_worker_tx,
-            worker_dir,
-            None,
-            base_internal_url,
-            rsmq.clone(),
-        )
-        .await;
-
-        if let Err(err) = updated_flow {
-            if let Some(parent_job_id) = job.parent_job {
-                if let Ok(mut tx) = db.begin().await {
-                    if let Ok(Some(parent_job)) =
-                        get_queued_job(parent_job_id, &job.workspace_id, &mut tx).await
-                    {
-                        let _ = add_completed_job_error(
-                            db,
-                            &parent_job,
-                            format!("Unexpected error during flow job error handling:\n{err}"),
-                            json!({"message": err.to_string(), "name": "InternalErr"}),
-                            metrics.clone(),
-                            rsmq,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-
-        update_job_future
-    } else {
-        Some(update_job_future)
-    };
-    if let Some(f) = update_job_future {
-        let _ = f().await;
+    if let Err(e) = send_result.await {
+        tracing::error!("error in awaiting send_result process: {e:?}")
     }
-    tracing::error!(job_id = %job.id, "error handling job: {err:?} {} {} {}", job.id, job.workspace_id, job.created_by);
+    tracing::info!("worker {} exited", worker_name);
+    tracing::info!("number of jobs executed: {}", jobs_executed);
 }
 
-async fn insert_initial_ping(
-    worker_instance: &str,
-    worker_name: &str,
-    ip: &str,
+async fn queue_init_bash_maybe<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
     db: &Pool<Postgres>,
-) {
-    sqlx::query!(
-        "INSERT INTO worker_ping (worker_instance, worker, ip) VALUES ($1, $2, $3) ON CONFLICT (worker) DO NOTHING",
-        worker_instance,
-        worker_name,
-        ip
-    )
-    .execute(db)
-    .await
-    .expect("insert worker_ping initial value");
+    same_worker_tx: SameWorkerSender,
+    worker_name: &str,
+    rsmq: Option<R>,
+) -> error::Result<bool> {
+    if let Some(content) = WORKER_CONFIG.read().await.init_bash.clone() {
+        let tx = PushIsolationLevel::IsolatedRoot(db.clone(), rsmq);
+        let ehm = HashMap::new();
+        let (uuid, inner_tx) = push(
+            &db,
+            tx,
+            "admins",
+            windmill_common::jobs::JobPayload::Code(windmill_common::jobs::RawCode {
+                hash: None,
+                content: content.clone(),
+                path: Some(format!("init_script_{worker_name}")),
+                language: ScriptLang::Bash,
+                lock: None,
+                custom_concurrency_key: None,
+                concurrent_limit: None,
+                concurrency_time_window_s: None,
+                cache_ttl: None,
+                dedicated_worker: None,
+            }),
+            PushArgs::from(&ehm),
+            worker_name,
+            "worker@windmill.dev",
+            SUPERADMIN_SECRET_EMAIL.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            true,
+            Some("init_script".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        inner_tx.commit().await?;
+        same_worker_tx
+            .send(SameWorkerPayload { job_id: uuid, recoverable: false })
+            .await
+            .map_err(to_anyhow)?;
+        tracing::info!("Creating initial job {uuid} from initial script script: {content}");
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
-
-fn extract_error_value(log_lines: &str, i: i32) -> serde_json::Value {
-    return json!({"message": format!("ExitCode: {i}, last log lines:\n{}", log_lines.to_string().trim().to_string()), "name": "ExecutionErr"});
+pub enum SendResult {
+    JobCompleted(JobCompleted),
+    UpdateFlow {
+        flow: Uuid,
+        w_id: String,
+        success: bool,
+        result: Box<RawValue>,
+        worker_dir: String,
+        stop_early_override: Option<bool>,
+        token: String,
+    },
+    Kill,
 }
 
 #[derive(Debug, Clone)]
-struct JobCompleted {
-    job: QueuedJob,
-    result: serde_json::Value,
-    logs: String,
+pub struct JobCompleted {
+    pub job: Arc<QueuedJob>,
+    pub result: Arc<Box<RawValue>>,
+    pub mem_peak: i32,
+    pub success: bool,
+    pub cached_res_path: Option<String>,
+    pub token: String,
+    pub canceled_by: Option<CanceledBy>,
 }
-#[tracing::instrument(level = "trace", skip_all)]
-async fn handle_queued_job<R: rsmq_async::RsmqConnection + Send + Sync + Clone>(
-    job: QueuedJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
+
+async fn do_nativets(
+    job: &QueuedJob,
     client: &AuthedClientBackgroundTask,
+    env_code: String,
+    code: String,
+    db: &Pool<Postgres>,
+    mem_peak: &mut i32,
+    canceled_by: &mut Option<CanceledBy>,
+    worker_name: &str,
+    occupancy_metrics: &mut OccupancyMetrics,
+) -> windmill_common::error::Result<(Box<RawValue>, String)> {
+    let args = build_args_map(job, client, db).await?.map(Json);
+    let job_args = if args.is_some() {
+        args.as_ref()
+    } else {
+        job.args.as_ref()
+    };
+
+    let result = eval_fetch_timeout(
+        env_code,
+        code.clone(),
+        transpile_ts(code)?,
+        job_args,
+        job.id,
+        job.timeout,
+        db,
+        mem_peak,
+        canceled_by,
+        worker_name,
+        &job.workspace_id,
+        true,
+        occupancy_metrics,
+    )
+    .await?;
+    Ok((result.0, result.1))
+}
+
+#[derive(Deserialize, Serialize, Default)]
+pub struct PreviousResult<'a> {
+    #[serde(borrow)]
+    pub previous_result: Option<&'a RawValue>,
+}
+
+#[tracing::instrument(name = "job", level = "info", skip_all, fields(job_id = %job.id))]
+async fn handle_queued_job<R: rsmq_async::RsmqConnection + Send + Sync + Clone>(
+    job: Arc<QueuedJob>,
+    db: &DB,
+    client: &AuthedClientBackgroundTask,
+    hostname: &str,
     worker_name: &str,
     worker_dir: &str,
     job_dir: &str,
-    metrics: Option<Metrics>,
-    same_worker_tx: Sender<Uuid>,
+    same_worker_tx: SameWorkerSender,
     base_internal_url: &str,
     rsmq: Option<R>,
-    job_completed_tx: Sender<JobCompleted>,
-) -> windmill_common::error::Result<()> {
+    job_completed_tx: JobCompletedSender,
+    occupancy_metrics: &mut OccupancyMetrics,
+    #[cfg(feature = "benchmark")] bench: &mut BenchmarkIter,
+) -> windmill_common::error::Result<bool> {
     if job.canceled {
-        return Err(Error::JsonErr(canceled_job_to_result(&job)))?;
+        return Err(Error::JsonErr(canceled_job_to_result(&job)));
     }
-    if let Some(e) = job.pre_run_error {
-        return Err(Error::ExecutionErr(e));
+    if let Some(e) = &job.pre_run_error {
+        return Err(Error::ExecutionErr(e.to_string()));
     }
 
-    match job.job_kind {
-        JobKind::FlowPreview | JobKind::Flow => {
-            let args = job.args.clone().unwrap_or(Value::Null);
-            handle_flow(
-                &job,
-                db,
-                &client.get_authed().await,
-                args,
-                same_worker_tx,
-                worker_dir,
-                base_internal_url,
-                rsmq,
-            )
-            .await?;
-        }
-        _ => {
-            let mut logs = "".to_string();
-            // println!("handle queue {:?}",  SystemTime::now());
-            if let Some(log_str) = &job.logs {
-                logs.push_str(&log_str);
-            }
+    #[cfg(any(not(feature = "enterprise"), feature = "sqlx"))]
+    if job.created_by.starts_with("email-") {
+        let daily_count = sqlx::query!(
+            "SELECT value FROM metrics WHERE id = 'email_trigger_usage' AND created_at > NOW() - INTERVAL '1 day' ORDER BY created_at DESC LIMIT 1"
+        ).fetch_optional(db).await?.map(|x| serde_json::from_value::<i64>(x.value).unwrap_or(1));
 
-            if job.is_flow_step {
-                update_flow_status_in_progress(
-                    db,
-                    &job.workspace_id,
-                    job.parent_job
-                        .ok_or_else(|| Error::InternalErr(format!("expected parent job")))?,
-                    job.id,
+        if let Some(count) = daily_count {
+            if count >= 100 {
+                return Err(error::Error::QuotaExceeded(format!(
+                    "Email trigger usage limit of 100 per day has been reached."
+                )));
+            } else {
+                sqlx::query!(
+                    "UPDATE metrics SET value = $1 WHERE id = 'email_trigger_usage' AND created_at > NOW() - INTERVAL '1 day'",
+                    serde_json::json!(count + 1)
                 )
+                .execute(db)
                 .await?;
             }
-
-            tracing::debug!(
-                worker = %worker_name,
-                job_id = %job.id,
-                workspace_id = %job.workspace_id,
-                "handling job {}",
-                job.id
-            );
-
-            logs.push_str(&format!("job {} on worker {}\n", &job.id, &worker_name));
-            let result = match job.job_kind {
-                JobKind::Dependencies => {
-                    handle_dependency_job(&job, &mut logs, job_dir, db, worker_name, worker_dir).await
-                }
-                JobKind::FlowDependencies => {
-                    handle_flow_dependency_job(&job, &mut logs, job_dir, db, worker_name, worker_dir)
-                        .await
-                        .map(|()| Value::Null)
-                }
-                JobKind::Identity => match job.args.clone() {
-                    Some(Value::Object(args))
-                        if args.len() == 1 && args.contains_key("previous_result") =>
-                    {
-                        Ok(args.get("previous_result").unwrap().clone())
-                    }
-                    args @ _ => Ok(args.unwrap_or_else(|| Value::Null)),
-                },
-                _ => {
-                    handle_code_execution_job(
-                        &job,
-                        db,
-                        client,
-                        job_dir,
-                        worker_dir,
-                        &mut logs,
-                        base_internal_url,
-                        worker_name
-                    )
-                    .await
-                }
-            };
-
-            //it's a test job, no need to update the db
-            if job.workspace_id == "" {
-                return Ok(());
-            }
-            let client = &client.get_authed().await;
-            match result {
-                Ok(r) => {
-                    // println!("bef completed job{:?}",  SystemTime::now());
-                    if job.is_flow_step {
-                        add_completed_job(db, &job, true, false, r.clone(), logs, rsmq.clone()).await?;
-                        if let Some(parent_job) = job.parent_job {
-                            update_flow_status_after_job_completion(
-                                db,
-                                client,
-                                parent_job,
-                                &job.id,
-                                &job.workspace_id,
-                                true,
-                                r,
-                                metrics.clone(),
-                                false,
-                                same_worker_tx.clone(),
-                                worker_dir,
-                                None,
-                                base_internal_url,
-                                rsmq.clone()
-                            )
-                            .await?;
-                        }
-                    } else {
-                        // in the happy path and if job not a flow step, we can delegate updating the completed job in the background
-                        job_completed_tx.send(JobCompleted{job,result:r,logs:logs,}).await.expect("send job completed");
-                        
-                    }
-                }
-                Err(e) => {
-                    let error_value = match e {
-                        Error::ExitStatus(i) => {
-                            let res = read_result(job_dir).await.ok();
-
-                            if res.is_some() && res.clone().unwrap().is_object() {
-                                res.unwrap()
-                            } else {
-                                let last_10_log_lines = logs
-                                    .lines()
-                                    .skip(logs.lines().count().max(13) - 13)
-                                    .join("\n")
-                                    .to_string()
-                                    .replace("\n\n", "\n");
-
-                                let log_lines = last_10_log_lines
-                                    .split("CODE EXECUTION ---")
-                                    .last()
-                                    .unwrap_or(&logs);
-
-                                extract_error_value(log_lines, i)
-                            }
-                        }
-                        err @ _ => {
-                            json!({"message": format!("error during execution of the script:\n{}", err), "name": "ExecutionErr"})
-                        }
-                    };
-
-                    let result =
-                        add_completed_job_error(db, &job, logs, error_value, metrics.clone(), rsmq.clone())
-                            .await?;
-                    if job.is_flow_step {
-                        if let Some(parent_job) = job.parent_job {
-                            update_flow_status_after_job_completion(
-                                db,
-                                client,
-                                parent_job,
-                                &job.id,
-                                &job.workspace_id,
-                                false,
-                                result,
-                                metrics,
-                                false,
-                                same_worker_tx,
-                                worker_dir,
-                                None,
-                                base_internal_url,
-                                rsmq
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            };
+        } else {
+            sqlx::query!(
+                "INSERT INTO metrics (id, value) VALUES ('email_trigger_usage', to_jsonb(1))"
+            )
+            .execute(db)
+            .await?;
         }
     }
-    Ok(())
-}
 
-#[tracing::instrument(level = "trace", skip_all)]
-pub async fn write_file(dir: &str, path: &str, content: &str) -> error::Result<File> {
-    let path = format!("{}/{}", dir, path);
-    let mut file = File::create(&path).await?;
-    file.write_all(content.as_bytes()).await?;
-    file.flush().await?;
-    Ok(file)
-}
+    let step = if job.is_flow_step {
+        let r = update_flow_status_in_progress(
+            db,
+            &job.workspace_id,
+            job.parent_job
+                .ok_or_else(|| Error::InternalErr(format!("expected parent job")))?,
+            job.id,
+        )
+        .await?;
 
-#[async_recursion]
-async fn transform_json_value(
-    name: &str,
-    client: &AuthedClient,
-    workspace: &str,
-    v: Value,
-) -> error::Result<Value> {
-    match v {
-        Value::String(y) if y.starts_with("$var:") => {
-            let path = y.strip_prefix("$var:").unwrap();
-            let v = client.get_client()
-                .get_variable(workspace, path, Some(true))
-                .await
-                .map_err(|_| Error::NotFound(format!("Variable {path} not found for `{name}`")))
-                .map(|v| v.into_inner())?
-                .value
-                .unwrap_or_else(|| String::new());
-            Ok(Value::String(v))
-        }
-        Value::String(y) if y.starts_with("$res:") => {
-            let path = y.strip_prefix("$res:").unwrap();
-            if path.split("/").count() < 2 {
-                return Err(Error::InternalErr(format!(
-                    "Argument `{name}` is an invalid resource path: {path}",
-                )));
+        Some(r)
+    } else {
+        if let Some(parent_job) = job.parent_job {
+            if let Err(e) = sqlx::query_scalar!(
+                "UPDATE queue SET flow_status = jsonb_set(jsonb_set(COALESCE(flow_status, '{}'::jsonb), array[$1], COALESCE(flow_status->$1, '{}'::jsonb)), array[$1, 'started_at'], to_jsonb(now()::text)) WHERE id = $2 AND workspace_id = $3",
+                &job.id.to_string(),
+                parent_job,
+                &job.workspace_id
+            )
+            .execute(db)
+            .await {
+                tracing::error!("Could not update parent job started_at flow_status: {}", e);
             }
-            let v = client.get_client()
-                .get_resource_value(workspace, path)
-                .await
-                .map_err(|_| Error::NotFound(format!("Resource {path} not found for `{name}`")))?
-                .into_inner();
-            transform_json_value(name, client, workspace, v).await
         }
-        Value::Object(mut m) => {
-            for (a, b) in m.clone().into_iter() {
-                m.insert(
-                    a.clone(),
-                    transform_json_value(&a, client, workspace, b).await?,
-                );
+        None
+    };
+
+    let cached_res_path = if job.cache_ttl.is_some() {
+        let version_hash = if let Some(h) = job.script_hash {
+            format!("script_{}", h.to_string())
+        } else if let Some(rc) = job.raw_code.as_ref() {
+            use std::hash::Hasher;
+            let mut s = DefaultHasher::new();
+            rc.hash(&mut s);
+            format!("inline_{}", hex::encode(s.finish().to_be_bytes()))
+        } else if let Some(rc) = job.raw_flow.as_ref() {
+            use std::hash::Hasher;
+            let mut s = DefaultHasher::new();
+            serde_json::to_string(&rc.0)
+                .unwrap_or_default()
+                .hash(&mut s);
+            format!("flow_{}", hex::encode(s.finish().to_be_bytes()))
+        } else {
+            "none".to_string()
+        };
+        let args_hash = hash_args(
+            db,
+            &client.get_authed().await,
+            &job.workspace_id,
+            &job.id,
+            &job.args,
+        )
+        .await;
+        if job.is_flow_step && !matches!(job.job_kind, JobKind::Flow) {
+            let flow_path = sqlx::query_scalar!(
+                "SELECT script_path FROM queue WHERE id = $1",
+                &job.parent_job.unwrap()
+            )
+            .fetch_one(db)
+            .await
+            .map_err(|e| {
+                Error::InternalErr(format!(
+                    "Fetching script path from queue for caching purposes: {e:#}"
+                ))
+            })?
+            .ok_or_else(|| Error::InternalErr(format!("Expected script_path")))?;
+            let step = match step.unwrap() {
+                Step::Step(i) => i.to_string(),
+                Step::PreprocessorStep => "preprocessor".to_string(),
+                Step::FailureStep => "failure".to_string(),
+            };
+            Some(format!(
+                "{flow_path}/cache/{version_hash}/{step}/{args_hash}"
+            ))
+        } else if let Some(script_path) = &job.script_path {
+            Some(format!("{script_path}/cache/{version_hash}/{args_hash}"))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(cached_res_path) = cached_res_path.clone() {
+        let authed_client = client.get_authed().await;
+
+        let cached_resource_value_maybe = get_cached_resource_value_if_valid(
+            db,
+            &authed_client,
+            &job.id,
+            &job.workspace_id,
+            &cached_res_path,
+        )
+        .await;
+        if let Some(cached_resource_value) = cached_resource_value_maybe {
+            {
+                let logs =
+                    "Job skipped because args & path found in cache and not expired".to_string();
+                append_logs(&job.id, &job.workspace_id, logs, db).await;
             }
-            Ok(Value::Object(m))
+            job_completed_tx
+                .send(JobCompleted {
+                    job: job,
+                    result: Arc::new(cached_resource_value),
+                    mem_peak: 0,
+                    canceled_by: None,
+                    success: true,
+                    cached_res_path: None,
+                    token: authed_client.token,
+                })
+                .await
+                .expect("send job completed");
+
+            return Ok(true);
         }
-        a @ _ => Ok(a),
+    };
+    if job.is_flow() {
+        handle_flow(
+            job,
+            db,
+            &client.get_authed().await,
+            None,
+            same_worker_tx,
+            worker_dir,
+            rsmq,
+            job_completed_tx.0.clone(),
+        )
+        .await?;
+        Ok(true)
+    } else {
+        let mut logs = "".to_string();
+        let mut mem_peak: i32 = 0;
+        let mut canceled_by: Option<CanceledBy> = None;
+        // println!("handle queue {:?}",  SystemTime::now());
+
+        logs.push_str(&format!(
+            "job={} tag={} worker={} hostname={}\n",
+            &job.id, &job.tag, &worker_name, &hostname
+        ));
+
+        if *NO_LOGS_AT_ALL {
+            logs.push_str("Logs are fully disabled for this worker\n");
+        }
+
+        if *NO_LOGS {
+            logs.push_str("Logs are disabled for this worker\n");
+        }
+
+        if *SLOW_LOGS {
+            logs.push_str("Logs are 10x less frequent for this worker\n");
+        }
+
+        #[cfg(not(feature = "enterprise"))]
+        if job.concurrent_limit.is_some() {
+            logs.push_str("---\n");
+            logs.push_str("WARNING: This job has concurrency limits enabled. Concurrency limits are going to become an Enterprise Edition feature in the near future.\n");
+            logs.push_str("---\n");
+        }
+
+        tracing::debug!(
+            workspace_id = %job.workspace_id,
+            "handling job {}",
+            job.id
+        );
+        append_logs(&job.id, &job.workspace_id, logs, db).await;
+
+        let mut column_order: Option<Vec<String>> = None;
+        let mut new_args: Option<HashMap<String, Box<RawValue>>> = None;
+        let result = match job.job_kind {
+            JobKind::Dependencies => {
+                handle_dependency_job(
+                    &job,
+                    &mut mem_peak,
+                    &mut canceled_by,
+                    job_dir,
+                    db,
+                    worker_name,
+                    worker_dir,
+                    base_internal_url,
+                    &client.get_token().await,
+                    rsmq.clone(),
+                    occupancy_metrics,
+                )
+                .await
+            }
+            JobKind::FlowDependencies => {
+                handle_flow_dependency_job(
+                    &job,
+                    &mut mem_peak,
+                    &mut canceled_by,
+                    job_dir,
+                    db,
+                    worker_name,
+                    worker_dir,
+                    base_internal_url,
+                    &client.get_token().await,
+                    rsmq.clone(),
+                    occupancy_metrics,
+                )
+                .await
+            }
+            JobKind::AppDependencies => handle_app_dependency_job(
+                &job,
+                &mut mem_peak,
+                &mut canceled_by,
+                job_dir,
+                db,
+                worker_name,
+                worker_dir,
+                base_internal_url,
+                &client.get_token().await,
+                rsmq.clone(),
+                occupancy_metrics,
+            )
+            .await
+            .map(|()| serde_json::from_str("{}").unwrap()),
+            JobKind::Identity => Ok(job
+                .args
+                .as_ref()
+                .map(|x| x.get("previous_result"))
+                .flatten()
+                .map(|x| x.to_owned())
+                .unwrap_or_else(|| serde_json::from_str("{}").unwrap())),
+            _ => {
+                let metric_timer = Instant::now();
+                let r = handle_code_execution_job(
+                    job.as_ref(),
+                    db,
+                    client,
+                    job_dir,
+                    worker_dir,
+                    &mut mem_peak,
+                    &mut canceled_by,
+                    base_internal_url,
+                    worker_name,
+                    &mut column_order,
+                    &mut new_args,
+                    occupancy_metrics,
+                )
+                .await;
+                occupancy_metrics.total_duration_of_running_jobs +=
+                    metric_timer.elapsed().as_secs_f32();
+                r
+            }
+        };
+
+        //it's a test job, no need to update the db
+        if job.as_ref().workspace_id == "" {
+            return Ok(true);
+        }
+
+        if result
+            .as_ref()
+            .is_err_and(|err| matches!(err, &Error::AlreadyCompleted(_)))
+        {
+            return Ok(false);
+        }
+
+        process_result(
+            job,
+            result.map(|x| Arc::new(x)),
+            job_dir,
+            job_completed_tx,
+            mem_peak,
+            canceled_by,
+            cached_res_path,
+            client.get_token().await,
+            column_order,
+            new_args,
+            db,
+        )
+        .await
     }
+}
+
+pub fn build_envs(
+    envs: Option<Vec<String>>,
+) -> windmill_common::error::Result<HashMap<String, String>> {
+    let mut envs = if *CLOUD_HOSTED || envs.is_none() {
+        HashMap::new()
+    } else {
+        let mut hm = HashMap::new();
+        for s in envs.unwrap() {
+            let (k, v) = s.split_once('=').ok_or_else(|| {
+                Error::BadRequest(format!(
+                    "Invalid env var: {}. Must be in the form of KEY=VALUE",
+                    s
+                ))
+            })?;
+            hm.insert(k.to_string(), v.to_string());
+        }
+        hm
+    };
+
+    for (k, v) in PROXY_ENVS.iter() {
+        envs.insert(k.to_string(), v.to_string());
+    }
+
+    Ok(envs)
+}
+
+pub struct ContentReqLangEnvs {
+    pub content: String,
+    pub lockfile: Option<String>,
+    pub language: Option<ScriptLang>,
+    pub envs: Option<Vec<String>>,
+    pub codebase: Option<String>,
+}
+
+pub async fn get_hub_script_content_and_requirements(
+    script_path: Option<String>,
+    db: Option<&DB>,
+) -> error::Result<ContentReqLangEnvs> {
+    let script_path = script_path
+        .clone()
+        .ok_or_else(|| Error::InternalErr(format!("expected script path for hub script")))?;
+
+    let script =
+        get_full_hub_script_by_path(StripPath(script_path.to_string()), &HTTP_CLIENT, db).await?;
+    Ok(ContentReqLangEnvs {
+        content: script.content,
+        lockfile: script.lockfile,
+        language: Some(script.language),
+        envs: None,
+        codebase: None,
+    })
+}
+
+async fn get_script_content_by_path(
+    script_path: Option<String>,
+    w_id: &str,
+    db: &DB,
+) -> error::Result<ContentReqLangEnvs> {
+    let script_path = script_path
+        .clone()
+        .ok_or_else(|| Error::InternalErr(format!("expected script path")))?;
+    return if script_path.starts_with("hub/") {
+        get_hub_script_content_and_requirements(Some(script_path), Some(db)).await
+    } else {
+        let (script_hash, ..) =
+            get_latest_deployed_hash_for_path(db, w_id, script_path.as_str()).await?;
+        get_script_content_by_hash(&script_hash, w_id, db).await
+    };
+}
+
+pub async fn get_script_content_by_hash(
+    script_hash: &ScriptHash,
+    w_id: &str,
+    db: &DB,
+) -> error::Result<ContentReqLangEnvs> {
+    let r = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<ScriptLang>,
+            Option<Vec<String>>,
+            Option<bool>
+        ),
+    >(
+        "SELECT content, lock, language, envs, codebase LIKE '%.tar' as codebase FROM script WHERE hash = $1 AND workspace_id = $2",
+    )
+    .bind(script_hash.0)
+    .bind(w_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| Error::InternalErr(format!("expected content and lock")))?;
+    Ok(ContentReqLangEnvs {
+        content: r.0,
+        lockfile: r.1,
+        language: r.2,
+        envs: r.3,
+        codebase: if r.4.is_some() {
+            let b = r.4.unwrap();
+            let sh = script_hash.to_string();
+            if b {
+                Some(format!("{sh}.tar"))
+            } else {
+                Some(sh)
+            }
+        } else {
+            None
+        },
+    })
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
@@ -1128,52 +2180,198 @@ async fn handle_code_execution_job(
     client: &AuthedClientBackgroundTask,
     job_dir: &str,
     worker_dir: &str,
-    logs: &mut String,
+    mem_peak: &mut i32,
+    canceled_by: &mut Option<CanceledBy>,
     base_internal_url: &str,
-    worker_name: &str
+    worker_name: &str,
+    column_order: &mut Option<Vec<String>>,
+    new_args: &mut Option<HashMap<String, Box<RawValue>>>,
+    occupancy_metrics: &mut OccupancyMetrics,
+) -> error::Result<Box<RawValue>> {
+    let ContentReqLangEnvs {
+        content: inner_content,
+        lockfile: requirements_o,
+        language,
+        envs,
+        codebase,
+    } = match job.job_kind {
+        JobKind::Preview => {
+            let codebase = match job.script_hash.map(|x| x.0) {
+                Some(PREVIEW_IS_CODEBASE_HASH) => Some(job.id.to_string()),
+                Some(PREVIEW_IS_TAR_CODEBASE_HASH) => Some(format!("{}.tar", job.id)),
+                _ => None,
+            };
 
-) -> error::Result<serde_json::Value> {
-    let (inner_content, requirements_o, language) = match job.job_kind {
-        JobKind::Preview  => (
-            job.raw_code
-                .clone()
-                .unwrap_or_else(|| "no raw code".to_owned()),
-            job.raw_lock.clone(),
-            job.language.to_owned(),
-        ),
-        JobKind::Script_Hub => {
-            let script_path = job.script_path.clone().ok_or_else(|| Error::InternalErr(format!("expected script path for hub script")))?;
-            let mut script_path_iterator = script_path.split("/");
-            script_path_iterator.next();
-            let version = script_path_iterator.next().ok_or_else(|| Error::InternalErr(format!("expected hub path to have version number")))?;
-            let cache_path = format!("{HUB_CACHE_DIR}/{version}");
-            let script;
-            if tokio::fs::metadata(&cache_path).await.is_err() {
-                script =  get_full_hub_script_by_path(&job.email, StripPath(script_path.clone()), &HTTP_CLIENT).await?;
-                write_file(HUB_CACHE_DIR, &version, &serde_json::to_string(&script).map_err(to_anyhow)?).await?;
-                tracing::info!("wrote hub script {script_path} to cache");
-            } else {
-                let cache_content = tokio::fs::read_to_string(cache_path).await?;
-                script = serde_json::from_str(&cache_content).unwrap();
-                tracing::info!("read hub script {script_path} from cache");
+            ContentReqLangEnvs {
+                content: job
+                    .raw_code
+                    .clone()
+                    .unwrap_or_else(|| "no raw code".to_owned()),
+                lockfile: job.raw_lock.clone(),
+                language: job.language.to_owned(),
+                envs: None,
+                codebase,
             }
-            (
-            script.content,
-            script.lockfile,
-            Some(script.language)
-        )},
-        JobKind::Script => sqlx::query_as::<_, (String, Option<String>, Option<ScriptLang>)>(
-            "SELECT content, lock, language FROM script WHERE hash = $1 AND workspace_id = $2",
-        )
-        .bind(&job.script_hash.unwrap_or(ScriptHash(0)).0)
-        .bind(&job.workspace_id)
-        .fetch_optional(db)
-        .await?
-        .ok_or_else(|| Error::InternalErr(format!("expected content and lock")))?,
+        }
+        JobKind::Script_Hub => {
+            get_hub_script_content_and_requirements(job.script_path.clone(), Some(db)).await?
+        }
+        JobKind::Script => {
+            get_script_content_by_hash(
+                &job.script_hash.unwrap_or(ScriptHash(0)),
+                &job.workspace_id,
+                db,
+            )
+            .await?
+        }
+        JobKind::DeploymentCallback => {
+            get_script_content_by_path(job.script_path.clone(), &job.workspace_id, db).await?
+        }
         _ => unreachable!(
             "handle_code_execution_job should never be reachable with a non-code execution job"
         ),
     };
+
+    if language == Some(ScriptLang::Postgresql) {
+        return do_postgresql(
+            job,
+            &client,
+            &inner_content,
+            db,
+            mem_peak,
+            canceled_by,
+            worker_name,
+            column_order,
+            occupancy_metrics,
+        )
+        .await;
+    } else if language == Some(ScriptLang::Mysql) {
+        return do_mysql(
+            job,
+            &client,
+            &inner_content,
+            db,
+            mem_peak,
+            canceled_by,
+            worker_name,
+            column_order,
+            occupancy_metrics,
+        )
+        .await;
+    } else if language == Some(ScriptLang::Bigquery) {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            return Err(Error::ExecutionErr(
+                "Bigquery is only available with an enterprise license".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "enterprise")]
+        {
+            return do_bigquery(
+                job,
+                &client,
+                &inner_content,
+                db,
+                mem_peak,
+                canceled_by,
+                worker_name,
+                column_order,
+                occupancy_metrics,
+            )
+            .await;
+        }
+    } else if language == Some(ScriptLang::Snowflake) {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            return Err(Error::ExecutionErr(
+                "Snowflake is only available with an enterprise license".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "enterprise")]
+        {
+            return do_snowflake(
+                job,
+                &client,
+                &inner_content,
+                db,
+                mem_peak,
+                canceled_by,
+                worker_name,
+                column_order,
+                occupancy_metrics,
+            )
+            .await;
+        }
+    } else if language == Some(ScriptLang::Mssql) {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            return Err(Error::ExecutionErr(
+                "Microsoft SQL server is only available with an enterprise license".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "enterprise")]
+        {
+            return do_mssql(
+                job,
+                &client,
+                &inner_content,
+                db,
+                mem_peak,
+                canceled_by,
+                worker_name,
+                occupancy_metrics,
+            )
+            .await;
+        }
+    } else if language == Some(ScriptLang::Graphql) {
+        return do_graphql(
+            job,
+            &client,
+            &inner_content,
+            db,
+            mem_peak,
+            canceled_by,
+            worker_name,
+            occupancy_metrics,
+        )
+        .await;
+    } else if language == Some(ScriptLang::Nativets) {
+        append_logs(
+            &job.id,
+            &job.workspace_id,
+            "\n--- FETCH TS EXECUTION ---\n",
+            db,
+        )
+        .await;
+
+        let reserved_variables = get_reserved_variables(job, &client.get_token().await, db).await?;
+
+        let env_code = format!(
+            "const process = {{ env: {{}} }};\nconst BASE_URL = '{base_internal_url}';\nconst BASE_INTERNAL_URL = '{base_internal_url}';\nprocess.env['BASE_URL'] = BASE_URL;process.env['BASE_INTERNAL_URL'] = BASE_INTERNAL_URL;\n{}",
+            reserved_variables
+                .iter()
+                .map(|(k, v)| format!("const {} = '{}';\nprocess.env['{}'] = '{}';\n", k, v, k, v))
+                .collect::<Vec<String>>()
+                .join("\n"));
+        let (result, ts_logs) = do_nativets(
+            job,
+            &client,
+            env_code,
+            inner_content,
+            db,
+            mem_peak,
+            canceled_by,
+            worker_name,
+            occupancy_metrics,
+        )
+        .await?;
+        append_logs(&job.id, &job.workspace_id, ts_logs, db).await;
+        return Ok(result);
+    }
+
     let lang_str = job
         .language
         .as_ref()
@@ -1181,8 +2379,6 @@ async fn handle_code_execution_job(
         .unwrap_or_else(|| "NO_LANG".to_string());
 
     tracing::debug!(
-        worker_name = %worker_name,
-        job_id = %job.id,
         workspace_id = %job.workspace_id,
         "started {} job {}",
         &lang_str,
@@ -1190,11 +2386,16 @@ async fn handle_code_execution_job(
     );
 
     let shared_mount = if job.same_worker && job.language != Some(ScriptLang::Deno) {
+        let folder = if job.language == Some(ScriptLang::Go) {
+            "/go"
+        } else {
+            ""
+        };
         format!(
             r#"
 mount {{
-    src: "{job_dir}/shared"
-    dst: "/tmp/shared"
+    src: "{job_dir}{folder}/shared"
+    dst: "/tmp{folder}/shared"
     is_bind: true
     rw: true
 }}
@@ -1206,7 +2407,9 @@ mount {{
 
     // println!("handle lang job {:?}",  SystemTime::now());
 
-    let result: error::Result<serde_json::Value> = match language {
+    let envs = build_envs(envs)?;
+
+    let result: error::Result<Box<RawValue>> = match language {
         None => {
             return Err(Error::ExecutionErr(
                 "Require language to be not null".to_string(),
@@ -1219,31 +2422,61 @@ mount {{
                 worker_dir,
                 worker_name,
                 job,
-                logs,
+                mem_peak,
+                canceled_by,
                 db,
                 client,
                 &inner_content,
                 &shared_mount,
                 base_internal_url,
+                envs,
+                new_args,
+                occupancy_metrics,
             )
             .await
         }
         Some(ScriptLang::Deno) => {
             handle_deno_job(
-                logs,
+                requirements_o,
+                mem_peak,
+                canceled_by,
                 job,
                 db,
                 client,
                 job_dir,
                 &inner_content,
                 base_internal_url,
-                worker_name
+                worker_name,
+                envs,
+                new_args,
+                occupancy_metrics,
+            )
+            .await
+        }
+        Some(ScriptLang::Bun) | Some(ScriptLang::Bunnative) => {
+            handle_bun_job(
+                requirements_o,
+                codebase,
+                mem_peak,
+                canceled_by,
+                job,
+                db,
+                client,
+                job_dir,
+                &inner_content,
+                base_internal_url,
+                worker_name,
+                envs,
+                &shared_mount,
+                new_args,
+                occupancy_metrics,
             )
             .await
         }
         Some(ScriptLang::Go) => {
             handle_go_job(
-                logs,
+                mem_peak,
+                canceled_by,
                 job,
                 db,
                 client,
@@ -1252,13 +2485,16 @@ mount {{
                 requirements_o,
                 &shared_mount,
                 base_internal_url,
-                worker_name
+                worker_name,
+                envs,
+                occupancy_metrics,
             )
             .await
         }
         Some(ScriptLang::Bash) => {
             handle_bash_job(
-                logs,
+                mem_peak,
+                canceled_by,
                 job,
                 db,
                 client,
@@ -1266,14 +2502,87 @@ mount {{
                 job_dir,
                 &shared_mount,
                 base_internal_url,
-                worker_name
+                worker_name,
+                envs,
+                occupancy_metrics,
             )
             .await
         }
+        Some(ScriptLang::Powershell) => {
+            handle_powershell_job(
+                mem_peak,
+                canceled_by,
+                job,
+                db,
+                client,
+                &inner_content,
+                job_dir,
+                &shared_mount,
+                base_internal_url,
+                worker_name,
+                envs,
+                occupancy_metrics,
+            )
+            .await
+        }
+        Some(ScriptLang::Php) => {
+            handle_php_job(
+                requirements_o,
+                mem_peak,
+                canceled_by,
+                job,
+                db,
+                client,
+                job_dir,
+                &inner_content,
+                base_internal_url,
+                worker_name,
+                envs,
+                &shared_mount,
+                occupancy_metrics,
+            )
+            .await
+        }
+        Some(ScriptLang::Rust) => {
+            handle_rust_job(
+                mem_peak,
+                canceled_by,
+                job,
+                db,
+                client,
+                &inner_content,
+                job_dir,
+                requirements_o,
+                &shared_mount,
+                base_internal_url,
+                worker_name,
+                envs,
+                occupancy_metrics,
+            )
+            .await
+        }
+        Some(ScriptLang::Ansible) => {
+            handle_ansible_job(
+                requirements_o,
+                job_dir,
+                worker_dir,
+                worker_name,
+                job,
+                mem_peak,
+                canceled_by,
+                db,
+                client,
+                &inner_content,
+                &shared_mount,
+                base_internal_url,
+                envs,
+                occupancy_metrics,
+            )
+            .await
+        }
+        _ => panic!("unreachable, language is not supported: {language:#?}"),
     };
     tracing::info!(
-        worker_name = %worker_name,
-        job_id = %job.id,
         workspace_id = %job.workspace_id,
         is_ok = result.is_ok(),
         "finished {} job {}",
@@ -1283,919 +2592,4 @@ mount {{
     // println!("handled job: {:?}",  SystemTime::now());
 
     result
-}
-
-
-#[tracing::instrument(level = "trace", skip_all)]
-async fn handle_bash_job(
-    logs: &mut String,
-    job: &QueuedJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
-    client: &AuthedClientBackgroundTask,
-    content: &str,
-    job_dir: &str,
-    shared_mount: &str,
-    base_internal_url: &str,
-    worker_name: &str,
-) -> Result<serde_json::Value, Error> {
-    logs.push_str("\n\n--- BASH CODE EXECUTION ---\n");
-    set_logs(logs, &job.id, db).await;
-    write_file(job_dir, "main.sh", &format!("set -e\n{content}\nsleep 0.02")).await?;
-    let token = client.get_token().await;
-    let mut reserved_variables = get_reserved_variables(job, &token, db).await?;
-    reserved_variables.insert("RUST_LOG".to_string(), "info".to_string());
-
-    let hm = match job.args {
-        Some(Value::Object(ref hm)) => hm.clone(),
-        _ => serde_json::Map::new(),
-    };
-    let args_owned = windmill_parser_bash::parse_bash_sig(&content)?
-        .args
-        .iter()
-        .map(|arg| {
-            hm.get(&arg.name)
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => serde_json::to_string(v).ok(),
-                })
-                .unwrap_or_else(String::new)
-        })
-        .collect::<Vec<String>>();
-    let args = args_owned.iter().map(|s| &s[..]).collect::<Vec<&str>>();
-
-    let child = if !*DISABLE_NSJAIL {
-        let _ = write_file(
-            job_dir,
-            "run.config.proto",
-            &NSJAIL_CONFIG_RUN_BASH_CONTENT
-                .replace("{JOB_DIR}", job_dir)
-                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
-                .replace("{SHARED_MOUNT}", shared_mount),
-        )
-        .await?;
-        let mut cmd_args = vec!["--config", "run.config.proto", "--", "/bin/bash", "main.sh"];
-        cmd_args.extend(args);
-        Command::new(NSJAIL_PATH.as_str())
-            .current_dir(job_dir)
-            .env_clear()
-            .envs(reserved_variables)
-            .env("PATH", PATH_ENV.as_str())
-            .env("BASE_INTERNAL_URL", base_internal_url)
-            .args(cmd_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?
-    } else {
-        let mut cmd_args = vec!["main.sh"];
-        cmd_args.extend(&args);
-        Command::new("/bin/bash")
-            .current_dir(job_dir)
-            .env_clear()
-            .envs(reserved_variables)
-            .env("PATH", PATH_ENV.as_str())
-            .env("BASE_INTERNAL_URL", base_internal_url)
-            .env("HOME", HOME_ENV.as_str())
-            .args(cmd_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?
-    };
-    handle_child(&job.id, db, logs,  child, !*DISABLE_NSJAIL, worker_name, &job.workspace_id, "bash run").await?;
-    //for now bash jobs have an empty result object
-    Ok(serde_json::json!(logs
-        .lines()
-        .last()
-        .map(|x| x.to_string())
-        .unwrap_or_else(String::new)))
-}
-
-fn get_common_deno_proc_envs(token: &str, base_internal_url: &str) -> HashMap<String, String> {
-    let hostname_base = BASE_URL.split("://").last().unwrap_or("localhost");
-    let hostname_internal = base_internal_url.split("://").last().unwrap_or("localhost");
-    let deno_auth_tokens_base = DENO_AUTH_TOKENS.as_str();
-    let deno_auth_tokens =
-        format!("{token}@{hostname_base};{token}@{hostname_internal}{deno_auth_tokens_base}",);
-
-    let mut deno_envs: HashMap<String, String> = HashMap::from([
-        (String::from("PATH"), PATH_ENV.clone()),
-        (String::from("DENO_AUTH_TOKENS"), deno_auth_tokens),
-        (String::from("BASE_INTERNAL_URL"), base_internal_url.to_string()),
-        (String::from("NO_COLOR"), String::from("true")),
-    ]);
-
-    if let Some(ref s) = *NPM_CONFIG_REGISTRY {
-        deno_envs.insert(String::from("NPM_CONFIG_REGISTRY"), s.clone());
-    }
-    return deno_envs;
-}
-
-#[tracing::instrument(level = "trace", skip_all)]
-async fn handle_deno_job(
-    logs: &mut String,
-    job: &QueuedJob,
-    db: &sqlx::Pool<sqlx::Postgres>,
-    client: &AuthedClientBackgroundTask,
-    job_dir: &str,
-    inner_content: &String,
-    base_internal_url: &str,
-    worker_name: &str
-) -> error::Result<serde_json::Value> {
-
-    // let mut start = Instant::now();
-    logs.push_str("\n\n--- DENO CODE EXECUTION ---\n");
-
-    let logs_to_set = logs.clone();
-    let id = job.id.clone();
-    let db2 = db.clone();
-
-    let set_logs_f = async {
-        set_logs(&logs_to_set, &id, &db2).await;
-        Ok(()) as error::Result<()>
-    };
-    
-    let write_main_f = write_file(job_dir, "main.ts", inner_content);
-
-    let write_wrapper_f = async {
-        // let mut start = Instant::now();
-        let args = windmill_parser_ts::parse_deno_signature(inner_content, true)?.args;
-        let dates = args.iter().enumerate().filter_map(|(i, x)| if matches!(x.typ, Typ::Datetime) {
-            Some(i) 
-        } else {
-            None
-        }).map(|x| {
-            return format!("args[{x}] = args[{x}] ? new Date(args[{x}]) : undefined")
-        }).join("\n");
-
-        let spread = args.into_iter().map(|x| x.name).join(",");
-        // logs.push_str(format!("infer args: {:?}\n", start.elapsed().as_micros()).as_str());
-        let wrapper_content: String = format!(
-            r#"
-import {{ main }} from "./main.ts";
-
-const args = await Deno.readTextFile("args.json")
-    .then(JSON.parse)
-    .then(({{ {spread} }}) => [ {spread} ])
-
-{dates}
-async function run() {{
-    let res: any = await main(...args);
-    const res_json = JSON.stringify(res ?? null, (key, value) => typeof value === 'undefined' ? null : value);
-    await Deno.writeTextFile("result.json", res_json);
-    Deno.exit(0);
-}}
-run().catch(async (e) => {{
-    await Deno.writeTextFile("result.json", JSON.stringify({{ message: e.message, name: e.name, stack: e.stack }}));
-    Deno.exit(1);
-}});
-    "#,
-        );
-        write_file(job_dir, "wrapper.ts", &wrapper_content).await?;
-        Ok(()) as error::Result<()>
-    };
-
-    let write_import_map_f = async {
-        let w_id = job.workspace_id.clone();
-        let script_path_split = job.script_path().split("/");
-        let script_path_parts_len = script_path_split.clone().count();
-        let mut relative_mounts = "".to_string();
-        for c in 0..script_path_parts_len {
-            relative_mounts += ",\n          ";
-            relative_mounts += &format!("\"./{}\": \"{base_internal_url}/api/w/{w_id}/scripts/raw/p/{}{}\"",
-                (0..c).map(|_| "../").join(""),
-                &script_path_split.clone().take(script_path_parts_len - c - 1).join("/"),
-                if c == script_path_parts_len - 1 { "" } else { "/" },
-            );
-        }
-        let import_map = format!(
-            r#"{{
-            "imports": {{
-              "{base_internal_url}/api/w/{w_id}/scripts/raw/p/": "{base_internal_url}/api/w/{w_id}/scripts/raw/p/",
-              "{base_internal_url}": "{base_internal_url}/api/w/{w_id}/scripts/raw/p/",
-              "/": "{base_internal_url}/api/w/{w_id}/scripts/raw/p/",
-              "./wrapper.ts": "./wrapper.ts",
-              "./main.ts": "./main.ts"{relative_mounts}
-            }}
-          }}"#,
-        );
-        write_file(job_dir, "import_map.json", &import_map).await?;
-        Ok(()) as error::Result<()>
-    };
-
-    let reserved_variables_args_out_f = async {
-        let client = client.get_authed().await;
-        let args_and_out_f = async {
-            create_args_and_out_file(&client, job, job_dir).await?;
-            Ok(()) as Result<()>
-        };
-        let reserved_variables_f = async {
-            let mut vars = get_reserved_variables(job, &client.token, db).await?;
-            vars.insert("RUST_LOG".to_string(), "info".to_string());
-            Ok(vars) as Result<HashMap<String, String>>
-        };
-        let (_, reserved_variables) = tokio::try_join!(args_and_out_f, reserved_variables_f)?;
-        Ok((reserved_variables, client.token)) as error::Result<(HashMap<String, String>, String)>
-    };
-
-    let (_, (reserved_variables, token), _, _, _) = tokio::try_join!(
-        set_logs_f,
-        reserved_variables_args_out_f,
-        write_main_f,
-        write_wrapper_f,
-        write_import_map_f)?;
-
-    let common_deno_proc_envs = get_common_deno_proc_envs(&token, base_internal_url);
-
-    //do not cache local dependencies
-    let reload = format!("--reload={base_internal_url}");
-    let child = async {
-            let script_path = format!("{job_dir}/wrapper.ts");
-            let import_map_path = format!("{job_dir}/import_map.json");
-            let mut args = Vec::with_capacity(12);
-            args.push("run");
-            args.push("--no-check");
-            args.push("--import-map");
-            args.push(&import_map_path);
-            args.push(&reload);
-            args.push("--unstable");
-            if let Some(deno_flags) = DENO_FLAGS.as_ref() {
-                for flag in deno_flags {
-                    args.push(flag);
-                }
-            } else if !*DISABLE_NSJAIL {
-                args.push("--allow-net");
-                args.push("--allow-read=./");
-                args.push("--allow-write=./");
-                args.push("--allow-env");
-            } else {
-                args.push("-A");
-            }
-            args.push(&script_path);
-            Command::new(DENO_PATH.as_str())
-                .current_dir(job_dir)
-                .env_clear()
-                .envs(reserved_variables)
-                .envs(common_deno_proc_envs)
-                .env("DENO_DIR", DENO_CACHE_DIR)
-                .args(args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-    }
-    .await?;
-    // logs.push_str(format!("prepare: {:?}\n", start.elapsed().as_micros()).as_str());
-    // start = Instant::now();
-    handle_child(&job.id, db, logs, child, false, worker_name, &job.workspace_id, "deno run").await?;
-    // logs.push_str(format!("execute: {:?}\n", start.elapsed().as_millis()).as_str());
-    if let Err(e) = tokio::fs::remove_dir_all(format!("{DENO_CACHE_DIR}/gen/file/{job_dir}")).await {
-        tracing::error!("failed to remove deno gen tmp cache dir: {}", e);
-    }
-    read_result(job_dir).await
-}
-
-#[tracing::instrument(level = "trace", skip_all)]
-pub async fn create_args_and_out_file(
-    client: &AuthedClient,
-    job: &QueuedJob,
-    job_dir: &str,
-) -> Result<(), Error> {
-    let args = if let Some(args) = &job.args {
-        Some(transform_json_value("args", client, &job.workspace_id, args.clone()).await?)
-    } else {
-        None
-    };
-    let ser_args = serde_json::to_string(&args).map_err(|e| Error::ExecutionErr(e.to_string()))?;
-    write_file(job_dir, "args.json", &ser_args).await?;
-    write_file(job_dir, "result.json", "").await?;
-    Ok(())
-}
-
-
-
-
-#[tracing::instrument(level = "trace", skip_all)]
-async fn handle_dependency_job(
-    job: &QueuedJob,
-    logs: &mut String,
-    job_dir: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
-    worker_name: &str,
-    worker_dir: &str,
-) -> error::Result<serde_json::Value> {
-    let content = capture_dependency_job(
-        &job.id,
-        job.language.as_ref().map(|v| Ok(v)).unwrap_or_else(|| {
-            Err(Error::InternalErr(
-                "Job Language required for dependency jobs".to_owned(),
-            ))
-        })?,
-        job.raw_code
-            .as_ref()
-            .map(|a| a.as_str())
-            .unwrap_or_else(|| "no raw code"),
-        logs,
-        job_dir,
-        db,
-        worker_name,
-        &job.workspace_id,
-        worker_dir,
-    )
-    .await;
-    match content {
-        Ok(content) => {
-            sqlx::query!(
-                "UPDATE script SET lock = $1 WHERE hash = $2 AND workspace_id = $3",
-                &content,
-                &job.script_hash.unwrap_or(ScriptHash(0)).0,
-                &job.workspace_id
-            )
-            .execute(db)
-            .await?;
-            Ok(json!({ "success": "Successful lock file generation", "lock": content }))
-        }
-        Err(error) => {
-            sqlx::query!(
-                "UPDATE script SET lock_error_logs = $1 WHERE hash = $2 AND workspace_id = $3",
-                &format!("{logs}\n{error}"),
-                &job.script_hash.unwrap_or(ScriptHash(0)).0,
-                &job.workspace_id
-            )
-            .execute(db)
-            .await?;
-            Err(Error::ExecutionErr(format!("Error locking file: {error}")))?
-        }
-    }
-}
-
-#[tracing::instrument(level = "trace", skip_all)]
-async fn handle_flow_dependency_job(
-    job: &QueuedJob,
-    logs: &mut String,
-    job_dir: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
-    worker_name: &str,
-    worker_dir: &str,
-) -> error::Result<()> {
-    let path = job.script_path.clone().ok_or_else(|| {
-        error::Error::InternalErr(
-            "Cannot resolve flow dependencies for flow without path".to_string(),
-        )
-    })?;
-    let raw_flow = job.raw_flow.clone().map(|v| Ok(v)).unwrap_or_else(|| {
-        Err(Error::InternalErr(
-            "Flow Dependency requires raw flow".to_owned(),
-        ))
-    })?;
-    let mut flow = serde_json::from_value::<FlowValue>(raw_flow).map_err(to_anyhow)?;
-    let mut new_flow_modules = Vec::new();
-    for mut e in flow.modules.into_iter() {
-        let FlowModuleValue::RawScript { lock: _, path, content, language, input_transforms, tag} = e.value else {
-            new_flow_modules.push(e);
-            continue;
-        };
-        // sync with windmill-api/scripts
-        let dependencies = match language {
-            ScriptLang::Python3 => windmill_parser_py::parse_python_imports(&content)?.join("\n"),
-            _ => content.clone(),
-        };
-        let new_lock = capture_dependency_job(
-            &job.id,
-            &language,
-            &dependencies,
-            logs,
-            job_dir,
-            db,
-            worker_name,
-            &job.workspace_id,
-            worker_dir,
-        )
-        .await;
-        match new_lock {
-            Ok(new_lock) => {
-                e.value = FlowModuleValue::RawScript {
-                    lock: Some(new_lock),
-                    path: path,
-                    input_transforms,
-                    content,
-                    language,
-                    tag
-                };
-                new_flow_modules.push(e);
-                continue;
-            }
-            Err(error) => {
-                // TODO: Record flow raw script error lock logs
-                tracing::warn!(
-                    path = path,
-                    language = ?language,
-                    error = ?error,
-                    logs = ?logs,
-                    "Failed to generate flow lock for raw script"
-                );
-                e.value = FlowModuleValue::RawScript {
-                    lock: None,
-                    path: path,
-                    input_transforms,
-                    content,
-                    language,
-                    tag
-                };
-                new_flow_modules.push(e);
-                continue;
-            }
-        }
-    }
-    flow.modules = new_flow_modules;
-    let new_flow_value = serde_json::to_value(flow).map_err(to_anyhow)?;
-
-    // Re-check cancelation to ensure we don't accidentially override a flow.
-    if sqlx::query_scalar!("SELECT canceled FROM queue WHERE id = $1", job.id)
-        .fetch_optional(db)
-        .await
-        .map(|v| Some(true) == v)
-        .unwrap_or_else(|err| {
-            tracing::error!(%job.id, %err, "error checking cancelation for job {0}: {err}", job.id);
-            false
-        })
-    {
-        return Ok(());
-    }
-
-    sqlx::query!(
-        "UPDATE flow SET value = $1 WHERE path = $2 AND workspace_id = $3",
-        new_flow_value,
-        path,
-        job.workspace_id
-    )
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-async fn capture_dependency_job(
-    job_id: &Uuid,
-    job_language: &ScriptLang,
-    job_raw_code: &str,
-    logs: &mut String,
-    job_dir: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
-    worker_name: &str,
-    w_id: &str,
-    worker_dir: &str,
-) -> error::Result<String> {
-    match job_language {
-        ScriptLang::Python3 => {
-            create_dependencies_dir(job_dir).await;
-            let req = pip_compile(job_id, job_raw_code, logs, job_dir, db, worker_name, w_id).await;
-            // install the dependencies to pre-fill the cache
-            if let Ok(req) = req.as_ref() {
-                handle_python_reqs(
-                    req
-                        .split("\n")
-                        .filter(|x| !x.starts_with("--"))
-                        .collect(),
-                    job_id,
-                    w_id,
-                    logs,
-                    db,
-                    worker_name,
-                    job_dir,
-                    worker_dir,
-                )
-                .await?;
-            }
-            req
-        }
-        ScriptLang::Go => {
-            install_go_dependencies(
-                job_id,
-                job_raw_code,
-                logs,
-                job_dir,
-                db,
-                false,
-                false,
-                false,
-                worker_name,
-                w_id
-            )
-            .await
-        }
-        ScriptLang::Deno => {
-            Ok(String::new())
-            // generate_deno_lock(job_id, job_raw_code, logs, job_dir, db, timeout).await
-        }
-        ScriptLang::Bash => Ok("".to_owned()),
-    }
-}
-
-
-#[tracing::instrument(level = "trace", skip_all)]
-pub async fn get_reserved_variables(
-    job: &QueuedJob,
-    token: &str,
-    db: &sqlx::Pool<sqlx::Postgres>,
-) -> Result<HashMap<String, String>, Error> {
-    let flow_path = if let Some(uuid) = job.parent_job {
-        sqlx::query_scalar!("SELECT script_path FROM queue WHERE id = $1", uuid)
-            .fetch_optional(db)
-            .await?
-            .flatten()
-    } else {
-        None
-    };
-
-    let variables = variables::get_reserved_variables(
-        &job.workspace_id,
-        token,
-        &job.email,
-        &job.created_by,
-        &job.id.to_string(),
-        &job.permissioned_as,
-
-        job.script_path.clone(),
-        job.parent_job.map(|x| x.to_string()),
-        flow_path,
-        job.schedule_path.clone(),
-    );
-    Ok(variables
-        .into_iter()
-        .map(|rv| (rv.name, rv.value))
-        .collect())
-}
-
-async fn get_mem_peak(pid: Option<u32>, nsjail: bool) -> i32 {
-    if pid.is_none() {
-        return -1
-    }
-    let pid = if nsjail {
-        // This is a bit hacky, but the process id of the nsjail process is the pid of nsjail + 1. 
-        // Ideally, we would get the number from fork() itself. This works in MOST cases.
-        pid.unwrap() + 1
-    } else {
-        pid.unwrap()
-    };
-    
-    if let Ok(file) = File::open(format!("/proc/{}/status", pid)).await {
-        let mut lines = BufReader::new(file).lines();
-        while let Some(line) = lines.next_line().await.unwrap_or(None) {
-            if line.starts_with("VmHWM:") {
-                return line.split_whitespace().nth(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
-            };
-        }
-        -2
-    } else {
-        -3
-    }
-}
-/// - wait until child exits and return with exit status
-/// - read lines from stdout and stderr and append them to the "queue"."logs"
-///   quitting early if output exceedes MAX_LOG_SIZE characters (not bytes)
-/// - update the `last_line` and `logs` strings with the program output
-/// - update "queue"."last_ping" every five seconds
-/// - kill process if we exceed timeout or "queue"."canceled" is set
-#[tracing::instrument(level = "trace", skip_all)]
-pub async fn handle_child(
-    job_id: &Uuid,
-    db: &Pool<Postgres>,
-    logs: &mut String,
-    mut child: Child,
-    nsjail: bool,
-    worker_name: &str,
-    _w_id: &str,
-    child_name: &str,
-) -> error::Result<()> {
-    let start = Instant::now();
-    let update_job_interval = Duration::from_millis(500);
-    let write_logs_delay = Duration::from_millis(500);
-
-    let pid = child.id();
-    #[cfg(target_os = "linux")]
-    if let Some(pid) = pid {
-        //set the highest oom priority
-        let mut file = File::create(format!("/proc/{pid}/oom_score_adj")).await?;
-        let _ = file.write_all(b"1000").await;
-    } else {
-        tracing::info!("could not get child pid");
-    }
-    let (set_too_many_logs, mut too_many_logs) = watch::channel::<bool>(false);
-    let (tx, mut rx) = broadcast::channel::<()>(3);
-    let mut rx2 = tx.subscribe();
-
-
-    let output = child_joined_output_stream(&mut child);
-
-    let job_id = job_id.clone();
-
-
-    /* the cancellation future is polled on by `wait_on_child` while
-     * waiting for the child to exit normally */
-    let update_job = async {
-        let db = db.clone();
-
-        let mut interval = interval(update_job_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        let mut i = 1;
-        loop {
-            tokio::select!(
-                _ = rx.recv() => break,
-                _ = interval.tick() => {
-                    // update the last_ping column every 5 seconds
-                    i+=1;
-                    if i % 10 == 0 {
-                        sqlx::query!(
-                            "UPDATE worker_ping SET ping_at = now() WHERE worker = $1",
-                            &worker_name
-                        )
-                        .execute(&db)
-                        .await
-                        .expect("update worker ping");
-                    }
-                    let mem_peak = get_mem_peak(pid, nsjail).await;
-                    tracing::info!("{job_id} still running. mem peak: {}kB", mem_peak);
-                    let mem_peak = if mem_peak > 0 { Some(mem_peak) } else { None };
-                    if sqlx::query_scalar!("UPDATE queue SET mem_peak = GREATEST($1, mem_peak), last_ping = now() WHERE id = $2 RETURNING canceled", mem_peak, job_id)
-                        .fetch_optional(&db)
-                        .await
-                        .map(|v| Some(true) == v)
-                        .unwrap_or_else(|err| {
-                            tracing::error!(%job_id, %err, "error checking cancelation for job {job_id}: {err}");
-                            false
-                        })
-                    {
-                        break;
-                    }
-                },
-            );
-        }
-    };
-
-    #[derive(PartialEq, Debug)]
-    enum KillReason {
-        TooManyLogs,
-        Timeout,
-        Cancelled,
-    }
-    /* a future that completes when the child process exits */
-    let wait_on_child = async {
-        let db = db.clone();
-
-        #[cfg(not(feature = "enterprise"))]
-        let timeout_duration = *TIMEOUT_DURATION;
-
-        #[cfg(feature = "enterprise")]
-        let premium_workspace = *CLOUD_HOSTED && sqlx::query_scalar!("SELECT premium FROM workspace WHERE id = $1", _w_id)
-            .fetch_one(&db)
-            .await
-            .map_err(|e| {
-                tracing::error!(%e, "error getting premium workspace for job {job_id}: {e}");
-            }).unwrap_or(false);
-        
-        #[cfg(feature = "enterprise")]
-        let timeout_duration = if premium_workspace {
-            *TIMEOUT_DURATION*6 //30mins
-        } else {
-            *TIMEOUT_DURATION
-        };
-
-        let kill_reason = tokio::select! {
-            biased;
-            result = child.wait() => return result.map(Ok),
-            Ok(()) = too_many_logs.changed() => KillReason::TooManyLogs,
-            _ = sleep(timeout_duration) => KillReason::Timeout,
-            _ = update_job => KillReason::Cancelled,
-        };
-        tx.send(()).expect("rx should never be dropped");
-        drop(tx);
-
-        let set_reason = async {
-            if kill_reason == KillReason::Timeout {
-                if let Err(err) = sqlx::query(
-                    r#"
-                       UPDATE queue
-                          SET canceled = true
-                            , canceled_by = 'timeout'
-                            , canceled_reason = $1
-                        WHERE id = $2
-                    "#,
-                )
-                .bind(format!("duration > {}", TIMEOUT_DURATION.as_secs()))
-                .bind(job_id)
-                .execute(&db)
-                .await
-                {
-                    tracing::error!(%job_id, %err, "error setting cancelation reason for job {job_id}: {err}");
-                }
-            }
-        };
-        
-        /* send SIGKILL and reap child process */
-        let (_, kill) = future::join(set_reason, child.kill()).await;
-        kill.map(|()| Err(kill_reason))
-    };
-
-    /* a future that reads output from the child and appends to the database */
-    let lines = async move {
-        let max_log_size = if *CLOUD_HOSTED {
-            MAX_RESULT_SIZE
-        } else {
-            usize::MAX
-        };
-        /* log_remaining is zero when output limit was reached */
-        let mut log_remaining = max_log_size.saturating_sub(logs.chars().count());
-        let mut result = io::Result::Ok(());
-        let mut output = output.take_until(rx2.recv()).boxed();
-        /* `do_write` resolves the task, but does not contain the Result.
-         * It's useful to know if the task completed. */
-        let (mut do_write, mut write_result) = tokio::spawn(ready(())).remote_handle();
-
-        while let Some(line) =  output.by_ref().next().await {
-
-            let do_write_ = do_write.shared();
-
-            let mut read_lines = stream::once(async { line })
-                .chain(output.by_ref())
-                /* after receiving a line, continue until some delay has passed
-                 * _and_ the previous database write is complete */
-                .take_until(future::join(sleep(write_logs_delay), do_write_.clone()))
-                .boxed();
-
-            /* Read up until an error is encountered,
-             * handle log lines first and then the error... */
-            let mut joined = String::new();
-
-            while let Some(line) = read_lines.next().await {
-
-                match line {
-                    Ok(_) if log_remaining == 0 => (),
-                    Ok(line) => {
-                        if line.is_empty() {
-                            continue;
-                        }
-                        append_with_limit(&mut joined, &line, &mut log_remaining);
-                        if log_remaining == 0 {
-                            tracing::info!(%job_id, "Too many logs lines for job {job_id}");
-                            let _ = set_too_many_logs.send(true);
-                            joined.push_str(&format!(
-                                "Job logs or result reached character limit of {MAX_RESULT_SIZE}; killing job."
-                            ));
-                            /* stop reading and drop our streams fairly quickly */
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        result = Err(err);
-                        break;
-                    }
-                }
-            }
-
-            logs.push_str(&joined);
-
-
-            /* Ensure the last flush completed before starting a new one.
-             *
-             * This shouldn't pause since `take_until()` reads lines until `do_write`
-             * resolves. We only stop reading lines before `take_until()` resolves if we reach
-             * EOF or a read error.  In those cases, waiting on a database query to complete is
-             * fine because we're done. */
-
-            if let Some(Ok(p)) = do_write_
-                .then(|()| write_result)
-                .await
-                .err()
-                .map(|err| err.try_into_panic())
-            {
-                panic::resume_unwind(p);
-            }
-
-            (do_write, write_result) = tokio::spawn(append_logs(job_id, joined, db.clone())).remote_handle();
-
-            if let Err(err) = result {
-                tracing::error!(%job_id, %err, "error reading output for job {job_id}: {err}");
-                break;
-            }
-
-            if *set_too_many_logs.borrow() {
-                break;
-            }
-
-        }
-
-        /* drop our end of the pipe */
-        drop(output);
-
-        if let Some(Ok(p)) = do_write
-            .then(|()| write_result)
-            .await
-            .err()
-            .map(|err| err.try_into_panic())
-        {
-            panic::resume_unwind(p);
-        }
-    }.instrument(trace_span!("child_lines"));
-
-
-    let (wait_result, _) = tokio::join!(wait_on_child, lines);
-
-    tracing::info!(%job_id, "child process '{child_name}' for {job_id} took {}ms", start.elapsed().as_millis());
-    match wait_result {
-        _ if *too_many_logs.borrow() => Err(Error::ExecutionErr(format!(
-            "logs or result reached limit. (current max size: {MAX_RESULT_SIZE} characters)"
-        ))),
-        Ok(Ok(status)) => {
-            if status.success() {
-                Ok(())
-            } else if let Some(code) = status.code() {
-                Err(error::Error::ExitStatus(code))
-            } else {
-                Err(error::Error::ExecutionErr(format!(
-                    "process terminated by signal: {:#?}, stopped_signal: {:#?}, core_dumped: {}",
-                    status.signal(),
-                    status.stopped_signal(),
-                    status.core_dumped()
-                )))
-            }
-        }
-        Ok(Err(kill_reason)) => Err(Error::ExecutionErr(format!(
-            "job process killed because {kill_reason:#?}"
-        ))),
-        Err(err) => Err(Error::ExecutionErr(format!("job process io error: {err}"))),
-    }
-}
-
-/// takes stdout and stderr from Child, panics if either are not present
-///
-/// builds a stream joining both stdout and stderr each read line by line
-fn child_joined_output_stream(
-    child: &mut Child,
-) -> impl stream::FusedStream<Item = io::Result<String>> {
-    let stderr = child
-        .stderr
-        .take()
-        .expect("child did not have a handle to stdout");
-
-    let stdout = child
-        .stdout
-        .take()
-        .expect("child did not have a handle to stdout");
-
-    let stdout = BufReader::new(stdout).lines();
-    let stderr = BufReader::new(stderr).lines();
-    stream::select(lines_to_stream(stderr), lines_to_stream(stdout))
-}
-
-fn lines_to_stream<R: tokio::io::AsyncBufRead + Unpin>(
-    mut lines: tokio::io::Lines<R>,
-) -> impl futures::Stream<Item = io::Result<String>> {
-    stream::poll_fn(move |cx| {
-        std::pin::Pin::new(&mut lines)
-            .poll_next_line(cx)
-            .map(|result| result.transpose())
-    })
-}
-
-// as a detail, `BufReader::lines()` removes \n and \r\n from the strings it yields,
-// so this pushes \n to thd destination string in each call
-fn append_with_limit(dst: &mut String, src: &str, limit: &mut usize) {
-    if *limit > 0 {
-        dst.push('\n');
-    }
-    *limit -= 1;
-
-    let src_len = src.chars().count();
-    if src_len <= *limit {
-        dst.push_str(&src);
-        *limit -= src_len;
-    } else {
-        let byte_pos = src
-            .char_indices()
-            .skip(*limit)
-            .next()
-            .map(|(byte_pos, _)| byte_pos)
-            .unwrap_or(0);
-        dst.push_str(&src[0..byte_pos]);
-        *limit = 0;
-    }
-}
-
-
-
-/* TODO retry this? */
-#[tracing::instrument(level = "trace", skip_all)]
-async fn append_logs(job_id: uuid::Uuid, logs: impl AsRef<str>, db: impl Borrow<Pool<Postgres>>) {
-    if logs.as_ref().is_empty() {
-        return;
-    }
-
-    if let Err(err) = sqlx::query!(
-        "UPDATE queue SET logs = concat(logs, $1::text) WHERE id = $2",
-        logs.as_ref(),
-        job_id,
-    )
-    .execute(db.borrow())
-    .await
-    {
-        tracing::error!(%job_id, %err, "error updating logs for job {job_id}: {err}");
-    }
 }

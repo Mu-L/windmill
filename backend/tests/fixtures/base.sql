@@ -11,6 +11,10 @@ INSERT INTO usr(workspace_id, email, username, is_admin, role) VALUES
 INSERT INTO workspace_key(workspace_id, kind, key) VALUES
 	('test-workspace', 'cloud', 'test-key');
 
+
+INSERT INTO workspace_settings (workspace_id) VALUES
+	('test-workspace');
+
 insert INTO token(token, email, label, super_admin) VALUES ('SECRET_TOKEN', 'test@windmill.dev', 'test token', true);
 
 GRANT ALL PRIVILEGES ON TABLE workspace_key TO windmill_admin;

@@ -9,14 +9,16 @@
 	export let forceOverflowVisible = false
 	export let tooltip: string = ''
 	export let documentationLink: string | undefined = undefined
+
+	export let fullScreen: boolean = true
 </script>
 
-<div class="flex flex-col divide-y h-screen max-h-screen">
-	<div class="flex justify-between w-full items-center px-2 py-2 gap-2">
-		<div class="flex items-center gap-2 min-w-0">
+<div class={classNames('flex flex-col divide-y', fullScreen ? 'h-screen max-h-screen' : 'h-full')}>
+	<div class="flex justify-between w-full items-center px-4 py-2 gap-2">
+		<div class="flex items-center gap-2 w-full truncate">
 			<CloseButton on:close />
 
-			<span class="font-semibold truncate text-gray-800"
+			<span class="font-semibold truncate text-primary !text-lg max-w-sm"
 				>{title ?? ''}
 				{#if tooltip != '' || documentationLink}
 					<Tooltip {documentationLink} scale={0.9}>{tooltip}</Tooltip>

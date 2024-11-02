@@ -1,77 +1,89 @@
 <script lang="ts">
 	import { page } from '$app/stores'
-	import { FlowService, JobService, ScheduleService, type Flow, type Schedule } from '$lib/gen'
 	import {
-		canWrite,
-		copyToClipboard,
-		defaultIfEmptyString,
-		displayDaysAgo,
-		emptyString,
-		encodeState
-	} from '$lib/utils'
-	import {
-		faArchive,
-		faCalendar,
-		faChevronDown,
-		faChevronUp,
-		faClipboard,
-		faCodeFork,
-		faEdit,
-		faList,
-		faPlay,
-		faShare,
-		faTrash
-	} from '@fortawesome/free-solid-svg-icons'
+		FlowService,
+		JobService,
+		WorkspaceService,
+		type Flow,
+		type FlowModule,
+		type TriggersCount,
+		type WorkspaceDeployUISettings
+	} from '$lib/gen'
+	import { canWrite, copyToClipboard, defaultIfEmptyString, emptyString } from '$lib/utils'
+	import { isDeployable, ALL_DEPLOYABLE } from '$lib/utils_deployable'
 
-	import { goto } from '$app/navigation'
-	import CenteredPage from '$lib/components/CenteredPage.svelte'
-	import { Alert, Badge, Button, Skeleton, Tab, TabContent, Tabs } from '$lib/components/common'
-	import CronInput from '$lib/components/CronInput.svelte'
-	import FlowViewer from '$lib/components/FlowViewer.svelte'
-	import JobArgs from '$lib/components/JobArgs.svelte'
+	import DetailPageLayout from '$lib/components/details/DetailPageLayout.svelte'
+	import { goto } from '$lib/navigation'
+	import { base } from '$lib/base'
+	import { Alert, Badge as HeaderBadge, Skeleton } from '$lib/components/common'
 	import MoveDrawer from '$lib/components/MoveDrawer.svelte'
 	import RunForm from '$lib/components/RunForm.svelte'
-	import ScheduleEditor from '$lib/components/ScheduleEditor.svelte'
 	import ShareModal from '$lib/components/ShareModal.svelte'
-	import Toggle from '$lib/components/Toggle.svelte'
-	import Tooltip from '$lib/components/Tooltip.svelte'
-	import UserSettings from '$lib/components/UserSettings.svelte'
-	import { userStore, workspaceStore } from '$lib/stores'
-	import Icon from 'svelte-awesome'
-	import { slide } from 'svelte/transition'
+	import { enterpriseLicense, userStore, workspaceStore } from '$lib/stores'
 	import { sendUserToast } from '$lib/toast'
-	import Urlize from '$lib/components/Urlize.svelte'
+	import DeployWorkspaceDrawer from '$lib/components/DeployWorkspaceDrawer.svelte'
+	import SavedInputs from '$lib/components/SavedInputs.svelte'
+	import {
+		FolderOpen,
+		Archive,
+		Trash,
+		Server,
+		Share,
+		Badge,
+		Loader2,
+		GitFork,
+		Play,
+		History,
+		Columns,
+		Pen,
+		Eye,
+		HistoryIcon,
+		ClipboardCopy
+	} from 'lucide-svelte'
 
-	let userSettings: UserSettings
+	import DetailPageHeader from '$lib/components/details/DetailPageHeader.svelte'
+	import WebhooksPanel from '$lib/components/triggers/WebhooksPanel.svelte'
+	import CliHelpBox from '$lib/components/CliHelpBox.svelte'
+	import FlowGraphViewer from '$lib/components/FlowGraphViewer.svelte'
+	import RunPageSchedules from '$lib/components/RunPageSchedules.svelte'
+	import { createAppFromFlow } from '$lib/components/details/createAppFromScript'
+	import { importStore } from '$lib/components/apps/store'
+	import TimeAgo from '$lib/components/TimeAgo.svelte'
+	import ClipboardPanel from '$lib/components/details/ClipboardPanel.svelte'
+	import FlowGraphViewerStep from '$lib/components/FlowGraphViewerStep.svelte'
+	import GfmMarkdown from '$lib/components/GfmMarkdown.svelte'
+	import FlowHistory from '$lib/components/flows/FlowHistory.svelte'
+	import EmailTriggerPanel from '$lib/components/details/EmailTriggerPanel.svelte'
+	import Star from '$lib/components/Star.svelte'
+	import RoutesPanel from '$lib/components/triggers/RoutesPanel.svelte'
+	import { Highlight } from 'svelte-highlight'
+	import json from 'svelte-highlight/languages/json'
+	import { writable } from 'svelte/store'
+	import TriggersBadge from '$lib/components/graph/renderers/triggers/TriggersBadge.svelte'
+	import WebsocketTriggersPanel from '$lib/components/triggers/WebsocketTriggersPanel.svelte'
 
 	let flow: Flow | undefined
-	let schedule: Schedule | undefined
 	let can_write = false
-
-	let path = $page.params.path
+	$: path = $page.params.path
 	let shareModal: ShareModal
+	let deploymentInProgress = false
 
+	let scheduledForStr: string | undefined = undefined
+	let invisible_to_owner: boolean | undefined = undefined
+	let overrideTag: string | undefined = undefined
+
+	const triggersCount = writable<TriggersCount | undefined>(undefined)
+
+	$: cliCommand = `wmill flow run ${flow?.path} -d '${JSON.stringify(args)}'`
+
+	let previousPath: string | undefined = undefined
 	$: {
-		if ($workspaceStore && $userStore) {
-			loadFlow()
-			loadSchedule()
-		}
-	}
-
-	async function loadSchedule() {
-		try {
-			let exists = await ScheduleService.existsSchedule({
-				workspace: $workspaceStore ?? '',
-				path
-			})
-			if (exists) {
-				schedule = await ScheduleService.getSchedule({
-					workspace: $workspaceStore ?? '',
-					path
-				})
+		if ($workspaceStore && $userStore && $page.params.path) {
+			if (previousPath !== path) {
+				previousPath = path
+				loadFlow()
+				loadTriggersCount()
 			}
-		} catch (e) {
-			console.log('no primary schedule')
 		}
 	}
 
@@ -90,27 +102,27 @@
 		goto('/')
 	}
 
-	async function setScheduleEnabled(path: string, enabled: boolean): Promise<void> {
-		try {
-			await ScheduleService.setScheduleEnabled({
-				path,
-				workspace: $workspaceStore!,
-				requestBody: { enabled }
-			})
-			loadSchedule()
-		} catch (err) {
-			sendUserToast(`Cannot ` + (enabled ? 'disable' : 'enable') + ` schedule: ${err}`, true)
-			loadSchedule()
-		}
+	let starred: boolean | undefined = undefined
+
+	async function loadTriggersCount() {
+		$triggersCount = await FlowService.getTriggersCountOfFlow({
+			workspace: $workspaceStore!,
+			path
+		})
 	}
 
 	async function loadFlow(): Promise<void> {
-		flow = await FlowService.getFlowByPath({ workspace: $workspaceStore!, path })
+		flow = await FlowService.getFlowByPath({
+			workspace: $workspaceStore!,
+			path,
+			withStarredInfo: true
+		})
+		starred = flow.starred
+		if (!flow.path.startsWith(`u/${$userStore?.username}`) && flow.path.split('/').length > 2) {
+			invisible_to_owner = flow.visible_to_runner_only
+		}
 		can_write = canWrite(flow.path, flow.extra_perms!, $userStore)
 	}
-
-	$: urlAsync = `${$page.url.hostname}/api/w/${$workspaceStore}/jobs/run/f/${flow?.path}`
-	$: urlSync = `${$page.url.hostname}/api/w/${$workspaceStore}/jobs/run_wait_result/f/${flow?.path}`
 
 	let isValid = true
 	let loading = false
@@ -118,185 +130,321 @@
 	async function runFlow(
 		scheduledForStr: string | undefined,
 		args: Record<string, any>,
-		invisibleToOwner?: boolean
+		invisibleToOwner: boolean | undefined,
+		overrideTag: string | undefined
 	) {
 		loading = true
 		const scheduledFor = scheduledForStr ? new Date(scheduledForStr).toISOString() : undefined
-		let run = await JobService.runFlowByPath({
-			workspace: $workspaceStore!,
-			path,
-			invisibleToOwner,
-			requestBody: args,
-			scheduledFor
-		})
-		await goto('/run/' + run + '?workspace=' + $workspaceStore)
-	}
-	let scheduleEditor: ScheduleEditor
-
-	let viewWebhookCommand = false
-
-	let args = undefined
-
-	function curlCommand(async: boolean) {
-		return `curl -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" -X POST -d '${JSON.stringify(
-			args
-		)}' ${$page.url.protocol}//${$page.url.hostname}/api/w/${$workspaceStore}/jobs/run${
-			async ? '' : '_wait_result'
-		}/f/${flow?.path}`
+		try {
+			let run = await JobService.runFlowByPath({
+				workspace: $workspaceStore!,
+				path,
+				invisibleToOwner,
+				requestBody: args,
+				scheduledFor,
+				tag: overrideTag,
+				skipPreprocessor: true
+			})
+			await goto('/run/' + run + '?workspace=' + $workspaceStore)
+		} catch (e) {
+			throw e
+		} finally {
+			loading = false
+		}
 	}
 
-	let webhook: HTMLHeadElement
+	let args: Record<string, any> | undefined = undefined
+
+	let hash = window.location.hash
+	if (hash.length > 1) {
+		try {
+			let searchParams = new URLSearchParams(hash.slice(1))
+			let params = [...searchParams.entries()].map(([k, v]) => [k, JSON.parse(v)])
+			args = Object.fromEntries(params)
+		} catch (e) {
+			console.error('Was not able to transform hash as args', e)
+		}
+	}
+
 	let moveDrawer: MoveDrawer
+	let deploymentDrawer: DeployWorkspaceDrawer
+	let runForm: RunForm
+
+	function getMainButtons(flow: Flow | undefined, args: object | undefined) {
+		const buttons: any = []
+
+		if (flow && !$userStore?.operator) {
+			buttons.push({
+				label: 'Fork',
+				buttonProps: {
+					href: `${base}/flows/add?template=${flow.path}`,
+					color: 'light',
+					size: 'xs',
+					startIcon: GitFork
+				}
+			})
+		}
+
+		if (!flow) {
+			return buttons
+		}
+
+		buttons.push({
+			label: `View runs`,
+			buttonProps: {
+				href: `${base}/runs/${flow.path}`,
+				size: 'xs',
+				color: 'light',
+				startIcon: Play
+			}
+		})
+
+		buttons.push({
+			label: `History`,
+			buttonProps: {
+				onClick: () => {
+					flowHistory?.open()
+				},
+
+				size: 'xs',
+				color: 'light',
+				startIcon: History
+			}
+		})
+
+		if (!flow || $userStore?.operator || !can_write) {
+			return buttons
+		}
+
+		if (!$userStore?.operator) {
+			buttons.push({
+				label: 'Build App',
+				buttonProps: {
+					onClick: async () => {
+						const app = createAppFromFlow(flow.path, flow.schema)
+						$importStore = JSON.parse(JSON.stringify(app))
+						await goto('/apps/add?nodraft=true')
+					},
+
+					size: 'xs',
+					color: 'light',
+					startIcon: Columns
+				}
+			})
+
+			buttons.push({
+				label: 'Edit',
+				buttonProps: {
+					href: `${base}/flows/edit/${path}?nodraft=true`,
+					variant: 'contained',
+					size: 'xs',
+					color: 'dark',
+					disabled: !can_write,
+					startIcon: Pen
+				}
+			})
+		}
+		return buttons
+	}
+
+	$: mainButtons = getMainButtons(flow, args)
+
+	let deployUiSettings: WorkspaceDeployUISettings | undefined = undefined
+
+	async function getDeployUiSettings() {
+		if (!$enterpriseLicense) {
+			deployUiSettings = ALL_DEPLOYABLE
+			return
+		}
+		let settings = await WorkspaceService.getSettings({ workspace: $workspaceStore! })
+		deployUiSettings = settings.deploy_ui ?? ALL_DEPLOYABLE
+	}
+	getDeployUiSettings()
+
+	function getMenuItems(
+		flow: Flow | undefined,
+		deployUiSettings: WorkspaceDeployUISettings | undefined
+	) {
+		if (!flow || $userStore?.operator) return []
+
+		const menuItems: any = []
+
+		menuItems.push({
+			label: 'Share',
+			onclick: () => shareModal.openDrawer(flow?.path ?? '', 'flow'),
+			Icon: Share,
+			disabled: !can_write
+		})
+
+		menuItems.push({
+			label: 'Move/Rename',
+			onclick: () => moveDrawer.openDrawer(flow?.path ?? '', flow?.summary, 'flow'),
+			Icon: FolderOpen
+		})
+
+		menuItems.push({
+			label: 'Audit logs',
+			Icon: Eye,
+			onclick: () => {
+				goto(`/audit_logs?resource=${flow?.path}`)
+			}
+		})
+
+		if (isDeployable('flow', flow?.path ?? '', deployUiSettings)) {
+			menuItems.push({
+				label: 'Deploy to staging/prod',
+				onclick: () => deploymentDrawer.openDrawer(flow?.path ?? '', 'flow'),
+				Icon: Server
+			})
+		}
+
+		if (can_write) {
+			menuItems.push({
+				label: 'Deployments',
+				onclick: () => flowHistory?.open(),
+				Icon: HistoryIcon
+			})
+			menuItems.push({
+				label: flow.archived ? 'Unarchive' : 'Archive',
+				onclick: () => flow?.path && archiveFlow(),
+				Icon: Archive,
+				color: 'red'
+			})
+			menuItems.push({
+				label: 'Delete',
+				onclick: () => flow?.path && deleteFlow(),
+				Icon: Trash,
+				color: 'red'
+			})
+		}
+		return menuItems
+	}
+
+	function onKeyDown(event: KeyboardEvent) {
+		switch (event.key) {
+			case 'Enter':
+				if (event.ctrlKey || event.metaKey) {
+					if (isValid) {
+						event.preventDefault()
+						runForm?.run()
+					} else {
+						sendUserToast('Please fix errors before running', true)
+					}
+				}
+				break
+		}
+	}
+	let stepDetail: FlowModule | string | undefined = undefined
+	let token = 'TOKEN_TO_CREATE'
+	let rightPaneSelected = 'saved_inputs'
+
+	let flowHistory: FlowHistory | undefined = undefined
 </script>
 
-<ScheduleEditor on:update={() => loadSchedule()} bind:this={scheduleEditor} />
-
-<UserSettings bind:this={userSettings} scopes={[`run:flow/${flow?.path}`]} />
-
 <Skeleton
-	class="!max-w-6xl !px-4 sm:!px-6 md:!px-8"
+	class="!max-w-7xl !px-4 sm:!px-6 md:!px-8"
 	loading={!flow}
 	layout={[0.75, [2, 0, 2], 2.25, [{ h: 1.5, w: 40 }], 0.2, [{ h: 1, w: 30 }]]}
 />
-
+<svelte:window on:keydown={onKeyDown} />
+<DeployWorkspaceDrawer bind:this={deploymentDrawer} />
+<ShareModal bind:this={shareModal} />
 <MoveDrawer
 	bind:this={moveDrawer}
 	on:update={async (e) => {
 		await goto('/flows/get/' + e.detail + `?workspace=${$workspaceStore}`)
 		loadFlow()
-		loadSchedule()
 	}}
 />
+{#if flow}
+	<FlowHistory bind:this={flowHistory} path={flow.path} on:historyRestore={loadFlow} />
+{/if}
 
-<CenteredPage>
-	{#if flow}
-		<div class="prose-sm mx-auto mt-6">
-			<div
-				class="flex flex-row-reverse w-full flex-wrap md:flex-nowrap justify-between gap-x-2 gap-y-4"
+{#if flow}
+	<DetailPageLayout
+		{triggersCount}
+		bind:selected={rightPaneSelected}
+		isOperator={$userStore?.operator}
+		flow_json={{
+			value: flow.value,
+			summary: flow.summary,
+			description: flow.description,
+			schema: flow.schema
+		}}
+	>
+		<svelte:fragment slot="header">
+			<DetailPageHeader
+				on:seeTriggers={() => {
+					rightPaneSelected = 'triggers'
+				}}
+				{mainButtons}
+				menuItems={getMenuItems(flow, deployUiSettings)}
+				title={defaultIfEmptyString(flow.summary, flow.path)}
+				bind:errorHandlerMuted={flow.ws_error_handler_muted}
+				scriptOrFlowPath={flow.path}
+				errorHandlerKind="flow"
+				tag={flow.tag}
 			>
-				<div class="flex flex-row-reverse gap-2 h-full">
-					<Button
-						href="/flows/run/{path}"
-						variant="contained"
-						color="blue"
-						size="md"
-						startIcon={{ icon: faPlay }}
-					>
-						Run
-					</Button>
-					{#if !$userStore?.operator}
-						<Button
-							href="/flows/edit/{path}?nodraft=true&args={encodeState(args)}"
-							variant="contained"
-							color="blue"
-							size="md"
-							startIcon={{ icon: faEdit }}
-							disabled={!can_write}
-						>
-							Edit
-						</Button>
-						<Button
-							href="/flows/add?template={flow.path}"
-							variant="border"
-							color="blue"
-							size="md"
-							startIcon={{ icon: faCodeFork }}
-						>
-							Fork
-						</Button>
-					{/if}
-					<Button
-						href="/runs/{flow.path}"
-						variant="border"
-						color="blue"
-						size="md"
-						startIcon={{ icon: faList }}
-					>
-						View runs
-					</Button>
-				</div>
-				<h1 class="mb-1 truncate grow">
-					{defaultIfEmptyString(flow.summary, flow.path)}
-				</h1>
-			</div>
-			{#if !emptyString(flow.summary)}
-				<span class="text-lg font-semibold">{flow.path}</span>
-			{/if}
-		</div>
-	{/if}
-	<ShareModal bind:this={shareModal} />
-
-	<div class="grid grid-cols-1 gap-6 max-w-7xl pb-6">
-		<Skeleton
-			loading={!flow}
-			layout={[[{ h: 1.5, w: 40 }], 1, [4], 2.25, [{ h: 1.5, w: 30 }], 1, [10]]}
-		/>
-		{#if flow}
-			<div>
-				<span class="text-sm text-gray-600">
-					Edited {displayDaysAgo(flow.edited_at ?? '')} by {flow.edited_by}
-
-					{#if schedule}
-						<a href="#primary-schedule" class="ml-2">
-							<Badge color="dark-blue">Primary schedule</Badge>
-						</a>{/if}</span
-				>
-
-				{#if flow.archived}
-					<div class="mt-2" />
-					<Alert type="error" title="Archived">This flow was archived</Alert>
+				<svelte:fragment slot="trigger-badges">
+					<TriggersBadge
+						showOnlyWithCount={true}
+						{path}
+						newItem={false}
+						isFlow
+						selected={rightPaneSelected == 'triggers'}
+						on:select={() => {
+							rightPaneSelected = 'triggers'
+						}}
+					/>
+				</svelte:fragment>
+				{#if $workspaceStore}
+					<Star
+						kind="flow"
+						path={flow.path}
+						{starred}
+						workspace_id={$workspaceStore}
+						on:starred={() => {
+							starred = !starred
+						}}
+					/>
 				{/if}
+				{#if flow?.value?.priority != undefined}
+					<div class="hidden md:block">
+						<HeaderBadge color="blue" variant="outlined" size="xs">
+							{`Priority: ${flow?.value?.priority}`}
+						</HeaderBadge>
+					</div>
+				{/if}
+				{#if flow?.value?.concurrent_limit != undefined && flow?.value?.concurrency_time_window_s != undefined}
+					<div class="hidden md:block">
+						<HeaderBadge color="gray" variant="outlined" size="xs">
+							{`Concurrency limit: ${flow?.value?.concurrent_limit} runs every ${flow?.value?.concurrency_time_window_s}s`}
+						</HeaderBadge>
+					</div>
+				{/if}
+			</DetailPageHeader>
+		</svelte:fragment>
+		<svelte:fragment slot="form">
+			<div class="flex-col flex h-full justify-between">
+				<div class="p-8 w-full max-w-3xl mx-auto gap-2 bg-surface">
+					<div class="flex flex-col gap-2 mb-8">
+						{#if !emptyString(flow?.description)}
+							<GfmMarkdown md={defaultIfEmptyString(flow?.description, 'No description')} />
+						{/if}
+					</div>
 
-				<div class="flex gap-2 flex-wrap mt-2">
-					<!-- <Button
-						target="_blank"
-						href={flowToHubUrl(flow).toString()}
-						variant="border"
-						color="light"
-						size="xs"
-						startIcon={{ icon: faGlobe }}
-					>
-						Publish to Hub
-					</Button> -->
-					<Button
-						on:click={() => shareModal.openDrawer(flow?.path ?? '', 'flow')}
-						variant="border"
-						color="light"
-						size="xs"
-						startIcon={{ icon: faShare }}
-						disabled={!can_write}
-					>
-						Share
-					</Button>
-					<Button
-						on:click={() => scheduleEditor?.openNew(true, flow?.path ?? '')}
-						variant="border"
-						color="light"
-						size="xs"
-						startIcon={{ icon: faCalendar }}
-					>
-						New Schedule
-					</Button>
-					<Button
-						on:click={() => moveDrawer.openDrawer(flow?.path ?? '', flow?.summary, 'flow')}
-						variant="border"
-						color="light"
-						size="xs"
-						startIcon={{ icon: faEdit }}
-					>
-						Move/Rename
-					</Button>
-					<Button
-						btnClasses="ml-2"
-						variant="border"
-						size="xs"
-						on:click={() => webhook.scrollIntoView()}>Webhook</Button
-					>
-				</div>
-			</div>
-			<div class="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-6">
-				<div class="col-span-2 box">
+					{#if deploymentInProgress}
+						<Badge color="yellow">
+							<Loader2 size={12} class="inline animate-spin mr-1" />
+							Deployment in progress
+						</Badge>
+					{/if}
+
 					<RunForm
+						bind:scheduledForStr
+						bind:invisible_to_owner
+						bind:overrideTag
+						viewKeybinding
 						{loading}
 						autofocus
 						detailed={false}
@@ -304,170 +452,119 @@
 						runnable={flow}
 						runAction={runFlow}
 						bind:args
-						viewCliRun
-						isFlow
+						bind:this={runForm}
 					/>
-				</div>
-				{#if !emptyString(flow.description)}
-					<div class="box overflow-auto break-words whitespace-pre-wrap">
-						<Urlize text={defaultIfEmptyString(flow.description, 'No description')} />
-					</div>
-				{/if}
-			</div>
-			<div class="mt-4">
-				<FlowViewer {flow} noSummary={true} />
+					<div class="py-10" />
 
-				<h2 bind:this={webhook} class="mt-10 text-gray-700 pb-1 mb-3 border-b"
-					>Webhooks<Tooltip>
-						Pass the input as a json payload, the token as a Bearer token or as query arg
-						`?token=XXX` and pass as header: 'Content-Type: application/json'. The webhook also
-						support 'x-www-form-urlencoded' encoded payloads <a
-							href="https://docs.windmill.dev/docs/core_concepts/webhooks">See docs</a
-						></Tooltip
-					></h2
-				>
-				<div class="box max-w-5xl">
-					<div class="flex w-full flex-justify-between mb-1">
-						<a
-							on:click={(e) => {
-								e.preventDefault()
-								copyToClipboard($page.url.protocol + '//' + urlAsync)
-							}}
-							href={$page.url.protocol + '//' + urlAsync}
-							class="whitespace-nowrap text-ellipsis overflow-hidden mr-1 w-full"
-						>
-							{urlAsync}
-							<span class="text-gray-700 ml-2">
-								<Icon data={faClipboard} />
-							</span>
-						</a>
-						<Badge>UUID/Async</Badge>
-					</div>
-					<div class="mb-2 w-full flex flex-justify-between">
-						<a
-							on:click={(e) => {
-								e.preventDefault()
-								copyToClipboard($page.url.protocol + '//' + urlSync)
-							}}
-							href={$page.url.protocol + '//' + urlSync}
-							class="whitespace-nowrap text-ellipsis overflow-hidden mr-1 w-full"
-						>
-							{urlSync}
-							<span class="text-gray-700 ml-2">
-								<Icon data={faClipboard} />
-							</span>
-						</a>
-						<Badge>Result/Sync</Badge>
-					</div>
-					<div class="flex flex-row-reverse">
-						<Button size="xs" on:click={userSettings.openDrawer}
-							>Create a Webhook-specific Token <Tooltip
-								>The token will have a scope such that it can only be used to trigger this flow. It
-								is safe to share as it cannot be used to impersonate you.</Tooltip
-							></Button
-						>
-					</div>
-					<div class="flex flex-col gap-2 mt-2">
-						<div class="flex">
-							<Button
-								color="light"
-								size="lg"
-								endIcon={{ icon: viewWebhookCommand ? faChevronUp : faChevronDown }}
-								on:click={() => (viewWebhookCommand = !viewWebhookCommand)}
-							>
-								CURL
-							</Button>
+					{#if !emptyString(flow.summary)}
+						<div class="mb-2">
+							<span class="!text-tertiary">{flow.path}</span>
 						</div>
-						{#if viewWebhookCommand}
-							<div transition:slide|local class="px-4">
-								<Tabs selected="async">
-									<Tab value="async">UUID/Async</Tab>
-									<Tab value="sync">Result/Sync</Tab>
-									<svelte:fragment slot="content">
-										<!-- svelte-ignore a11y-click-events-have-key-events -->
-										<pre class="bg-gray-700 text-gray-100 p-2 font-mono text-sm whitespace-pre-wrap"
-											><TabContent value="async"
-												>{curlCommand(true)} <span
-													on:click={() => copyToClipboard(curlCommand(true))}
-													class="cursor-pointer ml-2"><Icon data={faClipboard} /></span
-												></TabContent
-											><TabContent value="sync"
-												>{curlCommand(false)} <span
-													on:click={() => copyToClipboard(curlCommand(false))}
-													class="cursor-pointer ml-2"><Icon data={faClipboard} /></span
-												><br /><br />//^ returns an UUID. Fetch result until completed == true<br
-												/>curl -H "Authorization: Bearer $TOKEN" {$page.url.protocol}//{$page.url
-													.hostname}/api/w/{$workspaceStore}/jobs_u/completed/get_result_maybe/$UUID</TabContent
-											></pre
-										>
-									</svelte:fragment>
-								</Tabs>
-							</div>
+					{/if}
+					<div class="flex flex-row gap-x-2 flex-wrap items-center">
+						<span class="text-sm text-tertiary">
+							Edited <TimeAgo date={flow.edited_at ?? ''} /> by {flow.edited_by}
+						</span>
+
+						{#if flow.archived}
+							<div class="" />
+							<Alert type="error" title="Archived">This flow was archived</Alert>
 						{/if}
 					</div>
 				</div>
+				<div class="mt-8">
+					<FlowGraphViewer
+						triggerNode={true}
+						download
+						{flow}
+						overflowAuto
+						noSide={true}
+						on:select={(e) => {
+							if (e.detail) {
+								stepDetail = e.detail
+								rightPaneSelected = 'flow_step'
+							} else {
+								stepDetail = undefined
+								rightPaneSelected = 'saved_inputs'
+							}
+						}}
+						on:triggerDetail={(e) => {
+							rightPaneSelected = 'triggers'
+						}}
+					/>
+				</div>
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="save_inputs">
+			<SavedInputs
+				flowPath={flow?.path}
+				{isValid}
+				args={args ?? {}}
+				on:selected_args={(e) => {
+					const nargs = JSON.parse(JSON.stringify(e.detail))
+					runForm?.setArgs(nargs)
+					args = nargs
+				}}
+			/>
+		</svelte:fragment>
+		<svelte:fragment slot="schema">
+			<div class="p-1 relative">
+				<button
+					on:click={() => copyToClipboard(JSON.stringify(flow?.schema, null, 4))}
+					class="absolute top-2 right-2"
+				>
+					<ClipboardCopy size={14} />
+				</button>
+				<Highlight language={json} code={JSON.stringify(flow?.schema, null, 4)} />
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="webhooks">
+			<div class="p-2">
+				<WebhooksPanel
+					bind:token
+					scopes={[`run:flow/${flow?.path}`]}
+					path={flow?.path}
+					isFlow={true}
+					{args}
+				/>
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="routes">
+			<div class="p-2">
+				<RoutesPanel path={flow.path ?? ''} isFlow />
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="websockets">
+			<div class="p-2">
+				<WebsocketTriggersPanel path={flow.path ?? ''} isFlow />
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="emails">
+			<div class="p-2">
+				<EmailTriggerPanel
+					bind:token
+					scopes={[`run:flow/${flow?.path}`]}
+					path={flow?.path}
+					isFlow={true}
+				/>
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="schedules">
+			<div class="p-2">
+				<RunPageSchedules schema={flow.schema} isFlow={true} path={flow.path ?? ''} {can_write} />
+			</div>
+		</svelte:fragment>
+		<svelte:fragment slot="cli">
+			<div class="p-2">
+				<ClipboardPanel content={cliCommand} />
+				<CliHelpBox />
+			</div>
+		</svelte:fragment>
 
-				{#if schedule}
-					<div class="mt-10">
-						<h2
-							id="primary-schedule"
-							class="text-gray-700 pb-1 mb-3 border-b inline-flex flex-row items-center gap-x-4"
-							><div>Primary Schedule </div>
-							<Badge color="gray">{schedule.schedule}</Badge>
-							<Toggle
-								checked={schedule.enabled}
-								on:change={(e) => {
-									if (can_write) {
-										setScheduleEnabled(path, e.detail)
-									} else {
-										sendUserToast('not enough permission', true)
-									}
-								}}
-							/>
-							<Button size="xs" on:click={() => scheduleEditor?.openEdit(flow?.path ?? '', true)}
-								>Edit schedule</Button
-							>
-						</h2>
-						<div class="max-w-lg">
-							<JobArgs args={schedule.args ?? {}} />
-						</div>
-						<div class="box max-w-5xl mt-2">
-							<CronInput
-								disabled={true}
-								schedule={schedule.schedule}
-								timezone={schedule.timezone}
-							/>
-						</div>
-					</div>
-				{/if}
-			</div>
-			<div>
-				{#if can_write}
-					<h2 class="mt-4">Danger zone</h2>
-					<div class="flex gap-2 mt-6">
-						<Button
-							on:click={() => flow?.path && archiveFlow()}
-							variant="border"
-							color="red"
-							size="md"
-							startIcon={{ icon: faArchive }}
-							disabled={!can_write}
-						>
-							{flow.archived ? 'Unarchive' : 'Archive'}
-						</Button>
-						<Button
-							on:click={() => flow?.path && deleteFlow()}
-							variant="border"
-							color="red"
-							size="md"
-							startIcon={{ icon: faTrash }}
-							disabled={!can_write}
-						>
-							Delete
-						</Button>
-					</div>
-				{/if}
-			</div>
-		{/if}
-	</div>
-</CenteredPage>
+		<svelte:fragment slot="flow_step">
+			{#if stepDetail}
+				<FlowGraphViewerStep schema={flow.schema} {stepDetail} />
+			{/if}
+		</svelte:fragment>
+	</DetailPageLayout>
+{/if}
