@@ -15,16 +15,14 @@ use crate::db::ApiAuthed;
 
 #[cfg(feature = "enterprise")]
 use crate::ee::ExternalJwks;
-use crate::oauth2_ee::{check_nb_of_user, InstanceEvent};
+use crate::oauth2_ee::InstanceEvent;
 use crate::utils::{
-    generate_instance_wide_unique_username, get_and_delete_pending_username_or_generate,
-    get_instance_username_or_create_pending,
+    generate_instance_wide_unique_username, get_instance_username_or_create_pending,
 };
 use crate::{
-    db::DB, utils::require_super_admin, webhook_util::WebhookShared,
-    workspaces::invite_user_to_all_auto_invite_worspaces, BASE_URL, COOKIE_DOMAIN, IS_SECURE,
+    db::DB, utils::require_super_admin, webhook_util::WebhookShared, COOKIE_DOMAIN, IS_SECURE,
 };
-use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     async_trait,
     extract::{Extension, FromRequestParts, OriginalUri, Path, Query},
@@ -37,7 +35,6 @@ use chrono::TimeZone;
 use hyper::{header::LOCATION, StatusCode};
 use lazy_static::lazy_static;
 use quick_cache::sync::Cache;
-use rand::rngs::OsRng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -51,13 +48,13 @@ use windmill_audit::ActionKind;
 use windmill_common::auth::fetch_authed_from_permissioned_as;
 use windmill_common::global_settings::AUTOMATE_USERNAME_CREATION_SETTING;
 use windmill_common::users::{truncate_token, username_to_permissioned_as};
-use windmill_common::utils::{paginate, send_email};
-use windmill_common::worker::{CLOUD_HOSTED, SMTP_CONFIG};
+use windmill_common::utils::paginate;
+use windmill_common::worker::CLOUD_HOSTED;
 use windmill_common::{
     auth::{get_folders_for_user, get_groups_for_user, JWTAuthClaims, JWT_SECRET},
     db::UserDB,
     error::{self, Error, JsonResult, Result},
-    users::{SUPERADMIN_NOTIFICATION_EMAIL, SUPERADMIN_SECRET_EMAIL},
+    users::SUPERADMIN_SECRET_EMAIL,
     utils::{not_found_if_none, rd_string, require_admin, Pagination, StripPath},
 };
 use windmill_git_sync::handle_deployment_metadata;
@@ -818,6 +815,7 @@ pub struct WorkspaceInvite {
     pub operator: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct NewUser {
     pub email: String,
@@ -851,6 +849,7 @@ pub struct EditWorkspaceUser {
     pub disabled: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct EditPassword {
     pub password: String,
@@ -1941,114 +1940,9 @@ async fn create_user(
     Extension(webhook): Extension<WebhookShared>,
     Extension(argon2): Extension<Arc<Argon2<'_>>>,
     Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
-    Json(mut nu): Json<NewUser>,
+    Json(nu): Json<NewUser>,
 ) -> Result<(StatusCode, String)> {
-    require_super_admin(&db, &authed.email).await?;
-    let mut tx = db.begin().await?;
-
-    nu.email = nu.email.to_lowercase();
-
-    if nu.email == SUPERADMIN_SECRET_EMAIL || nu.email == SUPERADMIN_NOTIFICATION_EMAIL {
-        return Err(Error::BadRequest("This email address is reserved".into()));
-    }
-
-    check_nb_of_user(&db).await?;
-
-    let already_exists = sqlx::query_scalar!(
-        "SELECT EXISTS (SELECT 1 FROM password WHERE email = $1)",
-        &nu.email
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(false);
-
-    if already_exists {
-        return Err(Error::BadRequest(format!(
-            "an account with the email {} already exists",
-            nu.email
-        )));
-    }
-
-    let automate_username_creation = sqlx::query_scalar!(
-        "SELECT value FROM global_settings WHERE name = $1",
-        AUTOMATE_USERNAME_CREATION_SETTING,
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .map(|v| v.as_bool())
-    .flatten()
-    .unwrap_or(false);
-
-    let mut username = None;
-    if automate_username_creation {
-        username = Some(get_and_delete_pending_username_or_generate(&mut tx, &nu.email).await?);
-    }
-
-    sqlx::query!(
-        "INSERT INTO password(email, verified, password_hash, login_type, super_admin, name, \
-         company, username)
-    VALUES ($1, $2, $3, 'password', $4, $5, $6, $7)",
-        &nu.email,
-        true,
-        &hash_password(argon2, nu.password.clone())?,
-        &nu.super_admin,
-        nu.name,
-        nu.company,
-        username
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.add_global",
-        ActionKind::Create,
-        "global",
-        Some(&nu.email),
-        None,
-    )
-    .await?;
-    tx = add_to_demo_if_exists(tx, &nu.email).await?;
-
-    tx.commit().await?;
-
-    invite_user_to_all_auto_invite_worspaces(&db, &nu.email, rsmq, &authed).await?;
-    send_email_if_possible(
-        "Invited to Windmill",
-        &format!(
-            "You have been granted access to Windmill by {}.
-
-Log in and change your password: {}/user/login?email={}&password={}&rd=%2F%23user-settings
-
-You can then join or create a workspace. Happy building!",
-            authed.email,
-            BASE_URL.read().await.clone(),
-            &nu.email,
-            &nu.password
-        ),
-        &nu.email,
-    );
-    webhook.send_instance_event(InstanceEvent::UserAdded { email: nu.email.clone() });
-    Ok((StatusCode::CREATED, format!("email {} created", nu.email)))
-}
-
-pub fn send_email_if_possible(subject: &str, content: &str, to: &str) {
-    let subject = subject.to_string();
-    let content = content.to_string();
-    let to = to.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = send_email_if_possible_intern(&subject, &content, to.clone()).await {
-            tracing::error!("Failed to send email to {}: {}", to, e);
-        }
-    });
-}
-
-pub async fn send_email_if_possible_intern(subject: &str, content: &str, to: String) -> Result<()> {
-    if let Some(smtp) = SMTP_CONFIG.read().await.clone() {
-        send_email(subject, content, vec![to], smtp, None).await?;
-    }
-    return Ok(());
+    crate::users_ee::create_user(authed, db, webhook, argon2, rsmq, nu).await
 }
 
 async fn delete_workspace_user(
@@ -2121,193 +2015,10 @@ async fn set_password(
     Extension(db): Extension<DB>,
     Extension(argon2): Extension<Arc<Argon2<'_>>>,
     authed: ApiAuthed,
-    Json(EditPassword { password }): Json<EditPassword>,
+    Json(ep): Json<EditPassword>,
 ) -> Result<String> {
-    let mut tx = db.begin().await?;
-
-    let custom_type = sqlx::query_scalar!(
-        "SELECT login_type::TEXT FROM password WHERE email = $1",
-        &authed.email
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| Error::InternalErr(format!("setting password: {e:#}")))?
-    .unwrap_or("".to_string());
-
-    if custom_type != "password".to_string() {
-        return Err(Error::BadRequest(format!(
-            "login type for {} is of type {custom_type}. Cannot set password.",
-            authed.email
-        )));
-    }
-
-    sqlx::query!(
-        "UPDATE password SET password_hash = $1 WHERE email = $2",
-        &hash_password(argon2, password)?,
-        &authed.email,
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.setpassword",
-        ActionKind::Update,
-        "global",
-        Some(&authed.email),
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-
-    Ok(format!("password of {} updated", authed.email))
+    crate::users_ee::set_password(db, argon2, authed, ep).await
 }
-
-pub fn hash_password(argon2: Arc<Argon2>, password: String) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| Error::InternalErr(e.to_string()))?
-        .to_string();
-    Ok(password_hash)
-}
-
-// async fn lost_password(
-//     Extension(db): Extension<DB>,
-//     Extension(es): Extension<Arc<EmailSender>>,
-//     TypedHeader(host): TypedHeader<headers::Host>,
-//     Json(LostPassword {
-//         email
-//     }): Json<LostPassword>,
-// ) -> Result<String> {
-//     let mut tx = db.begin().await?;
-
-//     let exists = sqlx::query_scalar!(
-//             "SELECT EXISTS(SELECT 1 FROM password WHERE email = $1)",
-//         &email)
-//         .fetch_one(&mut tx)
-//         .await?
-//         .unwrap_or(false);
-
-//     if !exists {
-//         return Err(Error::NotFound(format!("no user found at email {email}")))
-//     }
-
-//     let already = sqlx::query_scalar!(
-//             "SELECT EXISTS(SELECT 1 FROM magic_link WHERE email = $1)",
-//         &email)
-//         .fetch_one(&mut tx)
-//         .await?
-//         .unwrap_or(false);
-
-//     if already {
-//         return Err(Error::BadRequest(format!("a magic link was already sent at {email}")))
-//     }
-
-//     let tx = create_magic_link(&host.hostname(), &email, &es, tx).await?;
-//     tx.commit().await?;
-
-//     Ok(format!("Magic link sent to {email}"))
-// }
-
-// async fn use_magic_link(
-//     cookies: Cookies,
-//     Extension(db): Extension<DB>,
-//     Query(UseMagicLink {
-//         email,
-//         token
-//     }): Query<UseMagicLink>,
-// ) -> Result<String> {
-//     let mut tx = db.begin().await?;
-
-//     let email_o = sqlx::query_scalar!(
-//         "DELETE FROM magic_link WHERE email = $1 AND token = $2
-//         RETURNING email", email, token
-//     )
-//     .fetch_optional(&mut tx)
-//     .await?;
-
-//     if let Some(email) = email_o {
-//         let is_super_admin = sqlx::query_scalar!("UPDATE password SET verified = true WHERE email = $1 RETURNING super_admin", email)
-//             .fetch_optional(&mut tx)
-//             .await?
-//             .unwrap_or(false);
-
-//         let token = create_session_token(&email, is_super_admin, &mut tx, cookies).await?;
-//         tx.commit().await?;
-//         Ok(token)
-//     } else {
-//         Err(Error::NotFound(format!("magic link for {email} not found")))
-//     }
-// }
-
-// async fn signup(
-//     TypedHeader(host): TypedHeader<headers::Host>,
-//     Extension(db): Extension<DB>,
-//     Extension(argon2): Extension<Arc<Argon2<'_>>>,
-//     Extension(es): Extension<Arc<EmailSender>>,
-//     Json(Signup {
-//         email,
-//         password,
-//         name,
-//         company
-//     }): Json<Signup>,
-// ) -> Result<(StatusCode, String)> {
-//     let mut tx = db.begin().await?;
-
-//     let email = sqlx::query_scalar!(
-//             "INSERT INTO password (email, password_hash, name, company) VALUES ($1, $2, $3, $4) RETURNING email",
-//         &email, &hash_password(argon2, password)?, name, company)
-//         .fetch_optional(&mut tx)
-//         .await?;
-
-//     if let Some(email) = email {
-//         let tx = create_magic_link(&host.hostname(), &email, &es, tx).await?;
-//         tx.commit().await?;
-
-//         Ok((
-//             StatusCode::CREATED,
-//             format!("user with email {} created", email),
-//         ))
-//     } else {
-//         Err(Error::BadRequest("Invalid login".to_string()))
-//     }
-// }
-
-// async fn create_magic_link<'c>(host: &str, email: &str, es: &EmailSender, mut tx: sqlx::Transaction<'c, sqlx::Postgres>) -> error::Result<sqlx::Transaction<'c, sqlx::Postgres>> {
-//     let token = gen_token();
-
-//     sqlx::query!(
-//         "INSERT INTO magic_link
-//             (email, token)
-//             VALUES ($1, $2)",
-//         email,
-//         &token
-//     )
-//     .execute(&mut tx)
-//     .await?;
-
-//     let encoded_token = urlencoding::encode(&token);
-//     let encoded_email = urlencoding::encode(email);
-//     es.send_email(Message::builder()
-//         .to(email.parse().unwrap())
-//         .subject("New magic link")
-//         .body(format!("Magic link: https://{host}/magic_link?token={encoded_token}&email={encoded_email}"))
-//         .unwrap()).await?;
-
-//     audit_log(
-//          &mut tx,
-//         email,
-//         "users.magic_link",
-//         ActionKind::Create,
-//         "global",
-//         Some(email),
-//         None,
-//     )
-//     .await?;
-//     Ok(tx)
-// }
 
 async fn login(
     cookies: Cookies,
@@ -2766,32 +2477,6 @@ pub struct LoginUserInfo {
     pub company: Option<String>,
 
     pub displayName: Option<String>,
-}
-
-pub async fn add_to_demo_if_exists<'c>(
-    mut tx: sqlx::Transaction<'c, sqlx::Postgres>,
-    email: &String,
-) -> Result<sqlx::Transaction<'c, sqlx::Postgres>> {
-    let demo_exists =
-        sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = 'demo')")
-            .fetch_one(&mut *tx)
-            .await?
-            .unwrap_or(false);
-    if demo_exists {
-        if let Err(e) = sqlx::query!(
-            "INSERT INTO workspace_invite
-                (workspace_id, email, is_admin)
-                VALUES ('demo', $1, false)
-                ON CONFLICT DO NOTHING",
-            &email
-        )
-        .execute(&mut *tx)
-        .await
-        {
-            tracing::error!("error inserting invite: {:#?}", e);
-        }
-    }
-    return Ok(tx);
 }
 
 #[derive(Serialize)]
